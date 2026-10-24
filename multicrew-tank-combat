@@ -1,0 +1,1965 @@
+--!strict
+--!optimize 2
+
+-- PostLocal reads and projects everything into a draw buffer, Render only plays it back.
+-- No Armor runs in PostModel and only walks the vehicles that PostLocal already cached.
+
+if _G.TankESP and _G.TankESP.stop then
+	pcall(_G.TankESP.stop)
+end
+
+type ModuleDef = { part: any, hx: number, hy: number, hz: number, kind: string }
+
+type Entry = {
+	inst: any,
+	anchor: any,
+	hx: number,
+	hy: number,
+	hz: number,
+	name: string,
+	kind: string,
+	class: string?,
+	requester: string?,
+	reqTries: number,
+	occupied: boolean,
+	occT: number,
+	ally: boolean?,
+	mods: { ModuleDef },
+	modTries: number,
+	gun: any,
+	loaded: any,
+	gunTries: number,
+	rl: number,
+	rlT: number,
+	distM: number,
+	distText: string,
+	armor: { any }, -- ArmourValue objects found in this vehicle (No Armor)
+	armorScans: number, -- how many times the vehicle was searched for ArmourValue
+	armorScanT: number, -- os.clock of the last search
+	armorChkT: number, -- os.clock of the last zero check
+}
+
+type MslTarget = { anchor: any, label: string, threat: boolean, distM: number, text: string }
+type RingPool = { list: { any }, used: number, sides: number, thick: number }
+
+type Point = { X: number, Y: number }
+type Segment = { A: Point, B: Point }
+
+type Prim = { k: number, col: Color3, thick: number, text: string, n: number, hwm: number, pts: { vector } }
+type Buffer = { n: number, items: { Prim } }
+
+local Players: any = game:GetService("Players")
+local RunService: any = game:GetService("RunService")
+local LocalPlayer: any = Players.LocalPlayer
+local Workspace: any = workspace
+
+local STUD_PER_M: number = 2.7777778
+local STUDS_TO_M: number = 1 / STUD_PER_M
+local FONT: number = 13
+local STEP: number = FONT + 2
+local MOD_FILL_A: number = 0.5
+local MOD_PAD: number = 1.25
+local BOX_THICK: number = 1
+local MOD_THICK: number = 1.5
+local HELI_R: number = 7
+local HELI_SIDES: number = 32
+local MSL_RATE: number = 0.1
+local MSL_POOL: number = 14
+local MSL_MOVE2: number = 4
+local INBOUND_RANGE: number = 300 * STUD_PER_M -- SAM inbound radius, 300 m expressed in studs
+local MSL_MAX_M: number = 5000
+local INBOUND_HOLD: number = 1
+local INBOUND_COOL: number = 5
+local MAX_TARGETS: number = 48
+local MAX_MODULES: number = 24
+local CACHE_RATE: number = 1
+local OCC_RATE: number = 2
+local RELOAD_RATE: number = 0.3
+local REQ_TRIES: number = 5
+local CAM_RATE: number = 1
+local SCREEN_RATE: number = 0.25
+local MENU_KEY: number = 0xA1
+local EPS: number = 0.0001
+local JOIN_EPS: number = 0.75
+
+-- No Armor
+local ARMOR_NAME: string = "ArmourValue" -- exact name of the value objects to zero
+-- ClassName is matched against this set (Instance:IsA is not available in Severe)
+local ARMOR_CLASSES: { [string]: boolean } = table.freeze({
+	NumberValue = true,
+	IntValue = true,
+	FloatValue = true,
+})
+local ARMOR_TICK: number = 0.25 -- PostModel work interval
+local ARMOR_SCAN_TRIES: number = 6 -- max searches per vehicle, parts can load after the hull
+local ARMOR_SCAN_GAP: number = 2 -- min seconds between two searches of the same vehicle
+local ARMOR_SCANS_PER_TICK: number = 1 -- max vehicle searches (GetDescendants) per tick
+local ARMOR_CHECK_RATE: number = 5 -- re-check interval of already found values
+
+local K_POLY, K_TRI, K_TEXT = 1, 2, 3
+
+local CLASS_ABBR: { [string]: string } = table.freeze({
+	["Main Battle Tank"] = "MBT",
+	["Medium Tank"] = "MT",
+	["Light Tank"] = "LT",
+	["Heavy Tank"] = "HT",
+	["Tank Destroyer"] = "TD",
+	["Infantry Fighting Vehicle"] = "IFV",
+	["Armored Personnel Carrier"] = "APC",
+	["Armoured Personnel Carrier"] = "APC",
+	["Self Propelled Howitzer"] = "SPH",
+	["Self Propelled Gun"] = "SPG",
+	["Self Propelled Anti Aircraft"] = "SPAA",
+	["Self-Propelled Anti-Aircraft"] = "SPAA",
+	["Anti-Air"] = "AA",
+	["Attack Helicopter"] = "AH",
+	["Helicopter"] = "HELI",
+})
+
+local Col = table.freeze({
+	Box = Color3.fromRGB(255, 255, 255),
+	Name = Color3.fromRGB(255, 255, 255),
+	Occupied = Color3.fromRGB(0, 255, 0),
+	Class = Color3.fromRGB(255, 180, 80),
+	Dist = Color3.fromRGB(140, 220, 255),
+	Ready = Color3.fromRGB(120, 200, 120),
+	Missile = Color3.fromRGB(255, 170, 40),
+	Threat = Color3.fromRGB(255, 40, 40),
+})
+
+local RELOAD_TEXT: { string } = table.freeze({ "READY", "RELOADING", "EMPTY" })
+local RELOAD_COL: { Color3 } = table.freeze({
+	Color3.fromRGB(120, 200, 120),
+	Color3.fromRGB(255, 180, 80),
+	Color3.fromRGB(255, 40, 40),
+})
+
+local MSL_PART: { [string]: boolean } = table.freeze({ MeshPart = true, Part = true, UnionOperation = true })
+
+local PROJ: { [string]: { label: string, threat: boolean } } = {}
+do
+	local function reg(label: string, threat: boolean, names: { string }): ()
+		for _, n in names do
+			PROJ[string.lower(n)] = { label = label, threat = threat }
+		end
+	end
+	reg("AA", true, { "SAM", "SAM1", "SAM2", "SAM3", "StingerRocket", "PATRIOTProj", "aim9m", "kugelblitz" })
+	reg("ATGM", false, {
+		"wireatgm", "roketatgm", "KornetATGMModel", "302ATM", "DragonATGM", "nlawmis", "STURM", "SS.11",
+		"losat", "testatgm", "Brimstone",
+	})
+	reg("AGM", false, { "agm65", "kh25ml", "kh35", "kh38mle" })
+	reg("Rocket", false, {
+		"MLRSRocket", "RP3RocketModel", "RP3Rocket", "RGB-60", "roket", "roketbeg", "RPG", "IskanderRocket", "HERO-120",
+	})
+	reg("Bomb", true, { "Bomb", "fab500m62", "mk842000lbs" })
+end
+
+local PALETTE: { Color3 } = table.freeze({
+	Color3.fromRGB(255, 140, 0),
+	Color3.fromRGB(255, 40, 40),
+	Color3.fromRGB(255, 220, 60),
+	Color3.fromRGB(60, 255, 120),
+	Color3.fromRGB(60, 200, 255),
+	Color3.fromRGB(80, 110, 255),
+	Color3.fromRGB(190, 90, 255),
+	Color3.fromRGB(255, 255, 255),
+})
+
+local SIGNS: { { number } } = table.freeze({
+	{ 1, 1, 1 },
+	{ 1, 1, -1 },
+	{ 1, -1, 1 },
+	{ 1, -1, -1 },
+	{ -1, 1, 1 },
+	{ -1, 1, -1 },
+	{ -1, -1, 1 },
+	{ -1, -1, -1 },
+})
+
+local Config: { [string]: any } = {
+	Enabled = true,
+	Box = true,
+	Names = true,
+	Class = true,
+	Distance = true,
+	ReloadStatus = false,
+	Heli = true,
+	Missile = false,
+	NoArmor = false, -- zeroes ArmourValue in cached vehicles (allies skipped while Team Check is on)
+	OccupiedOnly = false,
+	TeamCheck = true,
+	MaxDist = 3200,
+
+	ModOutline = true,
+	ModFilled = false,
+	ModEngine = true,
+	ModAmmo = true,
+	ModMaxDist = 1000,
+	EngineColor = PALETTE[1],
+	AmmoColor = PALETTE[2],
+}
+
+local ColorIdx: { [string]: number } = { EngineColor = 1, AmmoColor = 2 }
+
+local MAIN_ROWS: { { key: string, label: string } } = {
+	{ key = "Enabled", label = "Tank ESP" },
+	{ key = "Box", label = "Box ESP" },
+	{ key = "Names", label = "Names" },
+	{ key = "Class", label = "Vehicle Class" },
+	{ key = "Distance", label = "Distance" },
+	{ key = "ReloadStatus", label = "Reload Status" },
+	{ key = "Heli", label = "Helicopter ESP" },
+	{ key = "OccupiedOnly", label = "Occupied Only" },
+	{ key = "TeamCheck", label = "Team Check" },
+}
+
+local MISC_ROWS: { { key: string, label: string } } = {
+	{ key = "Missile", label = "Missile ESP + Inbound" },
+	{ key = "NoArmor", label = "No Armor" },
+}
+
+local MOD_ROWS: { { key: string, label: string, color: string? } } = {
+	{ key = "ModOutline", label = "Outline" },
+	{ key = "ModFilled", label = "Filled" },
+	{ key = "ModEngine", label = "Engine", color = "EngineColor" },
+	{ key = "ModAmmo", label = "Ammo", color = "AmmoColor" },
+}
+
+local running: boolean = true
+local Camera: any = nil
+local vpW: number = 1920
+local vpH: number = 1080
+
+local Cache: { [any]: Entry } = {}
+local Active: { Entry } = {}
+local TargetCount: number = 0
+
+-- Double buffer: PostLocal fills writeBuf, then publishes it as Front for Render.
+local EMPTY: Buffer = table.freeze({ n = 0, items = {} }) :: any
+local bufA: Buffer = { n = 0, items = {} }
+local bufB: Buffer = { n = 0, items = {} }
+local Front: Buffer = EMPTY
+local writeBuf: Buffer = bufA
+
+local function newPool(sides: number, thick: number): RingPool
+	return { list = {}, used = 0, sides = sides, thick = thick }
+end
+local HeliPool: RingPool = newPool(HELI_SIDES, 1.5)
+local MslPool: RingPool = newPool(12, 1.5)
+
+local MslContainers: { any } = {}
+local MslTargets: { MslTarget } = {}
+local MslPrev: { [any]: vector } = {}
+local projMemo: { [string]: any } = {}
+local lastMslT: number = 0
+local lastMslResolveT: number = -100
+local InboundUntil: number = 0
+local lastInboundNote: number = -100
+
+local UIState = {
+	X = 40,
+	Y = 60,
+	Visible = true,
+	Dragging = false,
+	DragOffset = { x = 0, y = 0 },
+}
+local MouseWasPressed: boolean = false
+local ActiveSlider: string? = nil
+local prevMenuKey: boolean = false
+
+local ptX: { number } = table.create(8, 0)
+local ptY: { number } = table.create(8, 0)
+local ord: { number } = table.create(8, 0)
+local stack: { number } = table.create(18, 0)
+local hullX: { number } = table.create(9, 0)
+local hullY: { number } = table.create(9, 0)
+local polysEng: { { Point } } = {}
+local polysAmmo: { { Point } } = {}
+
+local function v2(x: number, y: number): vector
+	return vector.create(x, y, 0)
+end
+
+local function getParent(inst: any): any
+	return inst.Parent
+end
+
+-- GC check: dead vehicles and projectiles never leave ghost markers.
+local function alive(inst: any): boolean
+	local ok, par = pcall(getParent, inst)
+	return ok and par ~= nil
+end
+
+local function child(inst: any, name: string): any
+	if not inst then
+		return nil
+	end
+	return inst:FindFirstChild(name)
+end
+
+local function readTeamName(plr: any): string?
+	local tm = plr.Team
+	if tm and tm.Parent then
+		return tm.Name
+	end
+	return nil
+end
+
+-- Memory-based attribute reader (boolean / number / string). Offsets and type pointers depend on the Roblox version.
+local ATTR_ROOT_OFFSET: number = 0x38
+local ATTR_STRIDE: number = 0x58
+local ATTR_VALUE_OFFSET: number = 0x18
+local ATTR_BASE: number = tonumber(memory.base) :: number
+local ATTR_TYPES: { [number]: string } = table.freeze({
+	[0x8947CD0] = "boolean",
+	[0x8947E10] = "number",
+	[0x8947E60] = "string",
+})
+local NODE_OFFS: { number } = table.freeze({ 0x0, 0x10 })
+
+local MISS_TTL: number = 0.9 -- seconds an absent attribute is not searched for again (below CACHE_RATE so retries are not skipped)
+local LEARN_BUDGET: number = 8 -- GetAttribute calls allowed in total to learn unknown type pointers
+local FAST_GIVEUP: number = 12 -- fast reads that found nothing, before any hit, until the fast reader is switched off
+
+local AttrNode: { [number]: { Root: number, Node: number } } = {}
+local AttrEntry: {
+	[number]: { Root: number, Attrs: { [string]: { Entry: number, Type: string } }, Miss: { [string]: number } },
+} = {}
+local LearnedTypes: { [number]: string } = {} -- type pointer (relative to the module base) -> "boolean" / "number" / "string" / "other"
+local learnLeft: number = LEARN_BUDGET
+local fastWorks: boolean = false -- true once the fast reader returned a value, from then on its misses are no longer counted
+local fastMisses: number = 0
+local fastOff: boolean = false -- set when the fast reader never worked (outdated offsets), GetAttribute is used instead
+
+local function isHeapPointer(v: any): boolean
+	return v ~= nil and v >= 0x10000000000 and v < 0x70000000000
+end
+
+local function getData(inst: any): number?
+	return tonumber(inst.Data)
+end
+
+local function readStdString(addr: any): string
+	if not addr or addr == 0 then
+		return ""
+	end
+	local okSize, size = pcall(memory.readu64, addr, 0x10)
+	local okCap, capacity = pcall(memory.readu64, addr, 0x18)
+	if not okSize or not okCap or not size or not capacity or size > 0x10000 then
+		return ""
+	end
+
+	local strAddr = addr
+	if capacity >= 16 then
+		local okPtr, ptr = pcall(memory.readu64, addr)
+		if not okPtr or not isHeapPointer(ptr) then
+			return ""
+		end
+		strAddr = ptr
+	end
+
+	local ok, value = pcall(memory.readstring, strAddr, 0)
+	if ok and value then
+		return value
+	end
+	return ""
+end
+
+local function readValue(entry: number, vt: string): any
+	local value = entry + ATTR_VALUE_OFFSET
+	if vt == "boolean" then
+		local ok, r = pcall(memory.readbool, value)
+		if ok then
+			return r
+		end
+		return nil
+	elseif vt == "number" then
+		local ok, r = pcall(memory.readf64, value)
+		if ok then
+			return r
+		end
+		return nil
+	end
+	return readStdString(value)
+end
+
+local function searchVector(first: any, packed: any, wanted: string): (number?, boolean)
+	if not isHeapPointer(first) or not packed then
+		return nil, false
+	end
+	local count = packed % 0x100000000
+	local capacity = math.floor(packed / 0x100000000)
+	if count <= 0 or count > capacity or capacity > 256 then
+		return nil, false
+	end
+
+	local valid = false
+	for i = 0, count - 1 do
+		local entry = first + i * ATTR_STRIDE
+		local ok, namePtr = pcall(memory.readu64, entry)
+		if ok and isHeapPointer(namePtr) then
+			local name = readStdString(namePtr + 0x8)
+			if name ~= "" and #name < 100 then
+				valid = true
+				if name == wanted then
+					return entry, true
+				end
+			end
+		end
+	end
+	return nil, valid
+end
+
+local function searchNode(node: number, wanted: string): (number?, boolean)
+	local ok1, first1 = pcall(memory.readu64, node, 0x8)
+	local ok2, packed1 = pcall(memory.readu64, node, 0x10)
+	if ok1 and ok2 then
+		local entry, valid = searchVector(first1, packed1, wanted)
+		if entry or valid then
+			return entry, valid
+		end
+	end
+
+	local ok3, packed2 = pcall(memory.readu64, node, 0x8)
+	local ok4, first2 = pcall(memory.readu64, node, 0x18)
+	if ok3 and ok4 then
+		local entry, valid = searchVector(first2, packed2, wanted)
+		if entry or valid then
+			return entry, valid
+		end
+	end
+	return nil, false
+end
+
+local function findAttrEntry(address: number, root: number, wanted: string): number?
+	local cached = AttrNode[address]
+	if cached and cached.Root == root then
+		local entry, valid = searchNode(cached.Node, wanted)
+		if valid then
+			return entry
+		end
+		AttrNode[address] = nil
+	end
+
+	local queue: { number } = { root }
+	local visited: { [number]: boolean } = {}
+	local qi: number = 1
+	local nodes: number = 0
+	while qi <= #queue and nodes < 64 do
+		local node = queue[qi]
+		qi += 1
+		if not visited[node] then
+			visited[node] = true
+			nodes += 1
+			local entry = searchNode(node, wanted)
+			if entry then
+				AttrNode[address] = { Root = root, Node = node }
+				return entry
+			end
+			for _, off in NODE_OFFS do
+				local ok, ptr = pcall(memory.readu64, node, off)
+				if ok and isHeapPointer(ptr) and not visited[ptr] then
+					queue[#queue + 1] = ptr
+				end
+			end
+		end
+	end
+	return nil
+end
+
+-- Counts a fast read that found nothing; with no hit so far this means the offsets are outdated.
+local function noteFastMiss(): ()
+	if fastWorks or fastOff then
+		return
+	end
+	fastMisses += 1
+	if fastMisses >= FAST_GIVEUP then
+		fastOff = true
+		pcall(send_notification, "Attribute fast reader off (offsets look outdated), using GetAttribute")
+	end
+end
+
+-- Type of an attribute entry from its type pointer; an unknown pointer is learned once from GetAttribute.
+local function resolveType(inst: any, name: string, tp: number): string?
+	local rva = tp - ATTR_BASE
+	local vt = ATTR_TYPES[rva] or LearnedTypes[rva]
+	if vt then
+		if vt == "other" then
+			return nil
+		end
+		return vt
+	end
+	if learnLeft <= 0 then
+		return nil
+	end
+	learnLeft -= 1
+	local ok, v = pcall(function()
+		return inst:GetAttribute(name)
+	end)
+	if not ok or v == nil then
+		return nil
+	end
+	local lt = type(v)
+	if lt ~= "boolean" and lt ~= "number" and lt ~= "string" then
+		lt = "other"
+	end
+	LearnedTypes[rva] = lt
+	if lt == "other" then
+		return nil
+	end
+	return lt
+end
+
+-- Entry + type are cached per (instance, name), absent attributes are not searched again for MISS_TTL.
+local function fastAttr(inst: any, name: string): any
+	if fastOff then
+		return nil
+	end
+	local okA, address = pcall(getData, inst)
+	if not okA or not address then
+		return nil
+	end
+	local okR, root = pcall(memory.readu64, address, ATTR_ROOT_OFFSET)
+	if not okR or not isHeapPointer(root) then
+		AttrNode[address] = nil
+		AttrEntry[address] = nil
+		return nil
+	end
+
+	local ic = AttrEntry[address]
+	if not ic or ic.Root ~= root then
+		ic = { Root = root, Attrs = {}, Miss = {} }
+		AttrEntry[address] = ic
+	end
+
+	local now = os.clock()
+	local missUntil = ic.Miss[name]
+	if missUntil and now < missUntil then
+		return nil
+	end
+
+	local c = ic.Attrs[name]
+	if c then
+		local okT, tp = pcall(memory.readu64, c.Entry, 0x8)
+		if okT and tp and (ATTR_TYPES[tp - ATTR_BASE] or LearnedTypes[tp - ATTR_BASE]) == c.Type then
+			local val = readValue(c.Entry, c.Type)
+			if val ~= nil then
+				fastWorks = true
+			end
+			return val
+		end
+		ic.Attrs[name] = nil
+	end
+
+	local entry = findAttrEntry(address, root, name)
+	if not entry then
+		ic.Miss[name] = now + MISS_TTL
+		noteFastMiss()
+		return nil
+	end
+	local okT, tp = pcall(memory.readu64, entry, 0x8)
+	if not okT or not tp then
+		return nil
+	end
+	local vt = resolveType(inst, name, tp)
+	if not vt then
+		ic.Miss[name] = now + MISS_TTL
+		noteFastMiss()
+		return nil
+	end
+	ic.Attrs[name] = { Entry = entry, Type = vt }
+	local val = readValue(entry, vt)
+	if val ~= nil then
+		fastWorks = true
+	end
+	return val
+end
+
+local function forgetAttrs(address: number): ()
+	AttrNode[address] = nil
+	AttrEntry[address] = nil
+end
+
+-- Fast reader first, built-in GetAttribute (slow on Severe) as a fallback for whatever the fast reader cannot return.
+-- An empty string or a string with NUL bytes from the fast reader is a failed decode, not a real value, so it falls back too.
+-- Callers are low frequency (vehicle build, Requester retries, Occupied every OCC_RATE).
+local function readAttr(inst: any, name: string): any
+	local v = fastAttr(inst, name)
+	if v ~= nil and not (type(v) == "string" and (v == "" or string.find(v, "\0", 1, true) ~= nil)) then
+		return v
+	end
+	return inst:GetAttribute(name)
+end
+
+local function collectModules(veh: any): { ModuleDef }
+	local out: { ModuleDef } = {}
+	local dm = child(veh, "DamageModules")
+	if not dm then
+		return out
+	end
+	for _, mdl in dm:GetChildren() do
+		for _, p in mdl:GetChildren() do
+			local nm: string = p.Name
+			local kind: string? = nil
+			if nm == "Engine" then
+				kind = "eng"
+			elseif string.match(nm, "^AmmoModel%d+$") then
+				kind = "ammo"
+			end
+			if kind then
+				local sz = p.Size
+				out[#out + 1] = { part = p, hx = sz.X * 0.5, hy = sz.Y * 0.5, hz = sz.Z * 0.5, kind = kind }
+			end
+		end
+	end
+	return out
+end
+
+local function buildEntry(veh: any): Entry?
+	local mass = child(child(veh, "Hull"), "Mass")
+	if not mass then
+		return nil
+	end
+	local sz = mass.Size
+	local kindRaw = readAttr(veh, "Type")
+	local classRaw = readAttr(veh, "VehicleClass")
+	return {
+		inst = veh,
+		anchor = mass,
+		hx = sz.X * 0.5,
+		hy = sz.Y * 0.5,
+		hz = sz.Z * 0.5,
+		name = veh.Name,
+		kind = if type(kindRaw) == "string" then kindRaw else "",
+		class = if type(classRaw) == "string" then (CLASS_ABBR[classRaw] or classRaw) else nil,
+		requester = nil,
+		reqTries = 0,
+		occupied = false,
+		occT = 0,
+		ally = nil,
+		mods = collectModules(veh),
+		modTries = 0,
+		gun = nil,
+		loaded = nil,
+		gunTries = 0,
+		rl = 0,
+		rlT = 0,
+		distM = -1,
+		distText = "",
+		armor = {},
+		armorScans = 0,
+		armorScanT = 0,
+		armorChkT = 0,
+	}
+end
+
+local function gunCaliber(name: string): number
+	local mm = string.match(name, "(%d+%.?%d*)mm")
+	if mm then
+		return tonumber(mm) or 0
+	end
+	local cal = string.match(name, "(%d+%.?%d*)%s*[Cc]al")
+	if cal then
+		return (tonumber(cal) or 0) / 100 * 25.4
+	end
+	return 0
+end
+
+local function findMainGun(veh: any): any
+	local weapons = child(child(child(veh, "Turrets"), "Turret1"), "Weapons")
+	if not weapons then
+		return nil
+	end
+	local best: any = nil
+	local bestCal: number = 0
+	for _, g in weapons:GetChildren() do
+		local c = gunCaliber(g.Name)
+		if c >= 20 and c > bestCal then
+			best = g
+			bestCal = c
+		end
+	end
+	return best
+end
+
+local function rebuildCache(): ()
+	local wantTeam: boolean = Config.TeamCheck
+
+	local myTeam: string? = nil
+	local teamOf: { [string]: string } = {}
+	if wantTeam and LocalPlayer then
+		myTeam = readTeamName(LocalPlayer)
+		if myTeam then
+			for _, plr in Players:GetChildren() do
+				local tn = readTeamName(plr)
+				if tn then
+					teamOf[plr.Name] = tn
+				end
+			end
+		end
+	end
+
+	local nextActive: { Entry } = {}
+	local seen: { [any]: boolean } = {}
+	local sv = Workspace:FindFirstChild("SpawnedVehicles")
+	if sv then
+		for _, veh in sv:GetChildren() do
+			local key = veh.Data
+			if not key then
+				continue
+			end
+			seen[key] = true
+			local e = Cache[key]
+			if not e then
+				e = buildEntry(veh)
+				if not e then
+					continue
+				end
+				Cache[key] = e
+			elseif #e.mods == 0 and e.modTries < 5 then
+				e.modTries += 1
+				e.mods = collectModules(veh)
+			end
+
+			-- Turrets may load after the hull, so the gun is searched only while Reload Status is on.
+			if Config.ReloadStatus and not e.gun and e.gunTries < 5 then
+				e.gunTries += 1
+				local gun = findMainGun(veh)
+				if gun then
+					e.gun = gun
+					e.loaded = child(gun, "CurrentlyLoaded")
+				end
+			end
+
+			e.ally = nil
+			if wantTeam and myTeam then
+				-- Requester never changes, so it is read until found and then cached.
+				if not e.requester and e.reqTries < REQ_TRIES then
+					e.reqTries += 1
+					local r = readAttr(veh, "Requester")
+					if type(r) == "string" then
+						e.requester = r
+					end
+				end
+				local req = e.requester
+				if req then
+					local tn = teamOf[req]
+					if tn then
+						e.ally = tn == myTeam
+					end
+				end
+			end
+			nextActive[#nextActive + 1] = e
+		end
+	end
+	for key in Cache do
+		if not seen[key] then
+			Cache[key] = nil
+			local addr = tonumber(key)
+			if addr then
+				forgetAttrs(addr)
+			end
+		end
+	end
+	Active = nextActive
+
+end
+
+local function updateScreenSize(): ()
+	local cam = Camera
+	if not cam then
+		return
+	end
+	local vp = cam.ViewportSize
+	if vp and vp.x > 0 and vp.y > 0 then
+		vpW, vpH = vp.x, vp.y
+	end
+end
+
+-- Projects the 8 box corners and keeps the on-screen ones.
+local function projectCorners(
+	cam: any,
+	pos: vector,
+	right: vector,
+	up: vector,
+	look: vector,
+	hx: number,
+	hy: number,
+	hz: number
+): number
+	local ax: vector = right * hx
+	local ay: vector = up * hy
+	local az: vector = look * hz
+	local n: number = 0
+	for _, s in SIGNS do
+		local sp, on = cam:WorldToScreenPoint(pos + ax * s[1] + ay * s[2] + az * s[3])
+		if on and sp then
+			n += 1
+			ptX[n] = sp.x
+			ptY[n] = sp.y
+		end
+	end
+	return n
+end
+
+local function cross(ox: number, oy: number, ax: number, ay: number, bx: number, by: number): number
+	return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+end
+
+-- Andrew monotone chain over ptX / ptY, writes hullX / hullY.
+local function convexHull(n: number): number
+	if n < 3 then
+		return 0
+	end
+	for i = 1, n do
+		ord[i] = i
+	end
+	for i = 2, n do
+		local cur = ord[i]
+		local cx, cy = ptX[cur], ptY[cur]
+		local j = i - 1
+		while j >= 1 do
+			local o = ord[j]
+			local ox, oy = ptX[o], ptY[o]
+			if ox > cx or (ox == cx and oy > cy) then
+				ord[j + 1] = o
+				j -= 1
+			else
+				break
+			end
+		end
+		ord[j + 1] = cur
+	end
+
+	local size: number = 0
+	for i = 1, n do
+		local p = ord[i]
+		local px, py = ptX[p], ptY[p]
+		while size >= 2 do
+			local a, b = stack[size - 1], stack[size]
+			if cross(ptX[a], ptY[a], ptX[b], ptY[b], px, py) <= 0 then
+				size -= 1
+			else
+				break
+			end
+		end
+		size += 1
+		stack[size] = p
+	end
+	local lower: number = size
+	for i = n - 1, 1, -1 do
+		local p = ord[i]
+		local px, py = ptX[p], ptY[p]
+		while size > lower do
+			local a, b = stack[size - 1], stack[size]
+			if cross(ptX[a], ptY[a], ptX[b], ptY[b], px, py) <= 0 then
+				size -= 1
+			else
+				break
+			end
+		end
+		size += 1
+		stack[size] = p
+	end
+	size -= 1
+	for i = 1, size do
+		local idx = stack[i]
+		hullX[i] = ptX[idx]
+		hullY[i] = ptY[idx]
+	end
+	return size
+end
+
+local function polygonArea(poly: { Point }): number
+	local area: number = 0
+	local count = #poly
+	for i = 1, count do
+		local a = poly[i]
+		local b = poly[i % count + 1]
+		area += a.X * b.Y - b.X * a.Y
+	end
+	return area * 0.5
+end
+
+local function reversePolygon(poly: { Point }): ()
+	local left = 1
+	local right = #poly
+	while left < right do
+		poly[left], poly[right] = poly[right], poly[left]
+		left += 1
+		right -= 1
+	end
+end
+
+local function expandPolygon(poly: { Point }, padding: number): ()
+	local cx: number = 0
+	local cy: number = 0
+	for _, pt in poly do
+		cx += pt.X
+		cy += pt.Y
+	end
+	cx /= #poly
+	cy /= #poly
+	for _, pt in poly do
+		local dx = pt.X - cx
+		local dy = pt.Y - cy
+		local len = math.sqrt(dx * dx + dy * dy)
+		if len > 0 then
+			pt.X += dx / len * padding
+			pt.Y += dy / len * padding
+		end
+	end
+end
+
+local function projectPolygon(
+	cam: any,
+	pos: vector,
+	right: vector,
+	up: vector,
+	look: vector,
+	hx: number,
+	hy: number,
+	hz: number
+): { Point }?
+	local n = projectCorners(cam, pos, right, up, look, hx, hy, hz)
+	if n < 3 then
+		return nil
+	end
+	local size = convexHull(n)
+	if size < 3 then
+		return nil
+	end
+	local poly: { Point } = {}
+	for i = 1, size do
+		poly[i] = { X = hullX[i], Y = hullY[i] }
+	end
+	if polygonArea(poly) < 0 then
+		reversePolygon(poly)
+	end
+	expandPolygon(poly, MOD_PAD)
+	return poly
+end
+
+local function pointInsideConvex(pt: Point, poly: { Point }): boolean
+	local count = #poly
+	for i = 1, count do
+		local a = poly[i]
+		local b = poly[i % count + 1]
+		if cross(a.X, a.Y, b.X, b.Y, pt.X, pt.Y) < -EPS then
+			return false
+		end
+	end
+	return true
+end
+
+local function segmentIntersectionT(a: Point, b: Point, c: Point, d: Point): number?
+	local rx = b.X - a.X
+	local ry = b.Y - a.Y
+	local sx = d.X - c.X
+	local sy = d.Y - c.Y
+	local den = rx * sy - ry * sx
+	if math.abs(den) <= EPS then
+		return nil
+	end
+	local qx = c.X - a.X
+	local qy = c.Y - a.Y
+	local t = (qx * sy - qy * sx) / den
+	local u = (qx * ry - qy * rx) / den
+	if t > EPS and t < 1 - EPS and u >= -EPS and u <= 1 + EPS then
+		return t
+	end
+	return nil
+end
+
+local function lerpPoint(a: Point, b: Point, t: number): Point
+	return { X = a.X + (b.X - a.X) * t, Y = a.Y + (b.Y - a.Y) * t }
+end
+
+local function buildBoundarySegments(polys: { { Point } }): { Segment }
+	local boundary: { Segment } = {}
+	for polyIndex, poly in polys do
+		for edgeIndex = 1, #poly do
+			local a = poly[edgeIndex]
+			local b = poly[edgeIndex % #poly + 1]
+			local splits: { number } = { 0, 1 }
+
+			for otherIndex, other in polys do
+				if otherIndex ~= polyIndex then
+					for otherEdge = 1, #other do
+						local t = segmentIntersectionT(a, b, other[otherEdge], other[otherEdge % #other + 1])
+						if t then
+							splits[#splits + 1] = t
+						end
+					end
+				end
+			end
+
+			table.sort(splits)
+			local clean: { number } = {}
+			for _, t in splits do
+				if #clean == 0 or math.abs(t - clean[#clean]) > EPS then
+					clean[#clean + 1] = t
+				end
+			end
+
+			for si = 1, #clean - 1 do
+				local t1 = clean[si]
+				local t2 = clean[si + 1]
+				if t2 - t1 <= EPS then
+					continue
+				end
+				local mid = lerpPoint(a, b, (t1 + t2) * 0.5)
+				local covered = false
+				for otherIndex, other in polys do
+					if otherIndex ~= polyIndex and pointInsideConvex(mid, other) then
+						covered = true
+						break
+					end
+				end
+				if not covered then
+					boundary[#boundary + 1] = { A = lerpPoint(a, b, t1), B = lerpPoint(a, b, t2) }
+				end
+			end
+		end
+	end
+	return boundary
+end
+
+local function samePoint(a: Point, b: Point): boolean
+	local dx = a.X - b.X
+	local dy = a.Y - b.Y
+	return dx * dx + dy * dy <= JOIN_EPS * JOIN_EPS
+end
+
+local function stitchBoundary(segments: { Segment }): { { Point } }
+	local loops: { { Point } } = {}
+	local used: { [number]: boolean } = {}
+	for startIndex, startSeg in segments do
+		if used[startIndex] then
+			continue
+		end
+		used[startIndex] = true
+		local loop: { Point } = { startSeg.A, startSeg.B }
+		local startPoint = startSeg.A
+		local current = startSeg.B
+		local guard = 0
+		while not samePoint(current, startPoint) and guard <= #segments do
+			guard += 1
+			local found = false
+			for index, seg in segments do
+				if used[index] then
+					continue
+				end
+				if samePoint(seg.A, current) then
+					used[index] = true
+					loop[#loop + 1] = seg.B
+					current = seg.B
+					found = true
+					break
+				elseif samePoint(seg.B, current) then
+					used[index] = true
+					loop[#loop + 1] = seg.A
+					current = seg.A
+					found = true
+					break
+				end
+			end
+			if not found then
+				break
+			end
+		end
+		if #loop >= 4 and samePoint(loop[#loop], startPoint) then
+			loop[#loop] = nil
+			if #loop >= 3 then
+				loops[#loops + 1] = loop
+			end
+		end
+	end
+	return loops
+end
+
+local function push(k: number, col: Color3, thick: number): Prim
+	local buf = writeBuf
+	local n = buf.n + 1
+	buf.n = n
+	local p = buf.items[n]
+	if not p then
+		p = { k = k, col = col, thick = thick, text = "", n = 0, hwm = 0, pts = {} }
+		buf.items[n] = p
+	end
+	p.k = k
+	p.col = col
+	p.thick = thick
+	p.n = 0
+	return p
+end
+
+local function finishPoly(p: Prim): ()
+	local n = p.n + 1
+	p.pts[n] = p.pts[1]
+	for i = n + 1, p.hwm do
+		p.pts[i] = nil
+	end
+	p.n = n
+	p.hwm = n
+end
+
+local function pushHull(size: number, color: Color3, thick: number): ()
+	local p = push(K_POLY, color, thick)
+	for i = 1, size do
+		p.pts[i] = v2(hullX[i], hullY[i])
+	end
+	p.n = size
+	finishPoly(p)
+end
+
+local function pushLoop(loop: { Point }, color: Color3, thick: number): ()
+	local p = push(K_POLY, color, thick)
+	local count = #loop
+	for i = 1, count do
+		local pt = loop[i]
+		p.pts[i] = v2(pt.X, pt.Y)
+	end
+	p.n = count
+	finishPoly(p)
+end
+
+local function pushFill(poly: { Point }, color: Color3): ()
+	local count = #poly
+	if count < 3 then
+		return
+	end
+	local a = v2(poly[1].X, poly[1].Y)
+	for i = 2, count - 1 do
+		local b = poly[i]
+		local c = poly[i + 1]
+		local p = push(K_TRI, color, 0)
+		p.pts[1] = a
+		p.pts[2] = v2(b.X, b.Y)
+		p.pts[3] = v2(c.X, c.Y)
+		p.n = 3
+	end
+end
+
+local function pushText(x: number, y: number, color: Color3, text: string, size: number?): ()
+	local p = push(K_TEXT, color, size or FONT)
+	p.pts[1] = v2(x, y)
+	p.text = text
+	p.n = 1
+end
+
+local function pushModules(polys: { { Point } }, color: Color3): ()
+	local count = #polys
+	if count == 0 then
+		return
+	end
+	if Config.ModFilled then
+		for _, poly in polys do
+			pushFill(poly, color)
+		end
+	end
+	if not Config.ModOutline then
+		return
+	end
+	if count == 1 then
+		pushLoop(polys[1], color, MOD_THICK)
+		return
+	end
+	local loops = stitchBoundary(buildBoundarySegments(polys))
+	if #loops == 0 then
+		for _, poly in polys do
+			pushLoop(poly, color, MOD_THICK)
+		end
+		return
+	end
+	for _, loop in loops do
+		pushLoop(loop, color, MOD_THICK)
+	end
+end
+
+-- Retained circles: DrawingImmediate.Circle has no NumSides and looks like a polygon.
+local function getRing(pool: RingPool, i: number): any
+	local c = pool.list[i]
+	if not c then
+		c = Drawing.new("Circle")
+		c.NumSides = pool.sides
+		c.Thickness = pool.thick
+		c.Filled = false
+		c.Opacity = 1
+		pool.list[i] = c
+	end
+	return c
+end
+
+local function finishRings(pool: RingPool, used: number): ()
+	for i = used + 1, pool.used do
+		pool.list[i].Visible = false
+	end
+	pool.used = used
+end
+
+local function hideAllRings(): ()
+	finishRings(HeliPool, 0)
+	finishRings(MslPool, 0)
+end
+
+local function projCat(nm: string): { label: string, threat: boolean }?
+	local c = projMemo[nm]
+	if c == nil then
+		c = PROJ[string.lower(nm)] or false
+		projMemo[nm] = c
+	end
+	if c then
+		return c
+	end
+	return nil
+end
+
+local function resolveMslContainers(now: number): ()
+	lastMslResolveT = now
+	local list: { any } = {}
+	local rs: any = game:GetService("ReplicatedStorage")
+	local bullets = child(child(child(rs, "PHRST"), "Shells"), "PhysicalBullets")
+	if bullets then
+		list[#list + 1] = bullets
+	end
+	local ter = Workspace:FindFirstChild("Terrain")
+	if ter then
+		list[#list + 1] = ter
+	end
+	MslContainers = list
+end
+
+-- A projectile counts as flying when it moved between scans; a SAM heading at the camera raises the inbound warning.
+local function scanMissiles(now: number, camPos: vector): ()
+	if #MslContainers == 0 or now - lastMslResolveT > 5 then
+		resolveMslContainers(now)
+	end
+	local out: { MslTarget } = {}
+	local seen: { [any]: boolean } = {}
+	local threatNear: boolean = false
+
+	for _, cont in MslContainers do
+		for _, c in cont:GetChildren() do
+			local cat = projCat(c.Name)
+			if not cat then
+				continue
+			end
+			local cn: string = c.ClassName
+			local anchor: any = nil
+			if cn == "Model" then
+				anchor = c.PrimaryPart
+			elseif MSL_PART[cn] then
+				anchor = c
+			end
+			local key = c.Data
+			if not anchor or not key then
+				continue
+			end
+			seen[key] = true
+
+			local pos: vector = anchor.CFrame.Position
+			local prev = MslPrev[key]
+			MslPrev[key] = pos
+			if not prev then
+				continue
+			end
+			local mv: vector = pos - prev
+			if vector.dot(mv, mv) <= MSL_MOVE2 then
+				continue
+			end
+			out[#out + 1] = { anchor = anchor, label = cat.label, threat = cat.threat, distM = -1, text = "" }
+
+			if cat.threat and cat.label == "AA" then
+				local toMe: vector = camPos - pos
+				if vector.dot(toMe, toMe) < INBOUND_RANGE * INBOUND_RANGE and vector.dot(mv, toMe) > 0 then
+					threatNear = true
+				end
+			end
+		end
+	end
+	for key in MslPrev do
+		if not seen[key] then
+			MslPrev[key] = nil
+		end
+	end
+	MslTargets = out
+
+	if threatNear then
+		InboundUntil = now + INBOUND_HOLD
+		if now - lastInboundNote >= INBOUND_COOL then
+			lastInboundNote = now
+			pcall(send_notification, "SAM inbound")
+		end
+	end
+end
+
+-- Occupied debug: prints what the fast reader and the final value look like (type, length, first bytes in hex).
+local DEBUG_OCC: boolean = true -- set to false when Occupied is confirmed working
+local occLogLeft: number = 8
+local occLogged: { [string]: boolean } = {}
+
+local function describeRaw(v: any): string
+	if type(v) ~= "string" then
+		return type(v) .. ":" .. tostring(v)
+	end
+	local n = #v
+	local parts: { string } = {}
+	for i = 1, math.min(n, 10) do
+		parts[i] = string.format("%02X", string.byte(v, i))
+	end
+	return `string len={n} hex={table.concat(parts, " ")}`
+end
+
+local function logOccupied(inst: any, final: any): ()
+	local tag = "fast[" .. describeRaw(fastAttr(inst, "Occupied")) .. "] final[" .. describeRaw(final) .. "]"
+	if not occLogged[tag] then
+		occLogged[tag] = true
+		occLogLeft -= 1
+		print("[TankESP] Occupied " .. tag)
+	end
+end
+
+local function buildFrame(now: number): ()
+	local cam = Camera
+	if not cam then
+		Front = EMPTY
+		TargetCount = 0
+		hideAllRings()
+		return
+	end
+	local camPos: vector = cam.Position
+	local camLook: vector = cam.LookVector
+
+	local maxStud: number = Config.MaxDist * STUD_PER_M
+	local maxSq: number = maxStud * maxStud
+	local modStud: number = Config.ModMaxDist * STUD_PER_M
+	local modSq: number = modStud * modStud
+	local modsOn: boolean = (Config.ModOutline or Config.ModFilled) and (Config.ModEngine or Config.ModAmmo)
+	local heliOn: boolean = Config.Heli
+	local occOnly: boolean = Config.OccupiedOnly
+	local teamChk: boolean = Config.TeamCheck
+	local showBox: boolean = Config.Box
+	local showName: boolean = Config.Names
+	local showClass: boolean = Config.Class
+	local showDist: boolean = Config.Distance
+	local showReload: boolean = Config.ReloadStatus
+	local wantOcc: boolean = showName or occOnly
+	local engColor: Color3 = Config.EngineColor
+	local ammoColor: Color3 = Config.AmmoColor
+
+	writeBuf.n = 0
+	local count: number = 0
+	local modCount: number = 0
+	local rings: number = 0
+
+	for _, e in Active do
+		if count >= MAX_TARGETS then
+			break
+		end
+		local isHeli = e.kind == "Heli"
+		if (isHeli and not heliOn) or (teamChk and e.ally == true) then
+			continue
+		end
+		local anchor = e.anchor
+		if not alive(anchor) then
+			continue
+		end
+
+		local cf = anchor.CFrame
+		local pos: vector = cf.Position
+		local rel: vector = pos - camPos
+		local d2: number = vector.dot(rel, rel)
+		-- Squared-distance culling, sqrt only for survivors.
+		if d2 > maxSq or vector.dot(rel, camLook) <= 0 then
+			continue
+		end
+
+		-- Occupied is read only for vehicles in range, at most once per OCC_RATE.
+		if wantOcc and now - e.occT >= OCC_RATE then
+			e.occT = now
+			local occ = readAttr(e.inst, "Occupied")
+			if DEBUG_OCC and occLogLeft > 0 then
+				logOccupied(e.inst, occ)
+			end
+			e.occupied = occ == true or occ == "true"
+		end
+		if occOnly and not e.occupied then
+			continue
+		end
+
+		count += 1
+		local distM: number = math.floor(math.sqrt(d2) * STUDS_TO_M)
+		if distM ~= e.distM then
+			e.distM = distM
+			e.distText = distM .. "m"
+		end
+		local nameCol: Color3 = if e.occupied then Col.Occupied else Col.Name
+
+		if isHeli then
+			local sp, on = cam:WorldToScreenPoint(pos)
+			if on and sp then
+				local x = math.floor(sp.x + 0.5)
+				local y = math.floor(sp.y + 0.5)
+				if x >= 0 and x <= vpW and y >= 0 and y <= vpH then
+					if showBox then
+						rings += 1
+						local ring = getRing(HeliPool, rings)
+						ring.Position = Vector2.new(x, y)
+						ring.Radius = HELI_R
+						ring.Color = Col.Box
+						ring.Visible = true
+					end
+					local yy = y - HELI_R - 4 - FONT
+					if showDist then
+						pushText(x, yy, Col.Dist, e.distText)
+						yy -= STEP
+					end
+					if showName then
+						pushText(x, yy, nameCol, e.name)
+					end
+				end
+			end
+			continue
+		end
+
+		-- Reload state is throttled and uses the fast reader only, no slow fallback.
+		if showReload and e.gun and now - e.rlT >= RELOAD_RATE then
+			e.rlT = now
+			local rl = fastAttr(e.gun, "reloading")
+			if rl == true or (type(rl) == "string" and rl ~= "" and string.lower(rl) ~= "false") then
+				e.rl = 2
+			else
+				local lv = e.loaded
+				local shell = if lv then lv.Value else nil
+				if type(shell) == "string" and shell ~= "" and shell ~= "Unloaded" then
+					e.rl = 1
+				else
+					e.rl = 3
+				end
+			end
+		end
+
+		local size = convexHull(projectCorners(cam, pos, cf.RightVector, cf.UpVector, cf.LookVector, e.hx, e.hy, e.hz))
+		if size >= 3 then
+			local minX: number = math.huge
+			local maxX: number = -math.huge
+			local minY: number = math.huge
+			for i = 1, size do
+				local px = hullX[i]
+				local py = hullY[i]
+				if px < minX then
+					minX = px
+				end
+				if px > maxX then
+					maxX = px
+				end
+				if py < minY then
+					minY = py
+				end
+			end
+			if showBox then
+				pushHull(size, Col.Box, BOX_THICK)
+			end
+			local cx = math.floor((minX + maxX) * 0.5)
+			local yy = math.floor(minY) - 4 - FONT
+			if showDist then
+				pushText(cx, yy, Col.Dist, e.distText)
+				yy -= STEP
+			end
+			if showName then
+				pushText(cx, yy, nameCol, e.name)
+				yy -= STEP
+			end
+			local cls = e.class
+			if showClass and cls then
+				pushText(cx, yy, Col.Class, cls)
+				yy -= STEP
+			end
+			-- Reload status is the topmost label.
+			if showReload and e.gun and e.rl > 0 then
+				pushText(cx, yy, RELOAD_COL[e.rl], RELOAD_TEXT[e.rl])
+			end
+		end
+
+		if modsOn and d2 <= modSq then
+			table.clear(polysEng)
+			table.clear(polysAmmo)
+			for _, m in e.mods do
+				if modCount >= MAX_MODULES then
+					break
+				end
+				local isEng = m.kind == "eng"
+				if ((isEng and Config.ModEngine) or (not isEng and Config.ModAmmo)) and alive(m.part) then
+					local mcf = m.part.CFrame
+					local poly = projectPolygon(
+						cam, mcf.Position, mcf.RightVector, mcf.UpVector, mcf.LookVector, m.hx, m.hy, m.hz
+					)
+					if poly then
+						modCount += 1
+						local list = if isEng then polysEng else polysAmmo
+						list[#list + 1] = poly
+					end
+				end
+			end
+			pushModules(polysEng, engColor)
+			pushModules(polysAmmo, ammoColor)
+		end
+	end
+
+	finishRings(HeliPool, rings)
+
+	local mslN: number = 0
+	if Config.Missile then
+		if now - lastMslT >= MSL_RATE then
+			lastMslT = now
+			scanMissiles(now, camPos)
+		end
+		for _, t in MslTargets do
+			if mslN >= MSL_POOL then
+				break
+			end
+			local anchor = t.anchor
+			if not alive(anchor) then
+				continue
+			end
+			local pos: vector = anchor.CFrame.Position
+			local sp, on = cam:WorldToScreenPoint(pos)
+			if on and sp then
+				local x = math.floor(sp.x + 0.5)
+				local y = math.floor(sp.y + 0.5)
+				local rel: vector = pos - camPos
+				local distM: number = math.floor(math.sqrt(vector.dot(rel, rel)) * STUDS_TO_M)
+				if distM > MSL_MAX_M then
+					continue
+				end
+				if distM ~= t.distM then
+					t.distM = distM
+					t.text = t.label .. "  " .. distM .. "m"
+				end
+				local col: Color3 = if t.threat then Col.Threat else Col.Missile
+				mslN += 1
+				local ring = getRing(MslPool, mslN)
+				ring.Position = Vector2.new(x, y)
+				ring.Radius = 6
+				ring.Color = col
+				ring.Visible = true
+				pushText(x, y - 18, col, t.text)
+			end
+		end
+		if now < InboundUntil then
+			pushText(math.floor(vpW * 0.5), math.floor(vpH * 0.12), Col.Threat, "!! SAM INBOUND !!", 22)
+		end
+	elseif #MslTargets > 0 then
+		MslTargets = {}
+		table.clear(MslPrev)
+	end
+	finishRings(MslPool, mslN)
+
+	TargetCount = count
+	Front = writeBuf
+	writeBuf = if writeBuf == bufA then bufB else bufA
+end
+
+local T = table.freeze({
+	W = 290,
+	Bg = Color3.fromRGB(15, 15, 17),
+	Divider = Color3.fromRGB(26, 26, 30),
+	TextMain = Color3.fromRGB(255, 255, 255),
+	TextRow = Color3.fromRGB(166, 166, 172),
+	TextOff = Color3.fromRGB(94, 94, 101),
+	TextDim = Color3.fromRGB(72, 72, 78),
+	Chip = Color3.fromRGB(23, 23, 26),
+	Track = Color3.fromRGB(26, 26, 30),
+	PillBg = Color3.fromRGB(28, 28, 32),
+	PillLine = Color3.fromRGB(60, 60, 66),
+	PillBgOff = Color3.fromRGB(20, 20, 23),
+	PillLineOff = Color3.fromRGB(38, 38, 43),
+	Knob = Color3.fromRGB(245, 245, 247),
+	KnobOff = Color3.fromRGB(96, 96, 104),
+	White = Color3.new(1, 1, 1),
+})
+
+local HEADER_H: number = 38
+local MAIN_ROW_H: number = 28
+local PART_ROW_H: number = 24
+local PART_GAP: number = 1
+local SLIDER_ROW_H: number = 56
+local MENU_GAP: number = 10
+local T2W: number = 230
+local PANEL2_H: number = HEADER_H + 1 + #MISC_ROWS * MAIN_ROW_H + 10
+local PANEL_H: number = HEADER_H + 1 + MAIN_ROW_H * #MAIN_ROWS + 3 + SLIDER_ROW_H + 9
+	+ 30 + #MOD_ROWS * (PART_ROW_H + PART_GAP) + 3 + SLIDER_ROW_H + 6 + 32
+
+local function cycleColor(key: string): ()
+	local idx = (ColorIdx[key] or 0) % #PALETTE + 1
+	ColorIdx[key] = idx
+	Config[key] = PALETTE[idx]
+end
+
+-- Keys arrive as virtual-key numbers or names depending on the game, accept both.
+local function processKeys(): ()
+	local keyDown: boolean = false
+	if isrbxactive() then
+		local keys: any = getpressedkeys()
+		keyDown = table.find(keys, MENU_KEY) ~= nil or table.find(keys, "RightShift") ~= nil
+	end
+	if keyDown and not prevMenuKey then
+		UIState.Visible = not UIState.Visible
+	end
+	prevMenuKey = keyDown
+end
+
+local function drawBuffer(buf: Buffer): ()
+	local items = buf.items
+	for i = 1, buf.n do
+		local p = items[i]
+		local k = p.k
+		if k == K_POLY then
+			DrawingImmediate.Polyline(p.pts, p.col, 1, p.thick)
+		elseif k == K_TRI then
+			DrawingImmediate.FilledTriangle(p.pts[1], p.pts[2], p.pts[3], p.col, MOD_FILL_A)
+		elseif k == K_TEXT then
+			DrawingImmediate.OutlinedText(p.pts[1], p.thick, p.col, 1, p.text, true)
+		end
+	end
+end
+
+-- Immediate mode has no rounding, so corners are built from rectangles and circles.
+local function RoundRect(x: number, y: number, w: number, h: number, r: number, color: Color3): ()
+	if r <= 3 then
+		DrawingImmediate.FilledRectangle(v2(x + 1, y), v2(w - 2, h), color, 1)
+		DrawingImmediate.FilledRectangle(v2(x, y + 1), v2(w, h - 2), color, 1)
+		return
+	end
+	DrawingImmediate.FilledRectangle(v2(x + r, y), v2(w - 2 * r, h), color, 1)
+	DrawingImmediate.FilledRectangle(v2(x, y + r), v2(r, h - 2 * r), color, 1)
+	DrawingImmediate.FilledRectangle(v2(x + w - r, y + r), v2(r, h - 2 * r), color, 1)
+	DrawingImmediate.FilledCircle(v2(x + r, y + r), r, color, 1)
+	DrawingImmediate.FilledCircle(v2(x + w - r, y + r), r, color, 1)
+	DrawingImmediate.FilledCircle(v2(x + r, y + h - r), r, color, 1)
+	DrawingImmediate.FilledCircle(v2(x + w - r, y + h - r), r, color, 1)
+end
+
+local function DrawPill(x: number, y: number, w: number, h: number, on: boolean): ()
+	RoundRect(x, y, w, h, 5, if on then T.PillLine else T.PillLineOff)
+	RoundRect(x + 1, y + 1, w - 2, h - 2, 4, if on then T.PillBg else T.PillBgOff)
+	local knob: number = 10
+	local kx: number = if on then (x + w - knob - 4) else (x + 4)
+	RoundRect(kx, y + (h - knob) / 2, knob, knob, 3, if on then T.Knob else T.KnobOff)
+end
+
+local function DrawToggleRow(
+	x: number, y: number, w: number, h: number,
+	label: string, enabled: boolean,
+	clicked: boolean, mp: vector, swatch: Color3?
+): (boolean, boolean)
+	local labelX: number = x + 10
+	if swatch then
+		DrawingImmediate.FilledRectangle(v2(x + 10, y + h / 2 - 3), v2(6, 6), swatch, 1)
+		labelX = x + 22
+	end
+	DrawingImmediate.Text(v2(labelX, y + h / 2 - 6), 13, if enabled then T.TextRow else T.TextOff, 1, label, false)
+
+	local pillW: number = 32
+	local pillH: number = 18
+	DrawPill(x + w - pillW - 10, y + (h - pillH) / 2, pillW, pillH, enabled)
+
+	local inRow: boolean = clicked and mp.x >= x and mp.x <= x + w and mp.y >= y and mp.y <= y + h
+	local onSwatch: boolean = swatch ~= nil and inRow and mp.x <= x + 22
+	return inRow and not onSwatch, onSwatch
+end
+
+local function DrawSliderRow(
+	x: number, y: number, w: number, id: string,
+	label: string, value: number, minV: number, maxV: number, suffix: string,
+	clicked: boolean, ldown: boolean, mp: vector
+): number
+	DrawingImmediate.Text(v2(x + 10, y + 9), 11, T.TextDim, 1, label, false)
+
+	local valStr = tostring(math.floor(value)) .. suffix
+	RoundRect(x + w - 55, y + 9, 45, 14, 4, T.Chip)
+	DrawingImmediate.Text(v2(x + w - 32.5, y + 10), 11, T.TextMain, 1, valStr, true)
+
+	local tX: number = x + 10
+	local tW: number = w - 20
+	local tC: number = y + 43
+
+	if clicked and mp.x >= tX - 6 and mp.x <= tX + tW + 6 and mp.y >= tC - 10 and mp.y <= tC + 10 then
+		ActiveSlider = id
+	end
+	if not ldown then
+		ActiveSlider = nil
+	end
+
+	if ActiveSlider == id then
+		local rel = math.clamp((mp.x - tX) / tW, 0, 1)
+		value = math.floor((minV + rel * (maxV - minV)) / 10 + 0.5) * 10
+		value = math.clamp(value, minV, maxV)
+	end
+
+	RoundRect(tX, tC - 2, tW, 4, 2, T.Track)
+
+	local frac: number = math.clamp((value - minV) / (maxV - minV), 0, 1)
+	local thumbX: number = tX + math.floor(tW * frac) - 5
+	RoundRect(thumbX, tC - 5, 10, 10, 3, T.Knob)
+
+	return value
+end
+
+local function drawUI(): ()
+	local active: boolean = isrbxactive()
+	local ldown: boolean = active and isleftpressed()
+	local clicked: boolean = ldown and not MouseWasPressed
+	MouseWasPressed = ldown
+	local mp: vector = getmouseposition()
+
+	if ldown then
+		if not UIState.Dragging then
+			if clicked and UIState.Visible and ActiveSlider == nil
+			and mp.x >= UIState.X and mp.x <= UIState.X + T.W + MENU_GAP + T2W
+			and mp.y >= UIState.Y and mp.y <= UIState.Y + HEADER_H then
+				UIState.Dragging = true
+				UIState.DragOffset.x = mp.x - UIState.X
+				UIState.DragOffset.y = mp.y - UIState.Y
+			end
+		else
+			UIState.X = mp.x - UIState.DragOffset.x
+			UIState.Y = mp.y - UIState.DragOffset.y
+		end
+	else
+		UIState.Dragging = false
+	end
+	-- The menu cannot leave the screen.
+	UIState.X = math.clamp(UIState.X, 0, math.max(0, vpW - (T.W + MENU_GAP + T2W)))
+	UIState.Y = math.clamp(UIState.Y, 0, math.max(0, vpH - PANEL_H))
+
+	if not UIState.Visible then
+		return
+	end
+
+	local ux: number = UIState.X
+	local uy: number = UIState.Y
+	local uw: number = T.W
+
+	RoundRect(ux, uy, uw, PANEL_H, 10, T.Bg)
+
+	DrawingImmediate.FilledRectangle(v2(ux + 18, uy + 18), v2(6, 6), T.White, 1)
+	DrawingImmediate.Text(v2(ux + 30, uy + 14), 13, T.TextMain, 1, "SEVERE | MTC", false)
+	DrawingImmediate.Text(v2(ux + 31, uy + 14), 13, T.TextMain, 1, "SEVERE | MTC", false)
+	DrawingImmediate.Text(v2(ux + uw - 26, uy + 13), 14, T.TextDim, 1, "x", false)
+	if clicked and mp.x >= ux + uw - 28 and mp.x <= ux + uw and mp.y >= uy and mp.y <= uy + HEADER_H then
+		UIState.Visible = false
+		return
+	end
+
+	local x2: number = ux + uw + MENU_GAP
+	RoundRect(x2, uy, T2W, PANEL2_H, 10, T.Bg)
+	DrawingImmediate.Text(v2(x2 + 18, uy + 14), 11, T.TextDim, 1, "MISC", false)
+	local yo2: number = uy + HEADER_H + 1
+	for _, row in MISC_ROWS do
+		local hit = DrawToggleRow(x2 + 8, yo2, T2W - 16, MAIN_ROW_H, row.label, Config[row.key] == true, clicked, mp, nil)
+		if hit then
+			Config[row.key] = not Config[row.key]
+		end
+		yo2 += MAIN_ROW_H
+	end
+
+	local yo: number = uy + HEADER_H + 1
+
+	for _, row in MAIN_ROWS do
+		local hit = DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, row.label, Config[row.key] == true, clicked, mp, nil)
+		if hit then
+			Config[row.key] = not Config[row.key]
+		end
+		yo += MAIN_ROW_H
+	end
+	yo += 3
+
+	Config.MaxDist = DrawSliderRow(
+		ux + 8, yo, uw - 16, "maxdist", "MAX DISTANCE", Config.MaxDist, 0, 4000, " m", clicked, ldown, mp
+	)
+	yo += SLIDER_ROW_H + 9
+
+	DrawingImmediate.FilledRectangle(v2(ux + 12, yo), v2(uw - 24, 1), T.Divider, 1)
+	DrawingImmediate.Text(v2(ux + 18, yo + 12), 11, T.TextDim, 1, "MODULES", false)
+	yo += 30
+
+	for _, row in MOD_ROWS do
+		local colorKey = row.color
+		local swatch: Color3? = if colorKey then Config[colorKey] else nil
+		local hit, swatchHit = DrawToggleRow(
+			ux + 8, yo, uw - 16, PART_ROW_H, row.label, Config[row.key] == true, clicked, mp, swatch
+		)
+		if swatchHit and colorKey then
+			cycleColor(colorKey)
+		elseif hit then
+			Config[row.key] = not Config[row.key]
+		end
+		yo += PART_ROW_H + PART_GAP
+	end
+	yo += 3
+
+	Config.ModMaxDist = DrawSliderRow(
+		ux + 8, yo, uw - 16, "moddist", "MODULE DISTANCE", Config.ModMaxDist, 0, 4000, " m", clicked, ldown, mp
+	)
+	yo += SLIDER_ROW_H + 6
+
+	DrawingImmediate.FilledRectangle(v2(ux + 12, yo), v2(uw - 24, 1), T.Divider, 1)
+	DrawingImmediate.Text(v2(ux + 18, yo + 11), 11, T.TextDim, 1, "Targets:", false)
+	DrawingImmediate.Text(v2(ux + 74, yo + 11), 11, T.TextRow, 1, tostring(TargetCount), false)
+	DrawingImmediate.Text(v2(ux + 114, yo + 11), 11, T.TextDim, 1, "Team check:", false)
+	DrawingImmediate.Text(v2(ux + 194, yo + 11), 11, T.TextMain, 1, if Config.TeamCheck then "ON" else "OFF", false)
+end
+
+-- No Armor (PostModel, driven by the vehicle cache)
+
+-- Zeroes every found ArmourValue that is not zero yet
+local function zeroArmorList(list: { any }): ()
+	for _, v in list do
+		if v.Value ~= 0 then
+			v.Value = 0
+		end
+	end
+end
+
+-- Searches one vehicle for ArmourValue objects (a single GetDescendants call) and remembers them
+local function scanArmor(e: Entry): ()
+	local found: { any } = {}
+	for _, d in e.inst:GetDescendants() do
+		if d.Name == ARMOR_NAME and ARMOR_CLASSES[d.ClassName] then
+			found[#found + 1] = d
+		end
+	end
+	e.armor = found
+end
+
+-- Zeroes the vehicle's found values, a failed read means a stale object so the list is dropped
+local function zeroEntry(e: Entry, now: number): ()
+	e.armorChkT = now
+	if not pcall(zeroArmorList, e.armor) then
+		e.armor = {}
+	end
+end
+
+local lastArmorT: number = 0
+
+local function onPostModel(): ()
+	if not running or not Config.NoArmor then
+		return
+	end
+	local now = os.clock()
+	if now - lastArmorT < ARMOR_TICK then
+		return
+	end
+	lastArmorT = now
+
+	local list = Active -- snapshot, rebuildCache swaps the table instead of editing it
+	local teamChk: boolean = Config.TeamCheck
+	local scansLeft: number = ARMOR_SCANS_PER_TICK
+	for _, e in list do
+		if teamChk and e.ally == true then
+			continue
+		end
+
+		-- Search again while nothing was found yet (parts can load after the hull), and once more after the first hit
+		local wantScan = e.armorScans < ARMOR_SCAN_TRIES and (#e.armor == 0 or e.armorScans < 2)
+		local scanned = false
+		if wantScan and scansLeft > 0 and now - e.armorScanT >= ARMOR_SCAN_GAP then
+			scansLeft -= 1
+			e.armorScanT = now
+			e.armorScans += 1
+			if pcall(scanArmor, e) then
+				zeroEntry(e, now)
+			end
+			scanned = true
+		end
+
+		if not scanned and #e.armor > 0 and now - e.armorChkT >= ARMOR_CHECK_RATE then
+			zeroEntry(e, now)
+		end
+	end
+end
+
+local lastCamT: number = 0
+local lastScreenT: number = 0
+local lastCacheT: number = 0
+
+local function onPostLocal(): ()
+	if not running then
+		return
+	end
+	local now = os.clock()
+
+	if now - lastCamT >= CAM_RATE then
+		lastCamT = now
+		Camera = Workspace.CurrentCamera
+	end
+	if now - lastScreenT >= SCREEN_RATE then
+		lastScreenT = now
+		updateScreenSize()
+	end
+	processKeys()
+
+	local espOn: boolean = Config.Enabled
+	if not espOn and not Config.NoArmor then
+		Front = EMPTY
+		TargetCount = 0
+		hideAllRings()
+		return
+	end
+	-- The cache also feeds No Armor, so it keeps rebuilding while either feature is on.
+	if now - lastCacheT >= CACHE_RATE then
+		lastCacheT = now
+		rebuildCache()
+	end
+	if espOn then
+		buildFrame(now)
+	else
+		Front = EMPTY
+		TargetCount = 0
+		hideAllRings()
+	end
+end
+
+local function onRender(): ()
+	if not running then
+		return
+	end
+	drawBuffer(Front)
+	drawUI()
+end
+
+local connRender: any = RunService.Render:Connect(onRender)
+local connLogic: any = RunService.PostLocal:Connect(onPostLocal)
+local connModel: any = RunService.PostModel:Connect(onPostModel)
+
+local function disconnect(conn: any): ()
+	local ok = pcall(function()
+		conn:Disconnect()
+	end)
+	if not ok then
+		pcall(function()
+			conn:disconnect()
+		end)
+	end
+end
+
+local function stop(): ()
+	running = false
+	disconnect(connRender)
+	disconnect(connLogic)
+	disconnect(connModel)
+	for _, pool in { HeliPool, MslPool } do
+		for _, ring in pool.list do
+			ring:Remove()
+		end
+		table.clear(pool.list)
+		pool.used = 0
+	end
+end
+
+_G.TankESP = { stop = stop }
+
+pcall(send_notification, "Tank ESP loaded - RIGHT SHIFT toggles the menu")
