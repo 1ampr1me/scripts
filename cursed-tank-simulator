@@ -1,0 +1,836 @@
+--!strict
+--!optimize 2
+
+-- Remove the previous run (connections) so nothing is drawn twice
+local G = _G :: any
+if G.CTS_Cleanup then
+    pcall(G.CTS_Cleanup)
+end
+
+local Players    = game:GetService("Players")
+local Workspace  = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = Workspace.CurrentCamera
+
+local floor = math.floor
+local sqrt  = math.sqrt
+local huge  = math.huge
+local vec   = vector.create
+
+-- 3D box library; falls back to flat markers if it fails to load
+local Highlighter: any = nil
+do
+    local ok, lib = pcall(function()
+        return loadstring(game:HttpGet("https://raw.githubusercontent.com/Andris303/Libraries/refs/heads/main/Highlighter.lua"))()
+    end)
+    if ok and lib ~= nil then
+        Highlighter = lib
+    end
+end
+
+local RANGE_MIN: number = 100
+local RANGE_MAX: number = 3000
+
+local ESP = {
+    Enabled      = true,
+    ShowBox      = true,
+    TeamCheck    = true,
+    ShowName     = true,
+    ShowDistance = true,
+    PartBoxes    = Highlighter ~= nil,
+    HLArgs       = table.freeze({ 0.18, 0.7, 0.7 }),
+    BoxColor     = Color3.fromRGB(0, 220, 255),
+    FillColor    = Color3.fromRGB(0, 220, 255),
+    TextColor    = Color3.fromRGB(255, 255, 255),
+    OutlineColor = Color3.fromRGB(0, 60, 120),
+    BoxThickness = 2,
+    CornerLength = 8,
+    BoxOpacity   = 1,
+    FillOpacity  = 0.08,
+    DIST_DIVISOR = 3.571428571,
+    TankSize     = Vector3.new(12, 8, 20),
+    Separator    = " | ",
+    Range        = 1000, -- meters
+    ScansPerTick = 2,
+    RescanEvery  = 5,
+}
+
+local HALF = ESP.TankSize * 0.5
+local CORNERS: { Vector3 } = {
+    Vector3.new(-HALF.x, -HALF.y, -HALF.z), Vector3.new(-HALF.x, -HALF.y,  HALF.z),
+    Vector3.new(-HALF.x,  HALF.y, -HALF.z), Vector3.new(-HALF.x,  HALF.y,  HALF.z),
+    Vector3.new( HALF.x, -HALF.y, -HALF.z), Vector3.new( HALF.x, -HALF.y,  HALF.z),
+    Vector3.new( HALF.x,  HALF.y, -HALF.z), Vector3.new( HALF.x,  HALF.y,  HALF.z),
+}
+
+type Kind = { label: string, color: Color3, circle: boolean }
+
+local KINDS: { Kind } = table.freeze({
+    table.freeze({ label = "Ammunition", color = Color3.fromRGB(255,  30,  30), circle = true  }), -- bright red
+    table.freeze({ label = "Engine",     color = Color3.fromRGB(255, 140,   0), circle = true  }), -- orange
+    table.freeze({ label = "Fuel Tank",  color = Color3.fromRGB(255, 230,   0), circle = true  }), -- yellow
+    table.freeze({ label = "Cannon",     color = Color3.fromRGB(120, 255, 190), circle = true  }), -- mint green
+    table.freeze({ label = "Commander",  color = Color3.fromRGB(170, 255,   0), circle = false }), -- acid green
+    table.freeze({ label = "Gunner",     color = Color3.fromRGB(255,  30, 160), circle = false }), -- hot pink
+    table.freeze({ label = "Driver",     color = Color3.fromRGB( 40, 210, 255), circle = false }), -- neon light blue
+    table.freeze({ label = "Loader",     color = Color3.fromRGB(170,  70, 255), circle = false }), -- purple
+})
+local KIND_COUNT: number = #KINDS
+
+local NAME_TO_KIND: { [string]: number } = table.freeze({
+    ["Ammunition"] = 1,
+    ["Engine"]     = 2,
+    ["Fuel Tank"]  = 3,
+    ["FuelTank"]   = 3,
+    ["Fuel"]       = 3,
+    ["Cannon"]     = 4,
+    ["Commander"]  = 5,
+    ["Gunner"]     = 6,
+    ["Driver"]     = 7,
+    ["Loader"]     = 8,
+})
+
+local PART_CLASSES: { [string]: boolean } = table.freeze({
+    Part            = true,
+    MeshPart        = true,
+    UnionOperation  = true,
+    WedgePart       = true,
+    CornerWedgePart = true,
+    TrussPart       = true,
+    Seat            = true,
+    VehicleSeat     = true,
+    SpawnLocation   = true,
+})
+
+local PartOn: { boolean } = { false, false, false, false, false, false, false, false }
+
+local T = table.freeze({
+    W           = 290,
+    Bg          = Color3.fromRGB(15, 15, 17),
+    Divider     = Color3.fromRGB(26, 26, 30),
+    TextMain    = Color3.fromRGB(255, 255, 255),
+    TextRow     = Color3.fromRGB(166, 166, 172),
+    TextOff     = Color3.fromRGB(94, 94, 101),
+    TextDim     = Color3.fromRGB(72, 72, 78),
+    Chip        = Color3.fromRGB(23, 23, 26),
+    Track       = Color3.fromRGB(26, 26, 30),
+    PillBg      = Color3.fromRGB(28, 28, 32),
+    PillLine    = Color3.fromRGB(60, 60, 66),
+    PillBgOff   = Color3.fromRGB(20, 20, 23),
+    PillLineOff = Color3.fromRGB(38, 38, 43),
+    Knob        = Color3.fromRGB(245, 245, 247),
+    KnobOff     = Color3.fromRGB(96, 96, 104),
+    White       = Color3.new(1, 1, 1),
+    Black       = Color3.new(0, 0, 0),
+    ZFBtn       = table.freeze({ X = 0, W = 44, H = 44 }),
+})
+
+local ZF_ON  = Color3.fromRGB(13, 13, 15)
+local ZF_OFF = Color3.fromRGB(11, 11, 13)
+
+local UIState = {
+    X          = 200,
+    Y          = 100,
+    Visible    = true,
+    Dragging   = false,
+    DragOffset = { x = 0, y = 0 },
+}
+
+local MouseWasPressed: boolean = false
+local RShiftWasDown:   boolean = false
+local SliderActive:    boolean = false
+
+-- Written in PostLocal, read in Render
+type StoredEntry = {
+    hullNode: BasePart?,
+    name:     string,
+    teammate: boolean,
+    parts:    { [number]: { BasePart } },
+    scanned:  boolean,
+    scanAge:  number,
+    visible:  boolean,
+    inRange:  boolean,
+    minX:     number,
+    minY:     number,
+    maxX:     number,
+    maxY:     number,
+    label:    string,
+    lastDist: number,
+}
+local Stored: { [Model]: StoredEntry } = {}
+local TankCount: number = 0
+
+type Marker = { kind: number, x: number, y: number, r: number, part: BasePart? }
+local MAX_MARKERS: number = 250
+local Markers: { Marker } = {}
+for i = 1, MAX_MARKERS do
+    Markers[i] = { kind = 1, x = 0, y = 0, r = 5, part = nil }
+end
+local MarkerCount: number = 0
+
+local LocalHullNode:  BasePart? = nil
+local VehiclesFolder: Instance? = Workspace:FindFirstChild("Vehicles")
+
+local function anyPartOn(): boolean
+    for i = 1, KIND_COUNT do
+        if PartOn[i] then return true end
+    end
+    return false
+end
+
+local function getPlayerTeam(playerName: string): Team?
+    for _, p in Players:GetChildren() do
+        if p.ClassName == "Player" and p.Name == playerName then
+            return (p :: Player).Team
+        end
+    end
+    return nil
+end
+
+local function ownerOf(chassisName: string): string
+    local s = chassisName:gsub("Chassis", "")
+    s = s:gsub("^%s+", "")
+    return s
+end
+
+local function isTeammate(ownerName: string): boolean
+    if not ESP.TeamCheck then return false end
+    if ownerName == "" then return false end
+    local localTeam = LocalPlayer.Team
+    if not localTeam then return false end
+    local targetTeam = getPlayerTeam(ownerName)
+    if not targetTeam then return false end
+    return localTeam == targetTeam
+end
+
+local function readParent(obj: Instance): Instance?
+    return obj.Parent
+end
+
+--- True only while the instance still has a valid Parent (safe against dead pointers).
+local function alive(obj: Instance): boolean
+    local ok, parent = pcall(readParent, obj)
+    return ok and parent ~= nil
+end
+
+local function readAlivePosition(obj: BasePart): Vector3?
+    if obj.Parent == nil then return nil end
+    return obj.Position
+end
+
+--- HullNode must be a real part (a constraint can share the name).
+local function findHullNode(model: Instance): BasePart?
+    for _, child in model:GetChildren() do
+        if child.Name == "HullNode" and PART_CLASSES[child.ClassName] then
+            return child :: BasePart
+        end
+    end
+    return nil
+end
+
+--- Garbage collector: drops destroyed parts from the cached lists.
+local function pruneParts(data: StoredEntry)
+    for k = 1, KIND_COUNT do
+        local list = data.parts[k]
+        local n = 0
+        for i = 1, #list do
+            local p = list[i]
+            if alive(p) then
+                n += 1
+                list[n] = p
+            end
+        end
+        for i = #list, n + 1, -1 do
+            list[i] = nil
+        end
+    end
+end
+
+--- Groups matching descendants of a vehicle by module kind.
+local function scanVehicle(vehicle: Model): { [number]: { BasePart } }
+    local out: { [number]: { BasePart } } = {}
+    for k = 1, KIND_COUNT do out[k] = {} end
+    local added: { [Instance]: boolean } = {}
+
+    local function add(k: number, part: Instance)
+        if added[part] then return end
+        added[part] = true
+        local list = out[k]
+        list[#list + 1] = part :: BasePart
+    end
+
+    for _, obj in vehicle:GetDescendants() do
+        local k = NAME_TO_KIND[obj.Name]
+        if not k then continue end
+
+        local cn = obj.ClassName
+        if PART_CLASSES[cn] then
+            add(k, obj)
+        elseif cn == "Model" then
+            local pp = (obj :: Model).PrimaryPart
+            if pp then
+                add(k, pp)
+            else
+                for _, child in obj:GetChildren() do
+                    if PART_CLASSES[child.ClassName] then
+                        add(k, child)
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function vehicleCache()
+    if not VehiclesFolder then
+        VehiclesFolder = Workspace:FindFirstChild("Vehicles")
+        if not VehiclesFolder then return end
+    end
+    local vf = VehiclesFolder :: Instance
+
+    local cam = Workspace.CurrentCamera
+    if cam then
+        Camera = cam
+        if Highlighter and Highlighter.SetCamera then
+            pcall(Highlighter.SetCamera, cam)
+        end
+    end
+
+    local current: { [Model]: boolean } = {}
+    local localName = LocalPlayer.Name
+    local wantParts = anyPartOn()
+    local scanBudget: number = ESP.ScansPerTick
+
+    local own = vf:FindFirstChild("Chassis" .. localName)
+    LocalHullNode = if own then findHullNode(own) else nil
+
+    for _, chassis in vf:GetChildren() do
+        if not chassis.Name:match("^Chassis") then continue end
+        local ownerName = ownerOf(chassis.Name)
+        if ownerName == localName then continue end
+
+        local model = chassis :: Model
+        current[model] = true
+
+        local entry = Stored[model]
+        if not entry then
+            entry = {
+                hullNode = nil,
+                name     = ownerName,
+                teammate = false,
+                parts    = {},
+                scanned  = false,
+                scanAge  = 0,
+                visible  = false,
+                inRange  = false,
+                minX = 0, minY = 0, maxX = 0, maxY = 0,
+                label    = "",
+                lastDist = -2,
+            }
+            for k = 1, KIND_COUNT do (entry.parts)[k] = {} end
+            Stored[model] = entry
+        end
+
+        local hn = entry.hullNode
+        if not hn or not alive(hn) then
+            entry.hullNode = findHullNode(model)
+        end
+
+        entry.teammate = isTeammate(entry.name)
+
+        if wantParts and entry.scanned then
+            pruneParts(entry)
+        end
+
+        entry.scanAge += 0.5
+        if wantParts and scanBudget > 0 and not entry.teammate
+        and (not entry.scanned or entry.scanAge >= ESP.RescanEvery) then
+            scanBudget -= 1
+            entry.parts   = scanVehicle(model)
+            entry.scanned = true
+            entry.scanAge = 0
+        end
+    end
+
+    local count = 0
+    for c in Stored do
+        if not current[c] then
+            Stored[c] = nil
+        else
+            count += 1
+        end
+    end
+    TankCount = count
+end
+
+--- Reads CFrame, so it must run in PostLocal.
+local function getHullNodeBounds(hullNode: BasePart): (number?, number?, number?, number?)
+    local minX, minY =  huge,  huge
+    local maxX, maxY = -huge, -huge
+
+    local cf      = hullNode.CFrame
+    local cfPos   = cf.Position
+    local cfRight = cf.RightVector
+    local cfUp    = cf.UpVector
+    local cfLook  = cf.LookVector
+
+    for i = 1, 8 do
+        local o = CORNERS[i]
+        local world = cfPos + (cfRight * o.x) + (cfUp * o.y) + (cfLook * o.z)
+        local s, on = Camera:WorldToScreenPoint(world)
+        if not on then return nil, nil, nil, nil end
+        local sx, sy = s.x, s.y
+        if sx < minX then minX = sx end
+        if sy < minY then minY = sy end
+        if sx > maxX then maxX = sx end
+        if sy > maxY then maxY = sy end
+    end
+
+    return minX, minY, maxX, maxY
+end
+
+local function partRadius(d: number): number
+    if d <= 15  then return 7 end
+    if d <= 100 then return 5 end
+    return floor(5 - 2 * math.clamp((d - 100) / 400, 0, 1))
+end
+
+--- One tank per call, wrapped in pcall by the caller so a dead object only affects itself.
+local function updateEntry(
+    data: StoredEntry, vpx: number, vpy: number,
+    camPos: Vector3, rangeSq: number, ownPos: Vector3?, wantParts: boolean
+)
+    data.visible = false
+    if data.teammate then return end
+
+    if wantParts then
+        for k = 1, KIND_COUNT do
+            if not PartOn[k] then continue end
+            local list = data.parts[k]
+            for j = 1, #list do
+                if MarkerCount >= MAX_MARKERS then break end
+                local p = list[j]
+                if not p.Parent then continue end
+
+                local pos = p.Position
+                local dx = pos.x - camPos.x
+                local dy = pos.y - camPos.y
+                local dz = pos.z - camPos.z
+                local dsq = dx*dx + dy*dy + dz*dz
+                if dsq > rangeSq then continue end
+
+                local s, on = Camera:WorldToScreenPoint(pos)
+                if not on then continue end
+                local sx, sy = s.x, s.y
+                if sx < 5 or sx > vpx - 5 or sy < 5 or sy > vpy - 5 then continue end
+
+                MarkerCount += 1
+                local m = Markers[MarkerCount]
+                m.kind = k
+                m.x    = sx
+                m.y    = sy
+                m.r    = partRadius(floor(sqrt(dsq) / ESP.DIST_DIVISOR))
+                m.part = p
+            end
+        end
+    end
+
+    local hullNode = data.hullNode
+    if not hullNode or not hullNode.Parent then return end
+
+    local minX, minY, maxX, maxY = getHullNodeBounds(hullNode)
+    if not minX then return end
+
+    local w = (maxX :: number) - (minX :: number)
+    local h = (maxY :: number) - (minY :: number)
+    if w <= 0 or h <= 0 or w > vpx or h > vpy then return end
+
+    local hpos = hullNode.Position
+    local rdx = hpos.x - camPos.x
+    local rdy = hpos.y - camPos.y
+    local rdz = hpos.z - camPos.z
+    data.inRange = (rdx*rdx + rdy*rdy + rdz*rdz) <= rangeSq
+
+    local dist = -1
+    if ownPos then
+        local dx, dy, dz = ownPos.x - hpos.x, ownPos.y - hpos.y, ownPos.z - hpos.z
+        dist = floor(sqrt(dx*dx + dy*dy + dz*dz) / ESP.DIST_DIVISOR)
+    end
+
+    -- rebuild the label only when the distance changes
+    if dist ~= data.lastDist then
+        data.lastDist = dist
+        local text = ESP.ShowName and data.name or ""
+        if dist >= 0 then
+            local d = tostring(dist) .. "m"
+            text = text ~= "" and (text .. ESP.Separator .. d) or d
+        end
+        data.label = text
+    end
+
+    data.minX    = minX :: number
+    data.minY    = minY :: number
+    data.maxX    = maxX :: number
+    data.maxY    = maxY :: number
+    data.visible = true
+end
+
+local function updateScreen()
+    MarkerCount = 0
+    if not ESP.Enabled then return end
+
+    local vpSize = Camera.ViewportSize
+    local vpx: number = vpSize.x
+    local vpy: number = vpSize.y
+
+    local ownPos: Vector3? = nil
+    if ESP.ShowDistance and LocalHullNode then
+        local ok, pos = pcall(readAlivePosition, LocalHullNode :: BasePart)
+        if ok then ownPos = pos end
+    end
+
+    local wantParts = anyPartOn()
+    local camPos    = Camera.CFrame.Position
+    local rangeStuds: number = ESP.Range * ESP.DIST_DIVISOR
+    local rangeSq:    number = rangeStuds * rangeStuds
+
+    for _, data in Stored do
+        local ok = pcall(updateEntry, data, vpx, vpy, camPos, rangeSq, ownPos, wantParts)
+        if not ok then
+            -- dead pointer: hide this tank, drop its dead parts, re-resolve HullNode on the next tick
+            data.visible  = false
+            data.hullNode = nil
+            pruneParts(data)
+        end
+    end
+end
+
+-- Filled rounded rectangle; immediate mode has no rounding, so it is built from rectangles and corner circles
+local function RoundRect(x: number, y: number, w: number, h: number, r: number, color: Color3)
+    if r <= 3 then
+        -- small radius: a 1px chamfer is indistinguishable and much cheaper
+        DrawingImmediate.FilledRectangle(vec(x + 1, y, 0), vec(w - 2, h, 0), color, 1)
+        DrawingImmediate.FilledRectangle(vec(x, y + 1, 0), vec(w, h - 2, 0), color, 1)
+        return
+    end
+    DrawingImmediate.FilledRectangle(vec(x + r, y, 0),         vec(w - 2 * r, h, 0),     color, 1)
+    DrawingImmediate.FilledRectangle(vec(x, y + r, 0),         vec(r, h - 2 * r, 0),     color, 1)
+    DrawingImmediate.FilledRectangle(vec(x + w - r, y + r, 0), vec(r, h - 2 * r, 0),     color, 1)
+    DrawingImmediate.FilledCircle(vec(x + r,     y + r,     0), r, color, 1)
+    DrawingImmediate.FilledCircle(vec(x + w - r, y + r,     0), r, color, 1)
+    DrawingImmediate.FilledCircle(vec(x + r,     y + h - r, 0), r, color, 1)
+    DrawingImmediate.FilledCircle(vec(x + w - r, y + h - r, 0), r, color, 1)
+end
+
+-- Toggle pill with a 1px outline and a square knob (right = on, left = off)
+local function DrawPill(x: number, y: number, w: number, h: number, on: boolean)
+    RoundRect(x,     y,     w,     h,     5, on and T.PillLine or T.PillLineOff)
+    RoundRect(x + 1, y + 1, w - 2, h - 2, 4, on and T.PillBg   or T.PillBgOff)
+    local knob: number = 10
+    local kx: number = on and (x + w - knob - 4) or (x + 4)
+    RoundRect(kx, y + (h - knob) / 2, knob, knob, 3, on and T.Knob or T.KnobOff)
+end
+
+local function hline(x: number, y: number, len: number, c: Color3, thick: number)
+    DrawingImmediate.FilledRectangle(
+        vec(x, y - floor(thick / 2), 0), vec(len, thick, 0), c, 1)
+end
+
+local function vline(x: number, y: number, len: number, c: Color3, thick: number)
+    DrawingImmediate.FilledRectangle(
+        vec(x - floor(thick / 2), y, 0), vec(thick, len, 0), c, 1)
+end
+
+local function DrawCornerBox(minX: number, minY: number, maxX: number, maxY: number, color: Color3)
+    local cl = math.min(ESP.CornerLength, (maxX - minX) * 0.35, (maxY - minY) * 0.35)
+    local oc = ESP.OutlineColor
+    local t  = ESP.BoxThickness
+    local ot = t + 2
+
+    hline(minX,      minY, cl, oc, ot)   vline(minX, minY,      cl, oc, ot)
+    hline(minX,      minY, cl, color, t) vline(minX, minY,      cl, color, t)
+    hline(maxX - cl, minY, cl, oc, ot)   vline(maxX, minY,      cl, oc, ot)
+    hline(maxX - cl, minY, cl, color, t) vline(maxX, minY,      cl, color, t)
+    hline(minX,      maxY, cl, oc, ot)   vline(minX, maxY - cl, cl, oc, ot)
+    hline(minX,      maxY, cl, color, t) vline(minX, maxY - cl, cl, color, t)
+    hline(maxX - cl, maxY, cl, oc, ot)   vline(maxX, maxY - cl, cl, oc, ot)
+    hline(maxX - cl, maxY, cl, color, t) vline(maxX, maxY - cl, cl, color, t)
+end
+
+--- Returns true if the row was clicked.
+local function DrawToggleRow(
+    x: number, y: number, w: number, h: number,
+    label: string, enabled: boolean,
+    clicked: boolean, mp: vector, swatch: Color3?
+): boolean
+    local labelX: number = x + 10
+    if swatch then
+        DrawingImmediate.FilledRectangle(vec(x + 10, y + h / 2 - 3, 0), vec(6, 6, 0), swatch, 1)
+        labelX = x + 22
+    end
+    DrawingImmediate.Text(vec(labelX, y + h / 2 - 6, 0), 13,
+        enabled and T.TextRow or T.TextOff, 1, label, false)
+
+    local pillW: number = 32
+    local pillH: number = 18
+    DrawPill(x + w - pillW - 10, y + (h - pillH) / 2, pillW, pillH, enabled)
+
+    return clicked and mp.x >= x and mp.x <= x + w and mp.y >= y and mp.y <= y + h
+end
+
+--- Returns the new value; keeps dragging while the button is held.
+local function DrawSliderRow(
+    x: number, y: number, w: number,
+    label: string, value: number, minV: number, maxV: number, suffix: string,
+    clicked: boolean, ldown: boolean, mp: vector
+): number
+    DrawingImmediate.Text(vec(x + 10, y + 9, 0), 11, T.TextDim, 1, label, false)
+
+    local valStr = tostring(floor(value)) .. suffix
+    RoundRect(x + w - 55, y + 9, 45, 14, 4, T.Chip)
+    DrawingImmediate.Text(vec(x + w - 32.5, y + 10, 0), 11, T.TextMain, 1, valStr, true)
+
+    local tX: number = x + 10
+    local tW: number = w - 20
+    local tC: number = y + 43 -- vertical center of the track
+
+    if clicked and mp.x >= tX - 6 and mp.x <= tX + tW + 6 and mp.y >= tC - 10 and mp.y <= tC + 10 then
+        SliderActive = true
+    end
+    if not ldown then SliderActive = false end
+
+    if SliderActive then
+        local rel = math.clamp((mp.x - tX) / tW, 0, 1)
+        value = floor((minV + rel * (maxV - minV)) / 10 + 0.5) * 10
+        value = math.clamp(value, minV, maxV)
+    end
+
+    RoundRect(tX, tC - 2, tW, 4, 2, T.Track)
+
+    local frac: number = math.clamp((value - minV) / (maxV - minV), 0, 1)
+    local thumbX: number = tX + floor(tW * frac) - 5
+    RoundRect(thumbX, tC - 5, 10, 10, 3, T.Knob)
+
+    return value
+end
+
+local function CheckClick(): boolean
+    local pressed: boolean = (isleftpressed and isleftpressed()) or false
+    local fired:   boolean = pressed and not MouseWasPressed
+    MouseWasPressed        = pressed
+    return fired
+end
+
+local function render()
+    if not ESP.Enabled then return end
+
+    local fillC, fillO = ESP.FillColor, ESP.FillOpacity
+    local outC,  boxC  = ESP.OutlineColor, ESP.BoxColor
+    local boxO,  thick = ESP.BoxOpacity, ESP.BoxThickness
+    local showBox = ESP.ShowBox
+
+    for _, data in Stored do
+        if not data.visible then continue end
+
+        local minX, minY, maxX, maxY = data.minX, data.minY, data.maxX, data.maxY
+
+        if showBox and data.inRange then
+            local pos  = vec(minX, minY, 0)
+            local size = vec(maxX - minX, maxY - minY, 0)
+
+            DrawingImmediate.FilledRectangle(pos, size, fillC, fillO)
+            DrawingImmediate.Rectangle(pos, size, outC, 1, thick + 2)
+            DrawingImmediate.Rectangle(pos, size, boxC, boxO, thick)
+
+            DrawCornerBox(minX, minY, maxX, maxY, boxC)
+        end
+
+        local label = data.label
+        if label ~= "" then
+            DrawingImmediate.OutlinedText(
+                vec((minX + maxX) / 2, minY - 16, 0),
+                13, ESP.TextColor, 1, label, true)
+        end
+    end
+
+    local useBoxes = ESP.PartBoxes and Highlighter ~= nil
+    local a, b, c3 = ESP.HLArgs[1], ESP.HLArgs[2], ESP.HLArgs[3]
+    local black = T.Black
+
+    for i = 1, MarkerCount do
+        local m = Markers[i]
+        local k = KINDS[m.kind]
+        local part = m.part
+
+        if useBoxes and part then
+            pcall(Highlighter.Highlight, part, k.color, a, b, c3)
+        elseif k.circle then
+            local center = vec(m.x, m.y, 0)
+            DrawingImmediate.FilledCircle(center, m.r, k.color, 0.9)
+            DrawingImmediate.Circle(center, m.r + 1, black, 1, 1.5)
+        else
+            local p  = vec(m.x - m.r, m.y - m.r, 0)
+            local sz = vec(m.r * 2, m.r * 2, 0)
+            DrawingImmediate.FilledRectangle(p, sz, k.color, 0.9)
+            DrawingImmediate.Rectangle(p, sz, black, 1, 1.5)
+        end
+    end
+end
+
+local vehicleTimer: number = 0
+local lastError: string = ""
+
+-- On error, hide everything so stale frames are not left on screen
+local function guarded(fn: () -> ())
+    local ok, err = pcall(fn)
+    if ok then return end
+
+    MarkerCount = 0
+    for _, data in Stored do data.visible = false end
+
+    local msg = tostring(err)
+    if msg ~= lastError then
+        lastError = msg
+        print("[CTS] " .. msg)
+    end
+end
+
+local postConn = RunService.PostLocal:Connect(function(dt: number)
+    vehicleTimer += dt
+    if vehicleTimer >= 0.5 then
+        vehicleTimer = 0
+        guarded(vehicleCache)
+    end
+
+    guarded(updateScreen)
+
+    local keys: { string } = getpressedkeys()
+    local rshiftDown: boolean = table.find(keys, "RightShift") ~= nil
+    if rshiftDown and not RShiftWasDown then
+        UIState.Visible = not UIState.Visible
+    end
+    RShiftWasDown = rshiftDown
+end)
+
+local HEADER_H:     number = 38
+local MAIN_ROW_H:   number = 28
+local PART_ROW_H:   number = 24
+local PART_GAP:     number = 1
+local SLIDER_ROW_H: number = 56
+local MAIN_ROWS:    number = 4
+local PANEL_H: number = HEADER_H + 1 + MAIN_ROW_H * MAIN_ROWS + 3 + SLIDER_ROW_H + 9
+    + 30 + KIND_COUNT * (PART_ROW_H + PART_GAP) + 6 + 32
+
+local renderConn = RunService.Render:Connect(function()
+    render()
+
+    local mp:      vector  = getmouseposition()
+    local clicked: boolean = CheckClick()
+    local ldown:   boolean = (isleftpressed and isleftpressed()) or false
+
+    if ldown then
+        if not UIState.Dragging then
+            if UIState.Visible and not SliderActive
+            and mp.x >= UIState.X and mp.x <= UIState.X + T.W
+            and mp.y >= UIState.Y and mp.y <= UIState.Y + HEADER_H then
+                UIState.Dragging     = true
+                UIState.DragOffset.x = mp.x - UIState.X
+                UIState.DragOffset.y = mp.y - UIState.Y
+            end
+        else
+            local vpSize = Camera.ViewportSize
+            UIState.X = math.clamp(mp.x - UIState.DragOffset.x, 0, vpSize.x - T.W)
+            UIState.Y = math.clamp(mp.y - UIState.DragOffset.y, 0, vpSize.y - PANEL_H)
+        end
+    else
+        UIState.Dragging = false
+    end
+
+    local zf  = T.ZFBtn
+    local zfY: number = UIState.Y
+    RoundRect(zf.X, zfY, zf.W, zf.H, 7, UIState.Visible and ZF_ON or ZF_OFF)
+    local cx: number = zf.X + 22
+    local cy: number = zfY + 22
+    RoundRect(cx - 8, cy - 1, 16, 3, 1, T.White)
+    RoundRect(cx - 1, cy - 8, 3, 16, 1, T.White)
+    if clicked
+    and mp.x >= zf.X and mp.x <= zf.X + zf.W
+    and mp.y >= zfY  and mp.y <= zfY + zf.H then
+        UIState.Visible = not UIState.Visible
+    end
+
+    if not UIState.Visible then return end
+
+    local ux: number = UIState.X
+    local uy: number = UIState.Y
+    local uw: number = T.W
+
+    RoundRect(ux, uy, uw, PANEL_H, 10, T.Bg)
+
+    DrawingImmediate.FilledRectangle(vec(ux + 18, uy + 18, 0), vec(6, 6, 0), T.White, 1)
+    DrawingImmediate.Text(vec(ux + 30, uy + 14, 0), 13, T.TextMain, 1, "SEVERE | CTS", false)
+    DrawingImmediate.Text(vec(ux + 31, uy + 14, 0), 13, T.TextMain, 1, "SEVERE | CTS", false) -- second pass = bolder title
+    DrawingImmediate.Text(vec(ux + uw - 26, uy + 13, 0), 14, T.TextDim, 1, "x", false)
+    if clicked
+    and mp.x >= ux + uw - 28 and mp.x <= ux + uw
+    and mp.y >= uy            and mp.y <= uy + HEADER_H then
+        UIState.Visible = false
+        return
+    end
+
+    local yo: number = uy + HEADER_H + 1
+
+    if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "ESP", ESP.Enabled, clicked, mp, nil) then
+        ESP.Enabled = not ESP.Enabled
+    end
+    yo += MAIN_ROW_H
+
+    if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "BOX", ESP.ShowBox, clicked, mp, nil) then
+        ESP.ShowBox = not ESP.ShowBox
+    end
+    yo += MAIN_ROW_H
+
+    local modLabel = Highlighter and "Modules" or "Modules (n/a)"
+    if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, modLabel, ESP.PartBoxes, clicked, mp, nil) then
+        if Highlighter then ESP.PartBoxes = not ESP.PartBoxes end
+    end
+    yo += MAIN_ROW_H
+
+    if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Team check", ESP.TeamCheck, clicked, mp, nil) then
+        ESP.TeamCheck = not ESP.TeamCheck
+    end
+    yo += MAIN_ROW_H + 3
+
+    ESP.Range = DrawSliderRow(ux + 8, yo, uw - 16, "DRAW RANGE", ESP.Range,
+        RANGE_MIN, RANGE_MAX, " m", clicked, ldown, mp)
+    yo += SLIDER_ROW_H + 9
+
+    DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
+    DrawingImmediate.Text(vec(ux + 18, yo + 12, 0), 11, T.TextDim, 1, "PARTS", false)
+    yo += 30
+
+    for i = 1, KIND_COUNT do
+        local k = KINDS[i]
+        if DrawToggleRow(ux + 8, yo, uw - 16, PART_ROW_H, k.label, PartOn[i], clicked, mp, k.color) then
+            PartOn[i] = not PartOn[i]
+        end
+        yo += PART_ROW_H + PART_GAP
+    end
+    yo += 6
+
+    DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
+    DrawingImmediate.Text(vec(ux + 18,  yo + 11, 0), 11, T.TextDim,  1, "Targets:", false)
+    DrawingImmediate.Text(vec(ux + 74,  yo + 11, 0), 11, T.TextRow,  1, tostring(TankCount), false)
+    DrawingImmediate.Text(vec(ux + 114, yo + 11, 0), 11, T.TextDim,  1, "Team check:", false)
+    DrawingImmediate.Text(vec(ux + 194, yo + 11, 0), 11, T.TextMain, 1,
+        ESP.TeamCheck and "ON" or "OFF", false)
+end)
+
+G.CTS_Cleanup = function()
+    pcall(function() postConn:Disconnect() end)
+    pcall(function() renderConn:Disconnect() end)
+end
