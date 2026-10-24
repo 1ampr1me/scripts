@@ -1,0 +1,1849 @@
+--!strict
+--!optimize 2
+
+-- Severe | War Tycoon: ESP, Auto buy, Collect money, Infinite ammo, Teleports, Restrictions.
+-- PostLocal = every memory read/write and input sampling. Render = DrawingImmediate only
+-- (memory calls inside Render are not allowed by Severe and were a source of crashes).
+
+type Inst = any
+
+-- Remove the previous run so connections are never doubled (re-executing crashes Severe otherwise)
+local G = _G :: any
+if G.WarTycoonCleanup then
+	pcall(G.WarTycoonCleanup)
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local vec = vector.create
+local floor = math.floor
+local sqrt = math.sqrt
+
+local localPlayer: Inst = Players.LocalPlayer
+if localPlayer == nil then
+	return
+end
+local localName: string = localPlayer.Name
+
+local alive = true -- set to false by the cleanup function; stops every loop and thread
+
+-- ───────────────────────── Config ─────────────────────────
+
+-- Timers (seconds)
+local REBUILD_RATE = 1 -- ESP entity list rescan (GetChildren / attributes)
+local LOGIC_RATE = 0.03 -- ESP positions, distances, key binds
+local SLOW_RATE = 1 -- camera, character, viewport
+local BUY_RATE = 1 -- pause between auto-buy passes
+local BUY_DWELL = 1 -- seconds spent standing on a button so the purchase registers
+local COLLECT_EVERY = 15 -- auto buy collects money every this many seconds
+local AMMO_EVERY = 10 -- infinite ammo is re-applied this often (newly loaded guns)
+local INFINITE_AMMO = 999999999
+local COLLECT_DWELL = 0.5 -- seconds spent at the collector
+local MAX_MARKERS = 256 -- ESP markers drawn per frame
+local LINE_STEP = 15 -- vertical gap between the three ESP lines
+local PLAYERS_RATE = 3 -- seconds between player scans (teams, admin check)
+local NEAR_STUDS = 700 -- vehicles closer than this are read on every logic tick
+local MID_RATE = 0.1 -- read interval of farther in-range vehicles
+local FAR_RATE = 0.25 -- read interval of hidden / out-of-range vehicles
+local ALIVE_CHECK = 0.5 -- how often a vehicle's Parent is checked
+local LABEL_RATE = 0.1 -- how often the distance text is rebuilt
+local OWNER_SCANS_PER_REBUILD = 3 -- max deep owner searches (one attribute read per child) per rebuild
+local TYCOON_RETRY = 3 -- seconds before a missing tycoon is searched again
+local CALIB_PIXELS = 2.5 -- max difference between the Lua projection and WorldToScreenPoint
+local OWNER_RETRY = 5 -- seconds before an unknown vehicle owner is looked up again
+
+local RANGE_MIN: number = 250 -- draw range slider limits (studs)
+local RANGE_MAX: number = 5000
+
+type Category = {
+	key: string, -- toggle id
+	folder: string, -- child of workspace["Game Systems"] holding these vehicles
+	label: string, -- menu text
+	color: Color3, -- ESP color and menu swatch
+}
+
+-- Vehicle folders under workspace["Game Systems"]
+local CATEGORIES: { Category } = table.freeze({
+	{ key = "submarine", folder = "Submarine Workspace", label = "Submarine", color = Color3.fromRGB(255, 100, 100) },
+	{ key = "boat", folder = "Boat Workspace", label = "Boat", color = Color3.fromRGB(100, 180, 255) },
+	{ key = "vehicle", folder = "Vehicle Workspace", label = "Vehicle", color = Color3.fromRGB(255, 220, 100) },
+	{ key = "hovercraft", folder = "Hovercraft Workspace", label = "Hovercraft", color = Color3.fromRGB(100, 255, 200) },
+	{ key = "helicopter", folder = "Helicopter Workspace", label = "Helicopter", color = Color3.fromRGB(200, 140, 255) },
+	{ key = "plane", folder = "Plane Workspace", label = "Plane", color = Color3.fromRGB(255, 160, 80) },
+	{ key = "tank", folder = "Tank Workspace", label = "Tank", color = Color3.fromRGB(150, 255, 100) },
+})
+local CATEGORY_COUNT: number = #CATEGORIES
+
+-- Class names accepted as a part
+local PART_CLASSES: { [string]: boolean } = {
+	Part = true,
+	MeshPart = true,
+	UnionOperation = true,
+	WedgePart = true,
+	VehicleSeat = true,
+	Seat = true,
+	SpawnLocation = true,
+}
+table.freeze(PART_CLASSES)
+
+-- Button types that are never bought with cash
+local SKIP_TYPES: { [string]: boolean } = {
+	Clothing = true,
+	Group = true,
+	Gamepass = true,
+	Reward = true,
+	Operation = true,
+	Medal = true,
+}
+table.freeze(SKIP_TYPES)
+
+-- Multipliers for price suffixes such as "[$1.5M]"
+local PRICE_SUFFIX: { [string]: number } = { k = 1e3, m = 1e6, b = 1e9 }
+table.freeze(PRICE_SUFFIX)
+
+-- Locations (x, y, z); 3 studs are added on Y when teleporting
+type Location = { read name: string, read pos: vector }
+
+local MAP_LOCATIONS: { Location } = table.freeze({
+	table.freeze({ name = "Oil Rig 1", pos = vec(1705.62, 128.95, 3778.51) }),
+	table.freeze({ name = "Oil Rig 2", pos = vec(-1937.25, 120.95, -3697.70) }),
+	table.freeze({ name = "Oil Warehouse", pos = vec(-1209.48, 72.70, -879.73) }),
+	table.freeze({ name = "Control Point", pos = vec(-502.28, 177.04, -1029.86) }),
+})
+
+-- Every base (also its oil deposit, which is the same spot)
+local BASES: { Location } = table.freeze({
+	table.freeze({ name = "Alpha", pos = vec(-878.41, 65.52, -4862.31) }),
+	table.freeze({ name = "Bravo", pos = vec(106.47, 65.59, -4906.35) }),
+	table.freeze({ name = "Charlie", pos = vec(1108.62, 67.42, -4642.21) }),
+	table.freeze({ name = "Delta", pos = vec(2265.50, 68.38, -3744.03) }),
+	table.freeze({ name = "Echo", pos = vec(2868.43, 67.69, -2730.49) }),
+	table.freeze({ name = "Foxtrot", pos = vec(3032.77, 65.64, -1462.30) }),
+	table.freeze({ name = "Golf", pos = vec(3363.51, 66.06, -236.40) }),
+	table.freeze({ name = "Hotel", pos = vec(3219.96, 66.57, 905.49) }),
+	table.freeze({ name = "Juliet", pos = vec(2858.39, 66.84, 2115.60) }),
+	table.freeze({ name = "Kilo", pos = vec(2395.14, 67.06, 3201.82) }),
+	table.freeze({ name = "Lima", pos = vec(865.17, 66.55, 3720.86) }),
+	table.freeze({ name = "Omega", pos = vec(-645.18, 66.19, 3919.50) }),
+	table.freeze({ name = "Romeo", pos = vec(-1769.61, 65.65, 3572.98) }),
+	table.freeze({ name = "Sierra", pos = vec(-2749.55, 65.52, 2309.63) }),
+	table.freeze({ name = "Tango", pos = vec(-3194.95, 65.61, 1228.21) }),
+	table.freeze({ name = "Victor", pos = vec(-3738.37, 65.72, 345.40) }),
+	table.freeze({ name = "Yankee", pos = vec(-4030.05, 65.85, -604.23) }),
+	table.freeze({ name = "Zulu", pos = vec(-4036.56, 65.78, -1659.56) }),
+})
+
+local baseByName: { [string]: vector } = {}
+for _, base in BASES do
+	baseByName[base.name] = base.pos
+end
+table.freeze(baseByName)
+
+-- Team colors copied from the in-game map (TeamColor cannot be read in Severe)
+local TEAM_COLORS: { [string]: Color3 } = {
+	Alpha = Color3.fromRGB(255, 0, 0),
+	Bravo = Color3.fromRGB(255, 202, 0),
+	Charlie = Color3.fromRGB(255, 248, 0),
+	Delta = Color3.fromRGB(15, 252, 14),
+	Echo = Color3.fromRGB(37, 135, 11),
+	Foxtrot = Color3.fromRGB(0, 255, 255),
+	Golf = Color3.fromRGB(42, 123, 181),
+	Hotel = Color3.fromRGB(57, 33, 255),
+	Juliet = Color3.fromRGB(57, 62, 124),
+	Kilo = Color3.fromRGB(128, 0, 255),
+	Lima = Color3.fromRGB(255, 184, 255),
+	Omega = Color3.fromRGB(255, 0, 255),
+	Romeo = Color3.fromRGB(215, 177, 143),
+	Sierra = Color3.fromRGB(197, 110, 79),
+	Tango = Color3.fromRGB(153, 107, 49),
+	Victor = Color3.fromRGB(255, 252, 252),
+	Yankee = Color3.fromRGB(159, 206, 245),
+	Zulu = Color3.fromRGB(135, 101, 94),
+}
+table.freeze(TEAM_COLORS)
+
+-- Lowercases a button name and removes a "[N Rebirth(s)]" tag so names from different places match.
+local function matchKey(name: string): string
+	local stripped = (string.gsub(name, "%s*%[%d+%s*[Rr]ebirths?%]", ""))
+	return string.lower(stripped)
+end
+
+-- Restriction groups (buttons the auto buy can skip); ON = skip
+type RestrictGroup = { read title: string, read names: { string }, read keys: { string } }
+
+local function makeGroup(title: string, names: { string }): RestrictGroup
+	local keys: { string } = {}
+	for _, name in names do
+		table.insert(keys, matchKey(name))
+	end
+	return table.freeze({ title = title, names = table.freeze(names), keys = table.freeze(keys) })
+end
+
+local RESTRICT_GROUPS: { RestrictGroup } = table.freeze({
+	makeGroup("Helicopters", {
+		"Mi28 Havoc", "Invictus", "Eurocopter Tiger", "KA-52 Alligator", "AH-64 Apache", "Super Stallion",
+		"UH-60 Black Hawk", "RAH-66 Comanche", "Z-10", "A129 Mangusta", "Raider X", "AH-1Z Viper", "KA-50 Black Shark",
+	}),
+	makeGroup("Ground vehicles", {
+		"Speedy Humvee", "HEMTT A3", "Patriot AA", "Humvee Hawkeye", "Lazar 3 APC", "M142 HIMARS ATACMS",
+		"Stryker MGS", "M142 HIMARS", "LAV-25", "Pantsir S1", "Type 625E", "M1117 Guardian", "JLTV", "LAV-AD",
+		"Stryker M-SHORAD", "Gunship", "BTR-80", "VCAC Mephisto",
+	}),
+	makeGroup("Naval", {
+		"USS Zumwalt", "Fairmile", "PG-02", "Project 1124", "USS Douglas", "Pr. 206", "USS Independence",
+		"Sigma-Class Corvette", "PACV-77 Windshear", "PACV-78 Rampage",
+	}),
+	makeGroup("Weapons", {
+		"FAMAS Group Gun", "FAL Heavy Giver", "Explosive Sniper Giver", "Desert Eagle Giver", "Javelin Giver",
+		"AWP Giver", "Remington ACR Giver", "Gas Grenade Giver", "USP 45 Giver", "AK12 Giver", "Saiga-12k Giver",
+		"Barrett M82 Giver", "Barrett M82", "KSG 12 Giver", "PP19 Bizon Giver", "Hovercraft C4 Giver",
+		"Hovercraft QBZ-95 Giver", "Hovercraft QJB-LMG Giver", "AVH Reaper", "M1918 BAR Giver", "M14 Rifle Giver",
+		"M1903 Springfield Giver",
+	}),
+	makeGroup("Misc", {
+		"2x Health Armor", "KizmoTek Clothing", "WW2 US Army Pack", "Base Shield", "Vietnam Armor", "Vietnam Clothing",
+	}),
+})
+
+-- Menu theme and sizes
+local T = table.freeze({
+	W = 290, -- panel width
+	Bg = Color3.fromRGB(15, 15, 17),
+	Divider = Color3.fromRGB(26, 26, 30),
+	TextMain = Color3.fromRGB(255, 255, 255),
+	TextRow = Color3.fromRGB(166, 166, 172),
+	TextOff = Color3.fromRGB(94, 94, 101),
+	TextDim = Color3.fromRGB(72, 72, 78),
+	Chip = Color3.fromRGB(23, 23, 26),
+	Track = Color3.fromRGB(26, 26, 30),
+	PillBg = Color3.fromRGB(28, 28, 32),
+	PillLine = Color3.fromRGB(60, 60, 66),
+	PillBgOff = Color3.fromRGB(20, 20, 23),
+	PillLineOff = Color3.fromRGB(38, 38, 43),
+	Knob = Color3.fromRGB(245, 245, 247),
+	KnobOff = Color3.fromRGB(96, 96, 104),
+	White = Color3.new(1, 1, 1),
+})
+
+local TAB_NAMES: { string } = table.freeze({ "ESP", "Farm", "Teleports", "Restrict" })
+
+local HEADER_H: number = 38 -- title bar (drag handle)
+local TAB_H: number = 26 -- tab bar
+local MAIN_ROW_H: number = 28 -- normal row
+local DROP_ROW_H: number = 24 -- row inside a dropdown
+local DROP_GAP: number = 1
+local SLIDER_ROW_H: number = 56
+local CHIP_H: number = 22 -- compact two-column chip
+local CHIP_GAP: number = 4
+local DROP_TOP_GAP: number = 6 -- space between a dropdown header and its content
+
+-- ───────────────────────── State ─────────────────────────
+
+-- Mutable toggles (the menu writes here, the logic reads from here)
+local toggles: { [string]: boolean } = {
+	enabled = true, -- master ESP switch
+	submarine = true,
+	boat = true,
+	vehicle = true,
+	hovercraft = true,
+	helicopter = true,
+	plane = true,
+	tank = true,
+	showDistance = true,
+	showOwn = false,
+	showTeam = true, -- append the owner's team to the nickname line
+	autoBuy = false,
+	infAmmo = false, -- writes 999999999 into every gun's Ammo value (not reversible)
+}
+
+-- normalized button name -> true when auto buy must skip it
+local restricted: { [string]: boolean } = {}
+for _, group in RESTRICT_GROUPS do
+	for _, key in group.keys do
+		restricted[key] = false
+	end
+end
+
+local state = {
+	maxDistance = 2000, -- ESP is hidden beyond this many studs
+}
+
+local UIState = {
+	X = 200,
+	Y = 100,
+	Visible = true,
+	Dragging = false,
+	DragOffset = { x = 0, y = 0 },
+	Tab = 1,
+	VehiclesOpen = false,
+	BasesOpen = false,
+	OpenGroup = "", -- Restrict tab accordion: title of the open group
+	PanelH = 320, -- measured by the last drawn frame
+}
+
+-- Mouse snapshot sampled in PostLocal, consumed in Render
+local input = { mx = 0, my = 0, down = false, clicked = false }
+
+local RShiftWasDown: boolean = false
+local EnterWasDown: boolean = false
+local F1WasDown: boolean = false
+local EMPTY_KEYS: { any } = {}
+table.freeze(EMPTY_KEYS)
+local SliderActive: boolean = false
+
+local camera: Inst = nil
+local localRoot: Inst = nil
+local viewW: number = 0
+local viewH: number = 0
+
+local forceRebuild = true
+local actionBusy = false -- true while a teleport action (buy pass / collect) is running
+local collectQueued = false -- set by the menu or Enter; runs once nothing else is running
+local pendingTeleport: any = nil -- vector, "base" or "deposit"; resolved in PostLocal
+local lastCollectAt = 0
+local lastAmmoAt = -math.huge
+local adminText = "" -- red warning shown at the top center while an admin is in the server
+local teamOf: { [string]: string } = {} -- player name -> team name (refreshed by refreshPlayers)
+local lastBuyPass = 0 -- time of the last started auto-buy pass
+
+-- Static data about one button, computed once (attribute reads are expensive and crash-prone).
+type ButtonInfo = {
+	skipType: boolean, -- gamepass / clothing / ...: never bought
+	rebirth: number, -- required rebirths
+	restrictKey: string, -- key used by the Restrict tab
+	nameKey: string, -- key used by the attachment price index
+	price: number, -- 0 when free or unknown
+	known: boolean, -- false while the price is unknown
+	retryAt: number, -- os.clock() time before which the button is not tried again
+}
+
+type Candidate = { button: Inst, info: ButtonInfo, sort: number }
+
+local buttonInfo: { [Inst]: ButtonInfo } = {}
+local medbayRetryAt = 0
+
+-- ───────────────────────── ESP ─────────────────────────
+
+type Tracked = {
+	anchor: Inst, -- part whose position is used
+	top: string, -- top line: vehicle name
+	owner: string,
+	team: string, -- team name the middle line was built with
+	teamShown: boolean, -- showTeam value the middle line was built with
+	mid: string, -- middle line: owner nickname (+ team), "" when there is no owner
+	midColor: Color3, -- team color of the owner
+	bot: string, -- bottom line: distance ("" when hidden)
+	color: Color3,
+	isOwn: boolean,
+	pos: vector, -- last read world position
+	px: number,
+	py: number,
+	pz: number,
+	lastDist: number,
+	inRange: boolean,
+	valid: boolean, -- false once the part died
+	nextAt: number, -- os.clock() time of the next position read
+	aliveAt: number, -- os.clock() time of the next Parent check
+	labelAt: number, -- os.clock() time of the next distance text rebuild
+}
+
+type Marker = { x: number, y: number, top: string, mid: string, midColor: Color3, bot: string, color: Color3 }
+
+local tracked: { Tracked } = {}
+
+-- Preallocated marker pool (no allocations per frame)
+local markers: { Marker } = {}
+for i = 1, MAX_MARKERS do
+	markers[i] = { x = 0, y = 0, top = "", mid = "", midColor = T.White, bot = "", color = T.White }
+end
+local markerCount = 0
+
+-- Values shared with readItem (set once per refresh)
+local originX, originY, originZ = 0, 0, 0
+local maxSq = 0
+local showDist = true
+local showOwn = false
+local NEAR_SQ = NEAR_STUDS * NEAR_STUDS
+
+-- Camera basis for the Lua projection (read once per frame instead of one WorldToScreenPoint call per entry)
+local useOwnProjection = false -- true only while the Lua projection matches WorldToScreenPoint
+local camX, camY, camZ = 0, 0, 0
+local rgX, rgY, rgZ = 0, 0, 0
+local upX, upY, upZ = 0, 0, 0
+local lkX, lkY, lkZ = 0, 0, 0
+local projTan = 1
+local projAspect = 1
+
+local byModel: { [Inst]: Tracked } = {} -- one reused entry per vehicle model
+local ownerScansLeft = 0 -- deep owner searches still allowed in this rebuild
+
+local ownerCache: { [Inst]: string } = {}
+local ownerScanned: { [Inst]: boolean } = {}
+local ownerMissAt: { [Inst]: number } = {} -- model -> time before which its owner is not read again
+
+-- Returns the owner name of a vehicle. Attribute reads are slow in Severe, so the result is cached
+-- and unknown owners are only retried every OWNER_RETRY seconds.
+local function getOwner(model: Inst, now: number): string
+	local cached = ownerCache[model]
+	if cached ~= nil then
+		return cached
+	end
+	local retryAt = ownerMissAt[model]
+	if retryAt ~= nil and now < retryAt then
+		return "Unknown"
+	end
+	local owner = model:GetAttribute("Owner")
+	if type(owner) == "string" then
+		ownerCache[model] = owner
+		return owner
+	end
+	if not ownerScanned[model] then
+		if ownerScansLeft <= 0 then
+			return "Unknown" -- searched on a later rebuild so a burst of new vehicles cannot freeze the game
+		end
+		ownerScansLeft -= 1
+		ownerScanned[model] = true
+		for _, child in model:GetChildren() do
+			local o = child:GetAttribute("Owner")
+			if type(o) == "string" then
+				ownerCache[model] = o
+				return o
+			end
+		end
+	end
+	ownerMissAt[model] = now + OWNER_RETRY
+	return "Unknown"
+end
+
+-- Picks the ESP anchor part: BoatPivot, then PrimaryPart, then the first part child.
+local function getAnchor(model: Inst): Inst
+	local pivot = model:FindFirstChild("BoatPivot")
+	if pivot ~= nil then
+		return pivot
+	end
+	local primary = model.PrimaryPart
+	if primary ~= nil then
+		return primary
+	end
+	for _, child in model:GetChildren() do
+		if PART_CLASSES[child.ClassName] then
+			return child
+		end
+	end
+	return nil
+end
+
+-- Creates a tracked ESP entry.
+-- Middle ESP line: the owner's nickname, followed by his team when known.
+local function ownerText(owner: string): string
+	local team = teamOf[owner]
+	if toggles.showTeam and team ~= nil then
+		return `{owner} [{team}]`
+	end
+	return owner
+end
+
+-- Color of the owner's team (white while the team is unknown)
+local function teamColor(owner: string): Color3
+	return TEAM_COLORS[teamOf[owner] or ""] or T.White
+end
+
+local function newTracked(anchor: Inst, title: string, color: Color3): Tracked
+	return {
+		anchor = anchor,
+		top = title,
+		owner = "",
+		team = "",
+		teamShown = true,
+		mid = "",
+		midColor = T.White,
+		bot = "",
+		color = color,
+		isOwn = false,
+		pos = vec(0, 0, 0),
+		px = 0,
+		py = 0,
+		pz = 0,
+		lastDist = -2,
+		inRange = false,
+		valid = true,
+		nextAt = 0,
+		aliveAt = 0,
+		labelAt = 0,
+	}
+end
+
+-- Rebuilds the owner dependent fields of an entry (nickname, team text and color, own flag).
+local function applyOwner(item: Tracked, owner: string): ()
+	item.owner = owner
+	item.team = teamOf[owner] or ""
+	item.teamShown = toggles.showTeam
+	item.mid = if owner == "" then "" else ownerText(owner)
+	item.midColor = teamColor(owner)
+	item.isOwn = owner == localName
+end
+
+-- Re-resolves camera, viewport and the local HumanoidRootPart (slow poll).
+local function refreshSlow(): ()
+	camera = workspace.CurrentCamera
+	if camera ~= nil then
+		local vp = camera.ViewportSize
+		viewW = vp.x
+		viewH = vp.y
+	end
+	local character = localPlayer.Character
+	if character ~= nil then
+		localRoot = character:FindFirstChild("HumanoidRootPart")
+	else
+		localRoot = nil
+	end
+end
+
+-- Rescans the enabled vehicle folders and swaps the list in one step. Entries are reused between rebuilds.
+local function rebuildTracked(): ()
+	local now = os.clock()
+	ownerScansLeft = OWNER_SCANS_PER_REBUILD
+	local nextList: { Tracked } = {}
+	local seen: { [Inst]: boolean } = {}
+	local gameSystems = if toggles.enabled then workspace:FindFirstChild("Game Systems") else nil
+
+	if gameSystems ~= nil then
+		for _, cat in CATEGORIES do
+			if not toggles[cat.key] then
+				continue
+			end
+			local folder = gameSystems:FindFirstChild(cat.folder)
+			if folder == nil then
+				continue
+			end
+			for _, model in folder:GetChildren() do
+				local existing = byModel[model]
+				if existing ~= nil and not existing.valid then
+					byModel[model] = nil -- its anchor part died: build the entry again
+					existing = nil
+				end
+				local item: Tracked
+				if existing ~= nil then
+					item = existing
+				else
+					local anchor = getAnchor(model)
+					if anchor == nil then
+						continue
+					end
+					item = newTracked(anchor, model.Name, cat.color)
+					byModel[model] = item
+				end
+				seen[model] = true
+				local owner = getOwner(model, now)
+				if owner ~= item.owner or (teamOf[owner] or "") ~= item.team or toggles.showTeam ~= item.teamShown then
+					applyOwner(item, owner)
+				end
+				table.insert(nextList, item)
+			end
+		end
+	end
+
+	-- Drop cache entries of models that no longer exist
+	for model in byModel do
+		if not seen[model] then
+			byModel[model] = nil
+		end
+	end
+	for model in ownerCache do
+		if not seen[model] then
+			ownerCache[model] = nil
+		end
+	end
+	for model in ownerScanned do
+		if not seen[model] then
+			ownerScanned[model] = nil
+			ownerMissAt[model] = nil
+		end
+	end
+
+	tracked = nextList
+end
+
+-- Reads one entry's position and distance. Far or hidden entries are read less often.
+local function readItem(item: Tracked, now: number): ()
+	local anchor = item.anchor
+	if now >= item.aliveAt then
+		item.aliveAt = now + ALIVE_CHECK
+		if anchor.Parent == nil then
+			item.valid = false
+			return
+		end
+	end
+	if item.isOwn and not showOwn then
+		item.inRange = false
+		item.nextAt = now + FAR_RATE
+		return
+	end
+	local pos: vector = anchor.Position
+	local x, y, z = pos.x, pos.y, pos.z
+	item.pos = pos
+	item.px = x
+	item.py = y
+	item.pz = z
+	local dx = x - originX
+	local dy = y - originY
+	local dz = z - originZ
+	local sq = dx * dx + dy * dy + dz * dz
+	local inRange = sq <= maxSq
+	item.inRange = inRange
+	if not inRange then
+		item.nextAt = now + FAR_RATE
+		return
+	end
+	item.nextAt = if sq > NEAR_SQ then now + MID_RATE else now
+	if showDist then
+		if now >= item.labelAt then
+			item.labelAt = now + LABEL_RATE
+			local d = floor(sqrt(sq))
+			if d ~= item.lastDist then
+				item.lastDist = d
+				item.bot = `{d} st`
+			end
+		end
+	else
+		item.bot = ""
+		item.lastDist = -2 -- so the text comes back when the option is switched on again
+	end
+end
+
+-- Refreshes positions and distances of the entries that are due (logic tick).
+local function refreshPositions(now: number): ()
+	local root = localRoot
+	if root == nil or root.Parent == nil then
+		for _, item in tracked do
+			item.inRange = false
+		end
+		return
+	end
+	local origin: vector = root.Position
+	originX, originY, originZ = origin.x, origin.y, origin.z
+	maxSq = state.maxDistance * state.maxDistance
+	showDist = toggles.showDistance
+	showOwn = toggles.showOwn
+
+	for _, item in tracked do
+		if item.valid and now >= item.nextAt then
+			readItem(item, now)
+		end
+	end
+end
+
+-- One pass over the players (slow poll): every player's team name and the admin warning text
+-- (another player with a non-zero AdminRank value).
+local function refreshPlayers(): ()
+	local names = ""
+	local teams: { [string]: string } = {}
+	for _, player in Players:GetChildren() do
+		if player.ClassName ~= "Player" then
+			continue
+		end
+		local name: string = player.Name
+		local team = player.Team
+		if team ~= nil then
+			teams[name] = team.Name
+		end
+		if name ~= localName then
+			local rank = player:FindFirstChild("AdminRank")
+			if rank ~= nil then
+				local value = rank.Value
+				if value ~= nil and value ~= 0 then
+					names = if names == "" then name else `{names}, {name}`
+				end
+			end
+		end
+	end
+	teamOf = teams
+	adminText = if names == "" then "" else `ADMIN ON SERVER: {names}`
+end
+
+-- Reads the camera basis once (position, right, up, look, field of view) for the Lua projection.
+-- Returns false when the camera does not provide it.
+local function loadCameraBasis(cam: Inst): boolean
+	local p: vector? = cam.Position
+	local r: vector? = cam.RightVector
+	local u: vector? = cam.UpVector
+	local l: vector? = cam.LookVector
+	if p == nil or r == nil or u == nil or l == nil then
+		return false
+	end
+	camX, camY, camZ = p.x, p.y, p.z
+	rgX, rgY, rgZ = r.x, r.y, r.z
+	upX, upY, upZ = u.x, u.y, u.z
+	lkX, lkY, lkZ = l.x, l.y, l.z
+	local fov = cam.FieldOfView
+	projTan = math.tan(math.rad(if fov ~= nil then fov else 70) * 0.5)
+	projAspect = if viewH > 0 then viewW / viewH else 1
+	return true
+end
+
+-- Projects a world point with the camera basis: screen x, y and whether the point is on screen.
+local function projectOwn(x: number, y: number, z: number): (number, number, boolean)
+	local dx = x - camX
+	local dy = y - camY
+	local dz = z - camZ
+	local depth = dx * lkX + dy * lkY + dz * lkZ
+	if depth <= 0.001 then
+		return 0, 0, false
+	end
+	local sx = ((dx * rgX + dy * rgY + dz * rgZ) / (depth * projTan * projAspect) * 0.5 + 0.5) * viewW
+	local sy = (0.5 - (dx * upX + dy * upY + dz * upZ) / (depth * projTan) * 0.5) * viewH
+	return sx, sy, sx >= 0 and sx <= viewW and sy >= 0 and sy <= viewH
+end
+
+-- Compares the Lua projection with WorldToScreenPoint on a few entries (slow poll). The Lua projection is
+-- used only while it matches, otherwise every entry goes through WorldToScreenPoint as before.
+local function calibrateProjection(): ()
+	local cam = camera
+	if cam == nil or viewW <= 0 then
+		useOwnProjection = false
+		return
+	end
+	if not loadCameraBasis(cam) then
+		useOwnProjection = false
+		return
+	end
+	local checked = 0
+	for _, item in tracked do
+		if checked >= 4 then
+			break
+		end
+		if item.valid and item.inRange then
+			local screen, on = cam:WorldToScreenPoint(item.pos)
+			if on then
+				local sx, sy, ownOn = projectOwn(item.px, item.py, item.pz)
+				if not ownOn or math.abs(sx - screen.x) > CALIB_PIXELS or math.abs(sy - screen.y) > CALIB_PIXELS then
+					useOwnProjection = false
+					return
+				end
+				checked += 1
+			end
+		end
+	end
+	if checked > 0 then
+		useOwnProjection = true
+	end
+end
+
+-- Projects entries to the screen into the marker pool (every frame, PostLocal).
+local function projectItems(): ()
+	markerCount = 0
+	local cam = camera
+	if cam == nil or not toggles.enabled then
+		return
+	end
+	local own = useOwnProjection
+	if own and not loadCameraBasis(cam) then
+		own = false
+		useOwnProjection = false
+	end
+	for _, item in tracked do
+		if not item.valid or not item.inRange then
+			continue
+		end
+		if markerCount >= MAX_MARKERS then
+			break
+		end
+		local sx: number, sy: number, onScreen: boolean
+		if own then
+			sx, sy, onScreen = projectOwn(item.px, item.py, item.pz)
+		else
+			local screen, on = cam:WorldToScreenPoint(item.pos)
+			sx, sy, onScreen = screen.x, screen.y, on
+		end
+		if onScreen then
+			markerCount += 1
+			local m = markers[markerCount]
+			m.x = sx
+			m.y = sy
+			m.top = item.top
+			m.mid = item.mid
+			m.midColor = item.midColor
+			m.bot = item.bot
+			m.color = item.color
+		end
+	end
+end
+
+-- ───────────────────────── Tycoon actions ─────────────────────────
+
+-- Returns the local HumanoidRootPart (fresh lookup, used by one-shot actions).
+local function getRoot(): Inst
+	local character = localPlayer.Character
+	if character == nil then
+		return nil
+	end
+	return character:FindFirstChild("HumanoidRootPart")
+end
+
+-- Reads a number from leaderstats (Cash / Rebirths), 0 if missing.
+local function getStat(name: string): number
+	local stats = localPlayer:FindFirstChild("leaderstats")
+	if stats == nil then
+		return 0
+	end
+	local value = stats:FindFirstChild(name)
+	if value == nil then
+		return 0
+	end
+	return tonumber(value.Value) or 0
+end
+
+local myTycoon: Inst = nil -- cached local tycoon
+local tycoonRetryAt = 0
+
+-- Returns the local tycoon. The team name is tried first (no attribute reads), the Owner attribute is the
+-- fallback; the result is cached until the tycoon disappears.
+local function getMyTycoon(): Inst
+	if myTycoon ~= nil and myTycoon.Parent ~= nil then
+		return myTycoon
+	end
+	myTycoon = nil
+	local now = os.clock()
+	if now < tycoonRetryAt then
+		return nil
+	end
+	tycoonRetryAt = now + TYCOON_RETRY
+	local root = workspace:FindFirstChild("Tycoon")
+	local folder = if root ~= nil then root:FindFirstChild("Tycoons") else nil
+	if folder == nil then
+		return nil
+	end
+	local team = localPlayer.Team
+	if team ~= nil then
+		myTycoon = folder:FindFirstChild(team.Name)
+	end
+	if myTycoon == nil then
+		for _, tycoon in folder:GetChildren() do
+			if tycoon:GetAttribute("Owner") == localName then
+				myTycoon = tycoon
+				break
+			end
+		end
+	end
+	if myTycoon ~= nil then
+		tycoonRetryAt = 0
+	end
+	return myTycoon
+end
+
+-- Returns a world position for a part, a model (PrimaryPart) or a folder (first part child).
+local function getInstancePosition(inst: Inst): vector?
+	if PART_CLASSES[inst.ClassName] then
+		return inst.Position
+	end
+	if inst.ClassName == "Model" then
+		local primary = inst.PrimaryPart
+		if primary ~= nil then
+			return primary.Position
+		end
+	end
+	for _, child in inst:GetChildren() do
+		if PART_CLASSES[child.ClassName] then
+			return child.Position
+		end
+	end
+	return nil
+end
+
+-- True for a SpawnLocation or anything named "...spawn...".
+local function isSpawn(inst: Inst): boolean
+	return inst.ClassName == "SpawnLocation" or string.find(string.lower(inst.Name), "spawn", 1, true) ~= nil
+end
+
+-- Looks for the tycoon spawn point in the tycoon and in its Essentials folder.
+local function findSpawn(tycoon: Inst): Inst
+	for _, child in tycoon:GetChildren() do
+		if isSpawn(child) then
+			return child
+		end
+	end
+	local essentials = tycoon:FindFirstChild("Essentials")
+	if essentials ~= nil then
+		for _, child in essentials:GetChildren() do
+			if isSpawn(child) then
+				return child
+			end
+		end
+	end
+	return nil
+end
+
+-- Returns the cash collector position (Essentials/CollectorParts/Collector, its Bottom part first).
+local function getCollectorPosition(tycoon: Inst): vector?
+	local essentials = tycoon:FindFirstChild("Essentials")
+	local parts = if essentials ~= nil then essentials:FindFirstChild("CollectorParts") else nil
+	local collector = if parts ~= nil then parts:FindFirstChild("Collector") else nil
+	if collector == nil then
+		return nil
+	end
+	local bottom = collector:FindFirstChild("Bottom")
+	return getInstancePosition(if bottom ~= nil then bottom else collector)
+end
+
+-- Teleports the local character to a position (3 studs above it).
+local function teleportTo(pos: vector): ()
+	local root = getRoot()
+	if root ~= nil then
+		root.Position = vec(pos.x, pos.y + 3, pos.z)
+	end
+end
+
+-- Resolves and runs a teleport request: a vector, "base" or "deposit".
+local function runTeleport(request: any): ()
+	if type(request) ~= "string" then
+		teleportTo(request :: vector)
+		return
+	end
+	tycoonRetryAt = 0 -- a click always searches for the tycoon
+	local tycoon = getMyTycoon()
+	if tycoon == nil then
+		return
+	end
+
+	if request == "deposit" then
+		local pos = baseByName[tycoon.Name]
+		if pos ~= nil then
+			teleportTo(pos)
+		end
+		return
+	end
+
+	-- "base": the spawn point, else the cash collector
+	local spawn = findSpawn(tycoon)
+	local pos = if spawn ~= nil then getInstancePosition(spawn) else nil
+	if pos == nil then
+		pos = getCollectorPosition(tycoon)
+	end
+	if pos ~= nil then
+		teleportTo(pos)
+		return
+	end
+
+	-- Neither is loaded: go to the oil deposit, then to the spawn point half a second later
+	local deposit = baseByName[tycoon.Name]
+	if deposit == nil then
+		return
+	end
+	teleportTo(deposit)
+	task.wait(0.5)
+	local late = findSpawn(tycoon)
+	local latePos = if late ~= nil then getInstancePosition(late) else nil
+	if latePos ~= nil then
+		teleportTo(latePos)
+	end
+end
+
+-- Teleports to the cash collector of the local tycoon and back.
+local function collectMoney(): ()
+	lastCollectAt = os.clock()
+	local root = getRoot()
+	local tycoon = getMyTycoon()
+	if root == nil or tycoon == nil then
+		return
+	end
+	local target = getCollectorPosition(tycoon)
+	if target == nil then
+		return
+	end
+	local saved: vector = root.Position
+	root.Position = target
+	task.wait(COLLECT_DWELL)
+	root.Position = saved
+
+	-- Money arrived: let every button be tried again right away
+	for _, info in buttonInfo do
+		info.retryAt = 0
+	end
+	medbayRetryAt = 0
+end
+
+-- Writes 999999999 into the Ammo value of every gun in ReplicatedStorage.Configurations.ACS_Guns.
+local function applyInfiniteAmmo(): ()
+	-- GetService can return nil for ReplicatedStorage in Severe, so a plain lookup is the fallback
+	local storage = game:GetService("ReplicatedStorage")
+	if storage == nil then
+		storage = game:FindFirstChild("ReplicatedStorage")
+	end
+	local configs = if storage ~= nil then storage:FindFirstChild("Configurations") else nil
+	local guns = if configs ~= nil then configs:FindFirstChild("ACS_Guns") else nil
+	if guns == nil then
+		return
+	end
+	for _, gun in guns:GetChildren() do
+		local ammo = gun:FindFirstChild("Ammo")
+		if ammo ~= nil and ammo.ClassName == "NumberValue" and ammo.Value ~= INFINITE_AMMO then
+			ammo.Value = INFINITE_AMMO
+		end
+	end
+end
+
+-- ───────────────────────── Auto buy ─────────────────────────
+
+-- Lowercases a button name and strips every [tag] so names from different places match.
+local function normalizeName(name: string): string
+	local stripped = (string.gsub(name, "%s*%b[]", ""))
+	stripped = (string.gsub(stripped, "%s+", " "))
+	stripped = (string.gsub(stripped, "^%s*(.-)%s*$", "%1"))
+	return string.lower(stripped)
+end
+
+-- Converts "[$80,000]" parts (amount + optional K/M/B suffix) into a number.
+local function parsePrice(amount: string, suffix: string): number?
+	local value = tonumber((string.gsub(amount, ",", "")))
+	if value == nil then
+		return nil
+	end
+	return value * (PRICE_SUFFIX[string.lower(suffix)] or 1)
+end
+
+-- Reads a price written inside a button name, e.g. "Buy Third Floor - [$15,000]".
+local function priceFromName(name: string): number?
+	local amount, suffix = string.match(name, "%[%$([%d,%.]+)([KkMmBb]?)%]")
+	if amount == nil then
+		return nil
+	end
+	return parsePrice(amount, suffix or "")
+end
+
+-- Builds normalizedName -> price from the "Buy <name> - [$price]" attachments in
+-- workspace.LocalPartStorage["Base Center Position"].
+local function buildPriceIndex(): { [string]: number }
+	local index: { [string]: number } = {}
+	local storage = workspace:FindFirstChild("LocalPartStorage")
+	local holder = if storage ~= nil then storage:FindFirstChild("Base Center Position") else nil
+	if holder == nil then
+		return index
+	end
+	for _, child in holder:GetChildren() do
+		local base, amount, suffix = string.match(child.Name, "^Buy%s+(.-)%s*%-%s*%[%$([%d,%.]+)([KkMmBb]?)%]")
+		if base ~= nil and amount ~= nil then
+			local price = parsePrice(amount, suffix or "")
+			if price ~= nil then
+				index[normalizeName(base)] = price
+			end
+		end
+	end
+	return index
+end
+
+-- Returns the cached info of a button, creating it on first sight.
+local function getInfo(button: Inst): ButtonInfo
+	local info = buttonInfo[button]
+	if info ~= nil then
+		return info
+	end
+	local name: string = button.Name
+	local named = priceFromName(name)
+	local created: ButtonInfo = {
+		skipType = SKIP_TYPES[button:GetAttribute("ButtonType")] == true
+			or string.find(string.lower(name), "gamepass", 1, true) ~= nil,
+		rebirth = tonumber(button:GetAttribute("RebirthRequirement"))
+			or tonumber(string.match(name, "%[(%d+)%s*[Rr]ebirth"))
+			or 0,
+		restrictKey = matchKey(name),
+		nameKey = normalizeName(name),
+		price = named or 0,
+		known = named ~= nil,
+		retryAt = 0,
+	}
+	buttonInfo[button] = created
+	return created
+end
+
+-- True while the buy pass must stop (cleanup, toggle off, other action waiting, game not focused).
+local function buyAborted(): boolean
+	return not alive or not toggles.autoBuy or collectQueued or pendingTeleport ~= nil or not isrbxactive()
+end
+
+-- Teleports onto a button, stays BUY_DWELL seconds (triggers the purchase), then goes back.
+local function buyButton(button: Inst): boolean
+	local part = button:FindFirstChild("Part")
+	local root = getRoot()
+	if part == nil or root == nil then
+		return false
+	end
+	local saved: vector = root.Position
+	local target: vector = part.Position
+	root.Position = vec(target.x, target.y + 1, target.z)
+	task.wait(BUY_DWELL)
+	root.Position = saved
+	return true
+end
+
+-- Tries to buy one button. Returns true if it left UnpurchasedButtons; otherwise sets a retry delay.
+local function tryBuy(button: Inst, buttons: Inst, retryDelay: number): boolean
+	local bought = false
+	if buyButton(button) then
+		task.wait(0.1)
+		bought = button.Parent ~= buttons
+	end
+	if bought then
+		buttonInfo[button] = nil
+	else
+		local info = buttonInfo[button]
+		if info ~= nil then
+			info.retryAt = os.clock() + retryDelay
+		end
+	end
+	return bought
+end
+
+-- One pass over the unpurchased buttons: cheapest first, buttons with unreadable prices last.
+local function autoBuyPass(): ()
+	local tycoon = getMyTycoon()
+	if tycoon == nil then
+		return
+	end
+	local buttons = tycoon:FindFirstChild("UnpurchasedButtons")
+	if buttons == nil then
+		return
+	end
+
+	local rebirths = getStat("Rebirths")
+	local priceIndex = buildPriceIndex()
+
+	-- Forget info of buttons that are gone
+	for button in buttonInfo do
+		if button.Parent ~= buttons then
+			buttonInfo[button] = nil
+		end
+	end
+
+	-- The Medbay start button goes first (retried every 10 s at most)
+	local medbay = buttons:FindFirstChild("Medbay Start")
+	if medbay ~= nil and os.clock() >= medbayRetryAt then
+		if not tryBuy(medbay, buttons, 10) then
+			medbayRetryAt = os.clock() + 10
+		end
+		task.wait(0.3)
+	end
+
+	local eligible: { Candidate } = {}
+	for _, button in buttons:GetChildren() do
+		if button.ClassName ~= "Model" then
+			continue
+		end
+		local info = getInfo(button)
+		if info.skipType or restricted[info.restrictKey] == true or rebirths < info.rebirth then
+			continue
+		end
+		if not info.known then
+			local indexed = priceIndex[info.nameKey]
+			if indexed ~= nil then
+				info.price = indexed
+				info.known = true
+			end
+		end
+		table.insert(eligible, { button = button, info = info, sort = if info.known then info.price else math.huge })
+	end
+	table.sort(eligible, function(a: Candidate, b: Candidate): boolean
+		return a.sort < b.sort
+	end)
+
+	local cash = getStat("Cash")
+	for _, item in eligible do
+		if buyAborted() then
+			return
+		end
+		local button = item.button
+		local info = item.info
+		if button.Parent ~= buttons or info.retryAt > os.clock() then
+			continue
+		end
+		if info.known and info.price > cash then
+			continue
+		end
+		if tryBuy(button, buttons, if info.known then 5 else 30) then
+			cash = getStat("Cash")
+		end
+	end
+end
+
+-- Runs fn in its own thread while holding the action lock. The lock is always released; an error is
+-- rethrown so Severe shows it in its console.
+local function startAction(fn: () -> ()): ()
+	actionBusy = true
+	task.spawn(function()
+		local ok, err = pcall(fn)
+		actionBusy = false
+		if not ok then
+			error(err, 0)
+		end
+	end)
+end
+
+-- ───────────────────────── Menu drawing ─────────────────────────
+
+-- Checks whether a point is inside a rectangle.
+local function inRect(px: number, py: number, x: number, y: number, w: number, h: number): boolean
+	return px >= x and px <= x + w and py >= y and py <= y + h
+end
+
+-- Cuts a label to maxLen characters.
+local function shortLabel(s: string, maxLen: number): string
+	if #s > maxLen then
+		return string.sub(s, 1, maxLen - 1) .. "."
+	end
+	return s
+end
+
+-- Filled rounded rectangle; immediate mode has no rounding, so it is built from rectangles and corner circles.
+local function RoundRect(x: number, y: number, w: number, h: number, r: number, color: Color3)
+	if r <= 3 then
+		DrawingImmediate.FilledRectangle(vec(x + 1, y, 0), vec(w - 2, h, 0), color, 1)
+		DrawingImmediate.FilledRectangle(vec(x, y + 1, 0), vec(w, h - 2, 0), color, 1)
+		return
+	end
+	if r <= 6 then
+		-- three stacked rectangles shape the corner (about half the draw calls of real circles)
+		local i1 = floor(r * 0.6 + 0.5)
+		local i2 = math.max(1, floor(r * 0.25 + 0.5))
+		local t = floor(r * 0.6)
+		DrawingImmediate.FilledRectangle(vec(x + i1, y, 0), vec(w - 2 * i1, h, 0), color, 1)
+		DrawingImmediate.FilledRectangle(vec(x + i2, y + 1, 0), vec(w - 2 * i2, h - 2, 0), color, 1)
+		DrawingImmediate.FilledRectangle(vec(x, y + t, 0), vec(w, h - 2 * t, 0), color, 1)
+		return
+	end
+	DrawingImmediate.FilledRectangle(vec(x + r, y, 0), vec(w - 2 * r, h, 0), color, 1)
+	DrawingImmediate.FilledRectangle(vec(x, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
+	DrawingImmediate.FilledRectangle(vec(x + w - r, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
+	DrawingImmediate.FilledCircle(vec(x + r, y + r, 0), r, color, 1)
+	DrawingImmediate.FilledCircle(vec(x + w - r, y + r, 0), r, color, 1)
+	DrawingImmediate.FilledCircle(vec(x + r, y + h - r, 0), r, color, 1)
+	DrawingImmediate.FilledCircle(vec(x + w - r, y + h - r, 0), r, color, 1)
+end
+
+-- Toggle pill with a 1px outline and a square knob (right = on, left = off).
+local function DrawPill(x: number, y: number, w: number, h: number, on: boolean)
+	RoundRect(x, y, w, h, 5, on and T.PillLine or T.PillLineOff)
+	RoundRect(x + 1, y + 1, w - 2, h - 2, 4, on and T.PillBg or T.PillBgOff)
+	local knob: number = 10
+	local kx: number = on and (x + w - knob - 4) or (x + 4)
+	RoundRect(kx, y + (h - knob) / 2, knob, knob, 3, on and T.Knob or T.KnobOff)
+end
+
+-- Draws one toggle row (optional color swatch). Returns true if the row was clicked.
+local function DrawToggleRow(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	enabled: boolean,
+	clicked: boolean,
+	mp: vector,
+	swatch: Color3?
+): boolean
+	local labelX: number = x + 10
+	if swatch then
+		DrawingImmediate.FilledRectangle(vec(x + 10, y + h / 2 - 3, 0), vec(6, 6, 0), swatch, 1)
+		labelX = x + 22
+	end
+	DrawingImmediate.Text(vec(labelX, y + h / 2 - 6, 0), 13, enabled and T.TextRow or T.TextOff, 1, label, false)
+
+	local pillW: number = 32
+	local pillH: number = 18
+	DrawPill(x + w - pillW - 10, y + (h - pillH) / 2, pillW, pillH, enabled)
+
+	return clicked and inRect(mp.x, mp.y, x, y, w, h)
+end
+
+-- Draws a row with a small button on the right. Returns true if the button was clicked.
+local function DrawActionRow(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	btnText: string,
+	clicked: boolean,
+	mp: vector
+): boolean
+	DrawingImmediate.Text(vec(x + 10, y + h / 2 - 6, 0), 13, T.TextRow, 1, label, false)
+
+	local bw: number = 64
+	local bh: number = 18
+	local bx: number = x + w - bw - 10
+	local by: number = y + (h - bh) / 2
+	local hover = inRect(mp.x, mp.y, bx, by, bw, bh)
+	RoundRect(bx, by, bw, bh, 5, T.PillLine)
+	RoundRect(bx + 1, by + 1, bw - 2, bh - 2, 4, if hover then T.PillLine else T.PillBg)
+	DrawingImmediate.Text(vec(bx + bw / 2, by + 3, 0), 12, T.TextMain, 1, btnText, true)
+
+	return clicked and hover
+end
+
+-- Draws a compact chip (optional on/off indicator, label). Returns true if it was clicked.
+local function DrawChip(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	on: boolean?,
+	clicked: boolean,
+	mp: vector
+): boolean
+	local hover = inRect(mp.x, mp.y, x, y, w, h)
+	RoundRect(x, y, w, h, 5, if hover then T.PillLine else T.Chip)
+	local labelX = x + 10
+	if on ~= nil then
+		DrawingImmediate.FilledRectangle(vec(x + 8, y + h / 2 - 3, 0), vec(6, 6, 0), if on then T.Knob else T.PillLineOff, 1)
+		labelX = x + 20
+	end
+	DrawingImmediate.Text(vec(labelX, y + h / 2 - 6, 0), 11, if on == false then T.TextOff else T.TextRow, 1, label, false)
+	return clicked and hover
+end
+
+-- Draws a collapsible section header (label, counter, arrow). Returns true if clicked.
+local function DrawDropdownHeader(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	countText: string,
+	open: boolean,
+	clicked: boolean,
+	mp: vector
+): boolean
+	local hover = inRect(mp.x, mp.y, x, y, w, h)
+	if hover or open then
+		RoundRect(x, y, w, h, 6, T.Chip)
+	end
+	DrawingImmediate.Text(vec(x + 10, y + h / 2 - 6, 0), 13, T.TextMain, 1, label, false)
+	DrawingImmediate.Text(vec(x + w - 46, y + h / 2 - 6, 0), 12, T.TextDim, 1, countText, true)
+
+	local cx: number = x + w - 16
+	local cy: number = y + h / 2
+	if open then
+		DrawingImmediate.FilledTriangle(vec(cx - 5, cy - 3, 0), vec(cx + 5, cy - 3, 0), vec(cx, cy + 3, 0), T.Knob, 1)
+	else
+		DrawingImmediate.FilledTriangle(vec(cx - 3, cy - 5, 0), vec(cx - 3, cy + 5, 0), vec(cx + 3, cy, 0), T.Knob, 1)
+	end
+
+	return clicked and hover
+end
+
+-- Draws the tab bar; returns the index of the clicked tab (0 if none).
+local function DrawTabs(x: number, y: number, w: number, clicked: boolean, mp: vector): number
+	local count = #TAB_NAMES
+	local gap: number = 4
+	local tabW: number = (w - gap * (count - 1)) / count
+	local hit = 0
+	for i, name in TAB_NAMES do
+		local tx = x + (i - 1) * (tabW + gap)
+		local active = UIState.Tab == i
+		local hover = inRect(mp.x, mp.y, tx, y, tabW, TAB_H)
+		if active or hover then
+			RoundRect(tx, y, tabW, TAB_H, 6, T.Chip)
+		end
+		DrawingImmediate.Text(vec(tx + tabW / 2, y + TAB_H / 2 - 6, 0), 12, if active then T.TextMain else T.TextOff, 1, name, true)
+		if clicked and hover then
+			hit = i
+		end
+	end
+	return hit
+end
+
+-- Draws a slider row; returns the new value and keeps dragging while the button is held.
+local function DrawSliderRow(
+	x: number,
+	y: number,
+	w: number,
+	label: string,
+	value: number,
+	minV: number,
+	maxV: number,
+	suffix: string,
+	clicked: boolean,
+	ldown: boolean,
+	mp: vector
+): number
+	DrawingImmediate.Text(vec(x + 10, y + 9, 0), 11, T.TextDim, 1, label, false)
+
+	local valStr = tostring(floor(value)) .. suffix
+	RoundRect(x + w - 55, y + 9, 45, 14, 4, T.Chip)
+	DrawingImmediate.Text(vec(x + w - 32.5, y + 10, 0), 11, T.TextMain, 1, valStr, true)
+
+	local tX: number = x + 10
+	local tW: number = w - 20
+	local tC: number = y + 43 -- vertical center of the track
+
+	if clicked and inRect(mp.x, mp.y, tX - 6, tC - 10, tW + 12, 20) then
+		SliderActive = true
+	end
+	if not ldown then
+		SliderActive = false
+	end
+
+	if SliderActive then
+		local rel = math.clamp((mp.x - tX) / tW, 0, 1)
+		value = floor((minV + rel * (maxV - minV)) / 10 + 0.5) * 10
+		value = math.clamp(value, minV, maxV)
+	end
+
+	RoundRect(tX, tC - 2, tW, 4, 2, T.Track)
+
+	local frac: number = math.clamp((value - minV) / (maxV - minV), 0, 1)
+	local thumbX: number = tX + floor(tW * frac) - 5
+	RoundRect(thumbX, tC - 5, 10, 10, 3, T.Knob)
+
+	return value
+end
+
+-- Draws a small dim section label.
+local function DrawLabel(x: number, y: number, text: string): ()
+	DrawingImmediate.Text(vec(x + 18, y, 0), 11, T.TextDim, 1, text, false)
+end
+
+-- ESP tab: master switches, range slider, vehicle dropdown.
+local function drawEspTab(ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "ESP", toggles.enabled, clicked, mp, nil) then
+		toggles.enabled = not toggles.enabled
+		forceRebuild = true
+	end
+	yo += MAIN_ROW_H
+
+	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Show distance", toggles.showDistance, clicked, mp, nil) then
+		toggles.showDistance = not toggles.showDistance
+	end
+	yo += MAIN_ROW_H
+
+	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Show team", toggles.showTeam, clicked, mp, nil) then
+		toggles.showTeam = not toggles.showTeam
+		forceRebuild = true
+	end
+	yo += MAIN_ROW_H
+
+	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Show own items", toggles.showOwn, clicked, mp, nil) then
+		toggles.showOwn = not toggles.showOwn
+	end
+	yo += MAIN_ROW_H + 3
+
+	state.maxDistance = DrawSliderRow(
+		ux + 8, yo, uw - 16, "DRAW RANGE", state.maxDistance, RANGE_MIN, RANGE_MAX, " st", clicked, input.down, mp
+	)
+	yo += SLIDER_ROW_H + 9
+
+	DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
+	DrawLabel(ux, yo + 12, "TARGETS")
+	yo += 30
+
+	local onCount = 0
+	for _, cat in CATEGORIES do
+		if toggles[cat.key] then
+			onCount += 1
+		end
+	end
+	if DrawDropdownHeader(ux + 8, yo, uw - 16, MAIN_ROW_H, "Vehicles", `{onCount}/{CATEGORY_COUNT}`, UIState.VehiclesOpen, clicked, mp) then
+		UIState.VehiclesOpen = not UIState.VehiclesOpen
+	end
+	yo += MAIN_ROW_H
+
+	if UIState.VehiclesOpen then
+		yo += DROP_TOP_GAP
+		local allOn = onCount == CATEGORY_COUNT
+		if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, "All vehicles", allOn, clicked, mp, T.White) then
+			for _, cat in CATEGORIES do
+				toggles[cat.key] = not allOn
+			end
+			forceRebuild = true
+		end
+		yo += DROP_ROW_H + DROP_GAP
+
+		for _, cat in CATEGORIES do
+			if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, cat.label, toggles[cat.key], clicked, mp, cat.color) then
+				toggles[cat.key] = not toggles[cat.key]
+				forceRebuild = true
+			end
+			yo += DROP_ROW_H + DROP_GAP
+		end
+		yo += 4
+	end
+	return yo
+end
+
+-- Farm tab: auto buy and collect money.
+local function drawFarmTab(ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Auto buy [F1]", toggles.autoBuy, clicked, mp, nil) then
+		toggles.autoBuy = not toggles.autoBuy
+		if toggles.autoBuy then
+			lastCollectAt = os.clock()
+		end
+	end
+	yo += MAIN_ROW_H
+
+	if DrawActionRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Collect money [Enter]", "Collect", clicked, mp) then
+		collectQueued = true
+	end
+	yo += MAIN_ROW_H
+
+	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Infinite ammo", toggles.infAmmo, clicked, mp, nil) then
+		toggles.infAmmo = not toggles.infAmmo
+		if toggles.infAmmo then
+			lastAmmoAt = -math.huge -- apply right away
+		end
+	end
+	yo += MAIN_ROW_H + 6
+
+	DrawLabel(ux, yo, `Auto buy collects money every {COLLECT_EVERY}s`)
+	DrawLabel(ux, yo + 14, "and keeps buying afterwards.")
+	DrawLabel(ux, yo + 28, "Infinite ammo stays until you rejoin.")
+	yo += 48
+	return yo
+end
+
+-- Teleports tab: map locations, own base / deposit, every base.
+local function drawTeleportTab(ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	DrawLabel(ux, yo + 2, "MAP")
+	yo += 20
+	for _, loc in MAP_LOCATIONS do
+		if DrawActionRow(ux + 8, yo, uw - 16, MAIN_ROW_H, loc.name, "Go", clicked, mp) then
+			pendingTeleport = loc.pos
+		end
+		yo += MAIN_ROW_H
+	end
+
+	DrawingImmediate.FilledRectangle(vec(ux + 12, yo + 4, 0), vec(uw - 24, 1, 0), T.Divider, 1)
+	DrawLabel(ux, yo + 14, "MY TYCOON")
+	yo += 32
+	if DrawActionRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "My base", "Go", clicked, mp) then
+		pendingTeleport = "base"
+	end
+	yo += MAIN_ROW_H
+	if DrawActionRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "My oil deposit", "Go", clicked, mp) then
+		pendingTeleport = "deposit"
+	end
+	yo += MAIN_ROW_H + 4
+
+	if DrawDropdownHeader(ux + 8, yo, uw - 16, MAIN_ROW_H, "Bases", `{#BASES}`, UIState.BasesOpen, clicked, mp) then
+		UIState.BasesOpen = not UIState.BasesOpen
+	end
+	yo += MAIN_ROW_H
+
+	if UIState.BasesOpen then
+		yo += DROP_TOP_GAP
+		local cw: number = (uw - 32 - CHIP_GAP) / 2
+		for i, base in BASES do
+			local col = (i - 1) % 2
+			local row = floor((i - 1) / 2)
+			local cx = ux + 16 + col * (cw + CHIP_GAP)
+			local cy = yo + row * (CHIP_H + CHIP_GAP)
+			if DrawChip(cx, cy, cw, CHIP_H, base.name, nil, clicked, mp) then
+				pendingTeleport = base.pos
+			end
+		end
+		yo += floor((#BASES + 1) / 2) * (CHIP_H + CHIP_GAP) + 4
+	end
+	return yo
+end
+
+-- Restrict tab: ON = auto buy skips that button.
+local function drawRestrictTab(ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	DrawLabel(ux, yo + 2, "ON = auto buy skips this button")
+	yo += 20
+
+	local total = 0
+	local skipped = 0
+	for _, group in RESTRICT_GROUPS do
+		for _, key in group.keys do
+			total += 1
+			if restricted[key] then
+				skipped += 1
+			end
+		end
+	end
+	local allOn = skipped == total
+	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Restrict all", allOn, clicked, mp, nil) then
+		for _, group in RESTRICT_GROUPS do
+			for _, key in group.keys do
+				restricted[key] = not allOn
+			end
+		end
+	end
+	yo += MAIN_ROW_H + 2
+
+	local cw: number = (uw - 32 - CHIP_GAP) / 2
+	for _, group in RESTRICT_GROUPS do
+		local open = UIState.OpenGroup == group.title
+		local count = 0
+		for _, key in group.keys do
+			if restricted[key] then
+				count += 1
+			end
+		end
+		local size = #group.keys
+
+		if DrawDropdownHeader(ux + 8, yo, uw - 16, MAIN_ROW_H, group.title, `{count}/{size}`, open, clicked, mp) then
+			UIState.OpenGroup = if open then "" else group.title
+		end
+		yo += MAIN_ROW_H
+
+		if open then
+			yo += DROP_TOP_GAP
+			local groupAll = count == size
+			if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, `All {group.title}`, groupAll, clicked, mp, T.White) then
+				for _, key in group.keys do
+					restricted[key] = not groupAll
+				end
+			end
+			yo += DROP_ROW_H + DROP_GAP + 2
+
+			for i, key in group.keys do
+				local col = (i - 1) % 2
+				local row = floor((i - 1) / 2)
+				local cx = ux + 16 + col * (cw + CHIP_GAP)
+				local cy = yo + row * (CHIP_H + CHIP_GAP)
+				if DrawChip(cx, cy, cw, CHIP_H, shortLabel(group.names[i], 19), restricted[key] == true, clicked, mp) then
+					restricted[key] = not restricted[key]
+				end
+			end
+			yo += floor((size + 1) / 2) * (CHIP_H + CHIP_GAP) + 4
+		end
+	end
+	return yo
+end
+
+-- Draws the red admin warning at the top center of the screen.
+local function drawAdminWarning(): ()
+	if adminText ~= "" and viewW > 0 then
+		DrawingImmediate.OutlinedText(vec(viewW / 2, 20, 0), 22, ADMIN_RED, 1, adminText, true)
+	end
+end
+
+-- Draws the ESP markers prepared in PostLocal: dot, then three lines above it:
+-- name (top), owner nickname + team in the team color (middle), white distance (bottom).
+local function drawEsp(): ()
+	for i = 1, markerCount do
+		local m = markers[i]
+		local x = m.x
+		local yy = m.y - 16
+		DrawingImmediate.FilledCircle(vec(x, m.y, 0), 3, m.color, 1)
+		if m.bot ~= "" then
+			DrawingImmediate.OutlinedText(vec(x, yy, 0), 13, T.TextMain, 1, m.bot, true)
+			yy -= LINE_STEP
+		end
+		if m.mid ~= "" then
+			DrawingImmediate.OutlinedText(vec(x, yy, 0), 13, m.midColor, 1, m.mid, true)
+			yy -= LINE_STEP
+		end
+		DrawingImmediate.OutlinedText(vec(x, yy, 0), 13, m.color, 1, m.top, true)
+	end
+end
+
+-- Draws the menu, handles dragging and every click (uses only the input snapshot, no memory calls).
+local function drawMenu(): ()
+	local clicked: boolean = input.clicked
+	input.clicked = false
+	local ldown: boolean = input.down
+	local mx: number = input.mx
+	local my: number = input.my
+	local mp: vector = vec(mx, my, 0)
+
+	-- Dragging by the title bar
+	if ldown then
+		if not UIState.Dragging then
+			if UIState.Visible and not SliderActive and inRect(mx, my, UIState.X, UIState.Y, T.W, HEADER_H) then
+				UIState.Dragging = true
+				UIState.DragOffset.x = mx - UIState.X
+				UIState.DragOffset.y = my - UIState.Y
+			end
+		else
+			UIState.X = math.clamp(mx - UIState.DragOffset.x, 0, math.max(0, viewW - T.W))
+			UIState.Y = math.clamp(my - UIState.DragOffset.y, 0, math.max(0, viewH - UIState.PanelH))
+		end
+	else
+		UIState.Dragging = false
+	end
+
+	if not UIState.Visible then
+		return
+	end
+
+	local ux: number = UIState.X
+	local uy: number = UIState.Y
+	local uw: number = T.W
+
+	RoundRect(ux, uy, uw, UIState.PanelH, 10, T.Bg)
+
+	-- Header + close "x"
+	DrawingImmediate.FilledRectangle(vec(ux + 18, uy + 18, 0), vec(6, 6, 0), T.White, 1)
+	DrawingImmediate.Text(vec(ux + 30, uy + 14, 0), 13, T.TextMain, 1, "SEVERE | WAR TYCOON", false)
+	DrawingImmediate.Text(vec(ux + 31, uy + 14, 0), 13, T.TextMain, 1, "SEVERE | WAR TYCOON", false) -- second pass = bolder title
+	DrawingImmediate.Text(vec(ux + uw - 26, uy + 13, 0), 14, T.TextDim, 1, "x", false)
+	if clicked and inRect(mx, my, ux + uw - 28, uy, 28, HEADER_H) then
+		UIState.Visible = false
+		return
+	end
+
+	local tab = DrawTabs(ux + 8, uy + HEADER_H, uw - 16, clicked, mp)
+	if tab ~= 0 then
+		UIState.Tab = tab
+	end
+
+	local yo: number = uy + HEADER_H + TAB_H + 8
+	local current = UIState.Tab
+	if current == 1 then
+		yo = drawEspTab(ux, yo, uw, clicked, mp)
+	elseif current == 2 then
+		yo = drawFarmTab(ux, yo, uw, clicked, mp)
+	elseif current == 3 then
+		yo = drawTeleportTab(ux, yo, uw, clicked, mp)
+	else
+		yo = drawRestrictTab(ux, yo, uw, clicked, mp)
+	end
+	yo += 6
+
+	-- Footer
+	DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
+	DrawingImmediate.Text(vec(ux + 18, yo + 11, 0), 11, T.TextDim, 1, "Shown:", false)
+	DrawingImmediate.Text(vec(ux + 62, yo + 11, 0), 11, T.TextRow, 1, tostring(markerCount), false)
+	DrawingImmediate.Text(vec(ux + 114, yo + 11, 0), 11, T.TextDim, 1, "Hide menu:", false)
+	DrawingImmediate.Text(vec(ux + 188, yo + 11, 0), 11, T.TextMain, 1, "RShift", false)
+	UIState.PanelH = yo + 32 - uy
+end
+
+-- ───────────────────────── Loops ─────────────────────────
+
+-- Samples the mouse once per frame (a click stays flagged until Render consumes it).
+local function sampleInput(): ()
+	local mouse = getmouseposition()
+	local down: boolean = isrbxactive() and isleftpressed()
+	if down and not input.down then
+		input.clicked = true
+	end
+	input.down = down
+	input.mx = mouse.x
+	input.my = mouse.y
+end
+
+-- Handles RightShift (menu) and Enter (collect money).
+local function handleKeys(): ()
+	-- No key reads while Roblox is not the active window (RightShift in another app must not toggle the menu)
+	local keys: { any } = if isrbxactive() then getpressedkeys() else EMPTY_KEYS
+	local rshift: boolean = table.find(keys, "RightShift") ~= nil or table.find(keys, 0xA1) ~= nil
+	if rshift and not RShiftWasDown then
+		UIState.Visible = not UIState.Visible
+	end
+	RShiftWasDown = rshift
+
+	local enter: boolean = table.find(keys, "Return") ~= nil
+		or table.find(keys, "Enter") ~= nil
+		or table.find(keys, 0x0D) ~= nil
+	if enter and not EnterWasDown then
+		collectQueued = true
+	end
+	EnterWasDown = enter
+
+	-- F1 toggles auto buy
+	local f1: boolean = table.find(keys, "F1") ~= nil or table.find(keys, 0x70) ~= nil
+	if f1 and not F1WasDown then
+		toggles.autoBuy = not toggles.autoBuy
+		if toggles.autoBuy then
+			lastCollectAt = os.clock()
+		end
+	end
+	F1WasDown = f1
+end
+
+-- Starts the next queued action when nothing else is running.
+local function dispatchActions(now: number): ()
+	-- Infinite ammo: applied when switched on, then refreshed for guns that loaded later
+	if toggles.infAmmo and now - lastAmmoAt >= AMMO_EVERY then
+		lastAmmoAt = now
+		applyInfiniteAmmo()
+	end
+
+	-- Auto buy collects money on a fixed interval, then keeps buying
+	if toggles.autoBuy and now - lastCollectAt >= COLLECT_EVERY then
+		collectQueued = true
+	end
+
+	if actionBusy then
+		return
+	end
+	if pendingTeleport ~= nil then
+		local request = pendingTeleport
+		pendingTeleport = nil
+		startAction(function()
+			runTeleport(request)
+		end)
+	elseif collectQueued then
+		collectQueued = false
+		startAction(collectMoney)
+	elseif toggles.autoBuy and now - lastBuyPass >= BUY_RATE and isrbxactive() then
+		lastBuyPass = now
+		startAction(autoBuyPass)
+	end
+end
+
+local lastRebuild = 0
+local lastLogic = 0
+local lastSlow = 0
+local lastPlayers = 0
+
+refreshSlow()
+refreshPlayers()
+rebuildTracked()
+refreshPositions(os.clock())
+calibrateProjection()
+
+local postConn = RunService.PostLocal:Connect(function()
+	if not alive then
+		return
+	end
+	local now = os.clock()
+
+	sampleInput()
+
+	if now - lastSlow >= SLOW_RATE then
+		lastSlow = now
+		refreshSlow()
+		calibrateProjection()
+	end
+
+	if now - lastPlayers >= PLAYERS_RATE then
+		lastPlayers = now
+		refreshPlayers()
+	end
+
+	if forceRebuild or now - lastRebuild >= REBUILD_RATE then
+		forceRebuild = false
+		lastRebuild = now
+		rebuildTracked()
+		refreshPositions(now)
+	end
+
+	if now - lastLogic >= LOGIC_RATE then
+		lastLogic = now
+		handleKeys()
+		refreshPositions(now)
+	end
+
+	projectItems()
+	dispatchActions(now)
+end)
+
+local renderConn = RunService.Render:Connect(function()
+	if not alive then
+		return
+	end
+	drawEsp()
+	drawAdminWarning()
+	drawMenu()
+end)
+
+G.WarTycoonCleanup = function()
+	alive = false
+	postConn:Disconnect()
+	renderConn:Disconnect()
+end
+
+print("[WT] loaded")
