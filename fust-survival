@@ -3,16 +3,14 @@
 
 -- World viewer: players (health, held item, armor with tier, clothes, backpack, holstered guns), sleepers, bots,
 -- ore nodes, loot crates / airdrops, recyclers and player-placed objects (one chams box per object),
--- dropped items and ground pickups.
--- PostModel reads the world in small time slices, PostLocal refreshes positions / health / distances and the menu,
--- Render only draws.
+-- dropped items and ground pickups. Every ESP type has its own distance slider.
+-- PostModel reads the world in small time slices (rosters, equipment, health, scans),
+-- PostLocal refreshes positions / distances and the menu, Render only draws.
 
 -- Immediate-mode menu library (embedded).
 local UI: any = (function()
 local UI: any = {}
 UI.__index = UI
-
-local DEBUG = false -- test hook: records the rectangle of every control in ui.Hits
 
 local vec = vector.create
 local floor = math.floor
@@ -34,7 +32,6 @@ local THEME = table.freeze({
 	KnobOff = Color3.fromRGB(96, 96, 104),
 	White = Color3.new(1, 1, 1),
 })
-UI.Theme = THEME
 local T = THEME
 
 local HEADER_H = 38 -- title bar (drag handle)
@@ -42,16 +39,14 @@ local TAB_H = 26
 local ROW_H = 28 -- normal row
 local DROP_ROW_H = 24 -- row inside a list
 local DROP_GAP = 1
-local SLIDER_ROW_H = 56
-local CHIP_H = 22
-local CHIP_GAP = 4
+local SLIDER_ROW_H = 38 -- compact slider row
 local DROP_TOP_GAP = 6 -- space between a list header and its content
 local KEY_POLL = 0.03 -- seconds between key reads
 
 local EMPTY_KEYS: { any } = {}
 table.freeze(EMPTY_KEYS)
 
--- Key names accepted by Key options (virtual-key codes); letters, digits and F1-F12 are added below
+-- Key names accepted by the menu key option (virtual-key codes)
 local KEY_CODES: { [string]: number } = {
 	RightShift = 0xA1,
 	LeftShift = 0xA0,
@@ -81,26 +76,11 @@ for i = 1, 12 do
 	KEY_CODES["F" .. i] = 0x6F + i
 end
 table.freeze(KEY_CODES)
-UI.Keys = KEY_CODES
-
-local current: any = nil -- window being rendered (used by the test hook)
 
 -- ───────────────────────── Helpers ─────────────────────────
 
--- True if a key spec (name, virtual-key code or a list of them) is in the pressed keys.
+-- True if a key spec (name or virtual-key code) is in the pressed keys.
 local function keyDown(keys: { any }, spec: any): boolean
-	if type(spec) == "table" then
-		for _, one in spec do
-			if table.find(keys, one) ~= nil then
-				return true
-			end
-			local code = if type(one) == "string" then KEY_CODES[one] else nil
-			if code ~= nil and table.find(keys, code) ~= nil then
-				return true
-			end
-		end
-		return false
-	end
 	if table.find(keys, spec) ~= nil then
 		return true
 	end
@@ -110,14 +90,6 @@ end
 
 -- Text shown for a key spec.
 local function keyLabel(spec: any): string
-	if type(spec) == "table" then
-		for _, one in spec do
-			if type(one) == "string" then
-				return one
-			end
-		end
-		return "?"
-	end
 	if type(spec) == "number" then
 		return string.format("0x%02X", spec)
 	end
@@ -131,19 +103,6 @@ end
 
 local function inRect(px: number, py: number, x: number, y: number, w: number, h: number): boolean
 	return px >= x and px <= x + w and py >= y and py <= y + h
-end
-
-local function shortLabel(s: string, maxLen: number): string
-	if #s > maxLen then
-		return string.sub(s, 1, maxLen - 1) .. "."
-	end
-	return s
-end
-
-local function hit(label: string, x: number, y: number, w: number, h: number): ()
-	if DEBUG and current ~= nil then
-		current.Hits[label] = { x = x, y = y, w = w, h = h }
-	end
 end
 
 -- Queues a callback; it runs in the next ui:update() (PostLocal), not in Render.
@@ -210,58 +169,10 @@ local function DrawToggleRow(
 	end
 	DrawingImmediate.Text(vec(labelX, y + h / 2 - 6, 0), 13, if enabled then T.TextRow else T.TextOff, 1, label, false)
 	DrawPill(x + w - 32 - 10, y + (h - 18) / 2, 32, 18, enabled)
-	hit(label, x, y, w, h)
 	return clicked and inRect(mp.x, mp.y, x, y, w, h)
 end
 
--- A row with a small button on the right. Returns true if the button was clicked.
-local function DrawActionRow(
-	x: number,
-	y: number,
-	w: number,
-	h: number,
-	label: string,
-	btnText: string,
-	clicked: boolean,
-	mp: vector
-): boolean
-	DrawingImmediate.Text(vec(x + 10, y + h / 2 - 6, 0), 13, T.TextRow, 1, label, false)
-	local bw = 64
-	local bh = 18
-	local bx = x + w - bw - 10
-	local by = y + (h - bh) / 2
-	local hover = inRect(mp.x, mp.y, bx, by, bw, bh)
-	RoundRect(bx, by, bw, bh, 5, T.PillLine)
-	RoundRect(bx + 1, by + 1, bw - 2, bh - 2, 4, if hover then T.PillLine else T.PillBg)
-	DrawingImmediate.Text(vec(bx + bw / 2, by + 3, 0), 12, T.TextMain, 1, btnText, true)
-	hit(label, bx, by, bw, bh)
-	return clicked and hover
-end
-
--- A compact chip; `on` = nil hides the on/off indicator. Returns true if it was clicked.
-local function DrawChip(
-	x: number,
-	y: number,
-	w: number,
-	h: number,
-	label: string,
-	on: boolean?,
-	clicked: boolean,
-	mp: vector
-): boolean
-	local hover = inRect(mp.x, mp.y, x, y, w, h)
-	RoundRect(x, y, w, h, 5, if hover then T.PillLine else T.Chip)
-	local labelX = x + 10
-	if on ~= nil then
-		DrawingImmediate.FilledRectangle(vec(x + 8, y + h / 2 - 3, 0), vec(6, 6, 0), if on then T.Knob else T.PillLineOff, 1)
-		labelX = x + 20
-	end
-	DrawingImmediate.Text(vec(labelX, y + h / 2 - 6, 0), 11, if on == false then T.TextOff else T.TextRow, 1, label, false)
-	hit(label, x, y, w, h)
-	return clicked and hover
-end
-
--- Collapsible list header (label, counter, arrow). Returns true if clicked.
+-- Collapsible header (label, counter, arrow). Returns true if clicked.
 local function DrawDropdownHeader(
 	x: number,
 	y: number,
@@ -286,22 +197,21 @@ local function DrawDropdownHeader(
 	else
 		DrawingImmediate.FilledTriangle(vec(cx - 3, cy - 5, 0), vec(cx - 3, cy + 5, 0), vec(cx + 3, cy, 0), T.Knob, 1)
 	end
-	hit(label, x, y, w, h)
 	return clicked and hover
 end
 
--- Slider row; returns the new value and keeps dragging while the button is held.
+-- Compact slider row; returns the new value and keeps dragging while the button is held.
 local function DrawSliderRow(ui: any, el: any, x: number, y: number, w: number, value: number, clicked: boolean, ldown: boolean, mp: vector): number
 	local minV: number = el.Min
 	local maxV: number = el.Max
 	local step: number = el.Step
-	DrawingImmediate.Text(vec(x + 10, y + 9, 0), 11, T.TextDim, 1, el.Name, false)
-	RoundRect(x + w - 55, y + 9, 45, 14, 4, T.Chip)
-	DrawingImmediate.Text(vec(x + w - 32.5, y + 10, 0), 11, T.TextMain, 1, tostring(floor(value)) .. el.Suffix, true)
+	DrawingImmediate.Text(vec(x + 10, y + 3, 0), 12, T.TextRow, 1, el.Name, false)
+	RoundRect(x + w - 62, y + 2, 52, 15, 4, T.Chip)
+	DrawingImmediate.Text(vec(x + w - 36, y + 3, 0), 11, T.TextMain, 1, tostring(floor(value)) .. el.Suffix, true)
 
 	local tX = x + 10
 	local tW = w - 20
-	local tC = y + 43 -- vertical center of the track
+	local tC = y + 28 -- vertical center of the track
 
 	if clicked and inRect(mp.x, mp.y, tX - 6, tC - 10, tW + 12, 20) then
 		ui.SliderActive = el
@@ -318,7 +228,6 @@ local function DrawSliderRow(ui: any, el: any, x: number, y: number, w: number, 
 	RoundRect(tX, tC - 2, tW, 4, 2, T.Track)
 	local frac = math.clamp((value - minV) / (maxV - minV), 0, 1)
 	RoundRect(tX + floor(tW * frac) - 5, tC - 5, 10, 10, 3, T.Knob)
-	hit(el.Name, tX, tC - 10, tW, 20)
 	return value
 end
 
@@ -328,49 +237,31 @@ end
 
 -- ───────────────────────── Controls ─────────────────────────
 
-local function getValue(ui: any, el: any): any
-	if el.Get ~= nil then
-		return el.Get()
-	end
-	local store = el.Store or ui.Flags
-	return store[el.Flag]
-end
-
 -- Stores a new value and queues OnChange.
 local function setValue(ui: any, el: any, value: any): ()
-	if el.Set ~= nil then
-		el.Set(value)
-	else
-		local store = el.Store or ui.Flags
-		store[el.Flag] = value
-	end
+	ui.Flags[el.Flag] = value
 	if el.OnChange ~= nil then
 		push(ui, el.OnChange, value, el.Flag)
 	end
 end
 
+local drawElement: any -- forward declaration (foldouts draw their children)
+
 local function drawToggle(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
-	local on = getValue(ui, el) == true
+	local on = ui.Flags[el.Flag] == true
 	if DrawToggleRow(ux + 8, yo, uw - 16, ROW_H, el.Label, on, clicked, mp, el.Swatch) then
 		setValue(ui, el, not on)
 	end
 	return yo + ROW_H + el.Gap
 end
 
-local function drawAction(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
-	if DrawActionRow(ux + 8, yo, uw - 16, ROW_H, el.Label, el.Button, clicked, mp) and el.Callback ~= nil then
-		push(ui, el.Callback, nil, nil)
-	end
-	return yo + ROW_H + el.Gap
-end
-
 local function drawSlider(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
-	local value: number = getValue(ui, el)
+	local value: number = ui.Flags[el.Flag]
 	local nextValue = DrawSliderRow(ui, el, ux + 8, yo, uw - 16, value, clicked, ui.Input.down, mp)
 	if nextValue ~= value then
 		setValue(ui, el, nextValue)
 	end
-	return yo + SLIDER_ROW_H + 9 + el.Gap
+	return yo + SLIDER_ROW_H + el.Gap
 end
 
 local function drawSection(ui: any, el: any, ux: number, yo: number, uw: number): number
@@ -383,53 +274,21 @@ local function drawSection(ui: any, el: any, ux: number, yo: number, uw: number)
 	return yo + 20
 end
 
-local function drawNote(ui: any, el: any, ux: number, yo: number): number
-	yo += el.Before
-	for i, line in el.Lines do
-		DrawLabel(ux, yo + (i - 1) * 14, line)
-	end
-	return yo + #el.Lines * 14 + 6
-end
-
--- Open state of a list: one open list per accordion id, or one flag per list.
-local function isOpen(ui: any, el: any): boolean
-	if el.Accordion ~= nil then
-		return ui.Accordion[el.Accordion] == el
-	end
-	return ui.Open[el] == true
-end
-
-local function toggleOpen(ui: any, el: any): ()
-	local open = isOpen(ui, el)
-	if el.Accordion ~= nil then
-		ui.Accordion[el.Accordion] = if open then nil else el
-	else
-		ui.Open[el] = not open
-	end
-end
-
+-- Dropdown with one toggle row per item and an optional "all" row.
 local function drawDropdown(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
 	local items: { any } = el.Items
-	local store = el.Store or ui.Flags
-	local chips = el.Layout == "chips"
+	local store = ui.Flags
 	local size = #items
-
-	-- Counter: on / total for flag items, the item count for plain action chips
-	local flagged = false
 	local onCount = 0
 	for _, item in items do
-		if item.Flag ~= nil then
-			flagged = true
-			if store[item.Flag] == true then
-				onCount += 1
-			end
+		if store[item.Flag] == true then
+			onCount += 1
 		end
 	end
-	local countText = if flagged then `{onCount}/{size}` else tostring(size)
 
-	local open = isOpen(ui, el)
-	if DrawDropdownHeader(ux + 8, yo, uw - 16, ROW_H, el.Name, countText, open, clicked, mp) then
-		toggleOpen(ui, el)
+	local open = ui.Open[el] == true
+	if DrawDropdownHeader(ux + 8, yo, uw - 16, ROW_H, el.Name, `{onCount}/{size}`, open, clicked, mp) then
+		ui.Open[el] = not open
 	end
 	yo += ROW_H
 	if not open then
@@ -437,75 +296,57 @@ local function drawDropdown(ui: any, el: any, ux: number, yo: number, uw: number
 	end
 	yo += DROP_TOP_GAP
 
-	-- "All" row switches every flag item at once
-	if el.All ~= nil and flagged then
+	if el.All ~= nil then
 		local allOn = onCount == size
 		if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, el.All, allOn, clicked, mp, T.White) then
 			for _, item in items do
 				store[item.Flag] = not allOn
 			end
-			if el.OnChange ~= nil then
-				push(ui, el.OnChange, nil, not allOn)
-			end
 		end
-		yo += DROP_ROW_H + DROP_GAP + (if chips then 2 else 0)
+		yo += DROP_ROW_H + DROP_GAP
 	end
-
-	if chips then
-		local cw = (uw - 32 - CHIP_GAP) / 2
-		for i, item in items do
-			local col = (i - 1) % 2
-			local row = floor((i - 1) / 2)
-			local cx = ux + 16 + col * (cw + CHIP_GAP)
-			local cy = yo + row * (CHIP_H + CHIP_GAP)
-			local label = shortLabel(item.Name, el.MaxLabel)
-			if item.Flag ~= nil then
-				local on = store[item.Flag] == true
-				if DrawChip(cx, cy, cw, CHIP_H, label, on, clicked, mp) then
-					store[item.Flag] = not on
-					if el.OnChange ~= nil then
-						push(ui, el.OnChange, item.Flag, not on)
-					end
-				end
-			elseif DrawChip(cx, cy, cw, CHIP_H, label, nil, clicked, mp) and item.Callback ~= nil then
-				push(ui, item.Callback, item, nil)
-			end
+	for _, item in items do
+		local on = store[item.Flag] == true
+		if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, item.Name, on, clicked, mp, item.Swatch) then
+			store[item.Flag] = not on
 		end
-		yo += floor((size + 1) / 2) * (CHIP_H + CHIP_GAP) + 4
-	else
-		for _, item in items do
-			local on = store[item.Flag] == true
-			if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, item.Name, on, clicked, mp, item.Swatch) then
-				store[item.Flag] = not on
-				if el.OnChange ~= nil then
-					push(ui, el.OnChange, item.Flag, not on)
-				end
-			end
-			yo += DROP_ROW_H + DROP_GAP
-		end
-		yo += 4
+		yo += DROP_ROW_H + DROP_GAP
 	end
+	yo += 4
 	return yo + el.Gap
 end
 
--- Draws one control and returns the y of the next one.
-local function drawElement(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
-	if el.Show ~= nil and not el.Show() then
-		return yo
+-- Foldout: a collapsible group of any controls (used for the per-type distance sliders).
+local function drawFoldout(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	local open = ui.Open[el] == true
+	local children: { any } = el.Fold.Elements
+	if DrawDropdownHeader(ux + 8, yo, uw - 16, ROW_H, el.Name, tostring(#children), open, clicked, mp) then
+		ui.Open[el] = not open
 	end
+	yo += ROW_H
+	if not open then
+		return yo + el.Gap
+	end
+	yo += 4
+	for _, childEl in children do
+		yo = drawElement(ui, childEl, ux + 8, yo, uw - 16, clicked, mp)
+	end
+	return yo + 4 + el.Gap
+end
+
+-- Draws one control and returns the y of the next one.
+drawElement = function(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
 	local kind = el.Kind
 	if kind == "toggle" then
 		return drawToggle(ui, el, ux, yo, uw, clicked, mp)
-	elseif kind == "action" then
-		return drawAction(ui, el, ux, yo, uw, clicked, mp)
 	elseif kind == "slider" then
 		return drawSlider(ui, el, ux, yo, uw, clicked, mp)
 	elseif kind == "dropdown" then
 		return drawDropdown(ui, el, ux, yo, uw, clicked, mp)
-	elseif kind == "section" then
-		return drawSection(ui, el, ux, yo, uw)
+	elseif kind == "foldout" then
+		return drawFoldout(ui, el, ux, yo, uw, clicked, mp)
 	end
-	return drawNote(ui, el, ux, yo)
+	return drawSection(ui, el, ux, yo, uw)
 end
 
 -- ───────────────────────── Tabs ─────────────────────────
@@ -513,16 +354,13 @@ end
 local Tab: any = {}
 Tab.__index = Tab
 
--- Registers a control: defaults, hotkey, label.
+-- Registers a control: defaults and label.
 function Tab:_add(kind: string, o: any): any
 	local ui = self.Ui
 	o.Kind = kind
 	o.Gap = o.Gap or 0
-	local name: string? = o.Name
-	if name ~= nil then
-		o.Label = if o.Key ~= nil then `{name} [{o.KeyLabel or keyLabel(o.Key)}]` else name
-	end
-	local store = o.Store or ui.Flags
+	o.Label = o.Name
+	local store = ui.Flags
 	if o.Flag ~= nil and store[o.Flag] == nil then
 		if kind == "slider" then
 			store[o.Flag] = o.Default or o.Min
@@ -537,23 +375,13 @@ function Tab:_add(kind: string, o: any): any
 			end
 		end
 	end
-	if o.Key ~= nil then
-		o.KeyWasDown = false
-		table.insert(ui.Hotkeys, o)
-	end
 	table.insert(self.Elements, o)
 	return o
 end
 
--- Toggle: Name, Flag (or Get / Set), Default, Key, KeyLabel, Swatch, Gap, Store, OnChange(value, flag).
+-- Toggle: Name, Flag, Default, Swatch, Gap, OnChange(value, flag).
 function Tab:toggle(o: any): any
 	return self:_add("toggle", o)
-end
-
--- Button row: Name, Button (text), Callback(), Key, KeyLabel, Gap.
-function Tab:action(o: any): any
-	o.Button = o.Button or "Run"
-	return self:_add("action", o)
 end
 
 -- Slider: Name, Flag, Min, Max, Default, Step (10), Suffix, Gap, OnChange(value, flag).
@@ -568,23 +396,20 @@ function Tab:section(o: any): any
 	return self:_add("section", o)
 end
 
--- Dim text lines: Lines, Before (space above, 0).
-function Tab:note(o: any): any
-	o.Before = o.Before or 0
-	return self:_add("note", o)
+-- Collapsible list of switches: Name, Items = { { Name, Flag, Swatch, Default } }, All (text of the all-row), Gap.
+function Tab:dropdown(o: any): any
+	return self:_add("dropdown", o)
 end
 
--- Collapsible list: Name, Items, All (text of the all-row), Layout ("rows" or "chips"), Accordion (id: only one list
--- of that id stays open), Store, Gap, MaxLabel, OnChange(flag, value) (flag = nil for the all-row).
--- Items: { Name, Flag, Swatch, Default } for switches, { Name, Callback } for plain chips.
-function Tab:dropdown(o: any): any
-	o.MaxLabel = o.MaxLabel or 19
-	return self:_add("dropdown", o)
+-- Collapsible group of controls: Name, Gap. Add controls through the returned element's Fold (el.Fold:slider{...}).
+function Tab:foldout(o: any): any
+	o.Fold = setmetatable({ Name = o.Name, Ui = self.Ui, Elements = {} }, Tab)
+	return self:_add("foldout", o)
 end
 
 -- ───────────────────────── Window ─────────────────────────
 
--- Options: Title, Key (menu key, "RightShift"), KeyLabel, Flags (table that holds the values), X, Y, Width (290),
+-- Options: Title, Key (menu key, "RightShift"), KeyLabel, Flags (table that holds the values), X, Y, Width (340),
 -- Stat = { Label, Value = function() -> string } (left footer text).
 function UI.new(opts: any): any
 	local self = setmetatable({
@@ -594,7 +419,7 @@ function UI.new(opts: any): any
 		TabIndex = 1,
 		X = opts.X or 200,
 		Y = opts.Y or 100,
-		Width = opts.Width or 290,
+		Width = opts.Width or 340,
 		PanelH = 320, -- measured by the last drawn frame
 		Visible = true,
 		MenuKey = opts.Key or "RightShift",
@@ -606,8 +431,6 @@ function UI.new(opts: any): any
 		DragDY = 0,
 		SliderActive = nil,
 		Open = {},
-		Accordion = {},
-		Hotkeys = {},
 		MenuKeyWasDown = false,
 		Input = { mx = 0, my = 0, down = false, clicked = false },
 		ViewW = 0,
@@ -618,9 +441,7 @@ function UI.new(opts: any): any
 		QFn = {},
 		QA = {},
 		QB = {},
-		Hits = {},
 	}, UI)
-	UI.Last = self
 	return self
 end
 
@@ -631,37 +452,12 @@ function UI:tab(name: string): any
 	return tab
 end
 
-function UI:get(flag: string): any
-	return self.Flags[flag]
-end
-
-function UI:set(flag: string, value: any): ()
-	self.Flags[flag] = value
-end
-
-function UI:setVisible(visible: boolean): ()
-	self.Visible = visible
-end
-
-function UI:isVisible(): boolean
-	return self.Visible
-end
-
 -- Stops drawing and input (call it from the script's cleanup).
 function UI:destroy(): ()
 	self.Alive = false
 end
 
--- Hotkey pressed: flips a toggle or runs an action.
-local function fireHotkey(ui: any, el: any): ()
-	if el.Kind == "toggle" then
-		setValue(ui, el, getValue(ui, el) ~= true)
-	elseif el.Callback ~= nil then
-		push(ui, el.Callback, nil, nil)
-	end
-end
-
--- PostLocal: samples the mouse, reads keys (menu key + hotkeys), refreshes the viewport, runs queued callbacks.
+-- PostLocal: samples the mouse, reads the menu key, refreshes the viewport, runs queued callbacks.
 function UI:update(): ()
 	if not self.Alive then
 		return
@@ -698,16 +494,9 @@ function UI:update(): ()
 			self.Visible = not self.Visible
 		end
 		self.MenuKeyWasDown = menuDown
-		for _, el in self.Hotkeys do
-			local pressed = keyDown(keys, el.Key)
-			if pressed and not el.KeyWasDown then
-				fireHotkey(self, el)
-			end
-			el.KeyWasDown = pressed
-		end
 	end
 
-	-- Callbacks queued by Render and by hotkeys; ones queued while draining wait for the next update
+	-- Callbacks queued by Render; ones queued while draining wait for the next update
 	local n = self.QN
 	if n > 0 then
 		local fns, qa, qb = self.QFn, self.QA, self.QB
@@ -729,10 +518,6 @@ function UI:render(): ()
 	if not self.Alive then
 		return
 	end
-	current = self
-	if DEBUG then
-		self.Hits = {}
-	end
 	local input = self.Input
 	local clicked: boolean = input.clicked
 	input.clicked = false
@@ -742,9 +527,10 @@ function UI:render(): ()
 	local mp: vector = vec(mx, my, 0)
 	local uw: number = self.Width
 
+	-- Dragging starts only from a fresh click on the title bar (not from a held button sliding over it)
 	if ldown then
 		if not self.Dragging then
-			if self.Visible and self.SliderActive == nil and inRect(mx, my, self.X, self.Y, uw, HEADER_H) then
+			if clicked and self.Visible and self.SliderActive == nil and inRect(mx, my, self.X, self.Y, uw - 28, HEADER_H) then
 				self.Dragging = true
 				self.DragDX = mx - self.X
 				self.DragDY = my - self.Y
@@ -769,7 +555,6 @@ function UI:render(): ()
 	DrawingImmediate.Text(vec(ux + 30, uy + 14, 0), 13, T.TextMain, 1, self.Title, false)
 	DrawingImmediate.Text(vec(ux + 31, uy + 14, 0), 13, T.TextMain, 1, self.Title, false) -- second pass = bolder title
 	DrawingImmediate.Text(vec(ux + uw - 26, uy + 13, 0), 14, T.TextDim, 1, "x", false)
-	hit("x", ux + uw - 28, uy, 28, HEADER_H)
 	if clicked and inRect(mx, my, ux + uw - 28, uy, 28, HEADER_H) then
 		self.Visible = false
 		return
@@ -787,13 +572,12 @@ function UI:render(): ()
 	for i, tab in tabs do
 		local tx = ux + 8 + (i - 1) * (tabW + gap)
 		local ty = uy + HEADER_H
-		local active = self.TabIndex == i
+		local isActive = self.TabIndex == i
 		local hover = inRect(mx, my, tx, ty, tabW, TAB_H)
-		if active or hover then
+		if isActive or hover then
 			RoundRect(tx, ty, tabW, TAB_H, 6, T.Chip)
 		end
-		DrawingImmediate.Text(vec(tx + tabW / 2, ty + TAB_H / 2 - 6, 0), 12, if active then T.TextMain else T.TextOff, 1, tab.Name, true)
-		hit(tab.Name, tx, ty, tabW, TAB_H)
+		DrawingImmediate.Text(vec(tx + tabW / 2, ty + TAB_H / 2 - 6, 0), 12, if isActive then T.TextMain else T.TextOff, 1, tab.Name, true)
 		if clicked and hover then
 			self.TabIndex = i
 		end
@@ -814,8 +598,8 @@ function UI:render(): ()
 		DrawingImmediate.Text(vec(ux + 18, yo + 11, 0), 11, T.TextDim, 1, stat.Label, false)
 		DrawingImmediate.Text(vec(ux + 62, yo + 11, 0), 11, T.TextRow, 1, stat.Value(), false)
 	end
-	DrawingImmediate.Text(vec(ux + 114, yo + 11, 0), 11, T.TextDim, 1, "Hide menu:", false)
-	DrawingImmediate.Text(vec(ux + 188, yo + 11, 0), 11, T.TextMain, 1, self.MenuKeyLabel, false)
+	DrawingImmediate.Text(vec(ux + uw - 96, yo + 11, 0), 11, T.TextDim, 1, "Hide:", false)
+	DrawingImmediate.Text(vec(ux + uw - 64, yo + 11, 0), 11, T.TextMain, 1, self.MenuKeyLabel, false)
 	self.PanelH = yo + 32 - uy
 end
 
@@ -850,14 +634,16 @@ local CONFIG = table.freeze({
 	OpenAttribute = "Open", -- crate attribute: true once the lid is open
 	HpAttribute = "Hp", -- node attribute: current health
 	MaxHpAttribute = "MaxHp", -- node attribute: full health
-	AnchorOffset = -3.2, -- studs relative to a model's root part where the text block starts (negative = below the feet)
+	AnchorOffset = -3.2, -- studs relative to a player / bot root part where the text block starts (negative = below the feet)
+	SleeperOffset = 0, -- studs relative to a sleeper's root part where its text block starts
 	GroundLift = 1, -- studs above a ground item where its label is drawn
 	Font = "Tamzen", -- monospace overlay font (health padding relies on equal character widths)
 	NearRange = 500, -- studs; targets closer than this are refreshed every frame, farther ones throttled
 	FarInterval = 0.15, -- seconds between refreshes of far targets
+	EquipInterval = 1, -- seconds between equipment re-reads of one player / bot
 	RosterRate = 1, -- seconds between player / bot roster syncs
 	SlowRate = 2, -- seconds between sleeper, ground and world scans
-	RecyclerRate = 6, -- seconds between recycler tree walks
+	RecyclerRate = 10, -- seconds between recycler walks (positions are static, only the running state changes)
 	SliceBudget = 0.002, -- seconds of model reading allowed per PostModel tick (keeps the frame time flat)
 	FallbackAfter = 0.5, -- PostLocal drives the model step itself if PostModel has not run for this long
 	LabelMax = 12, -- world labels on screen at once (nearest first)
@@ -866,21 +652,25 @@ local CONFIG = table.freeze({
 	PreviewPossible = false, -- true = the info line also names the rarest items the crate type can drop
 	PreviewCount = 2, -- how many possible drops the info line names
 	ChamsLimit = 30, -- world objects drawn with chams at once (nearest first)
-	ChamParts = 12, -- parts of one model that are wrapped by its single box
+	ChamParts = 12, -- largest parts of one model that are wrapped by its single box
+	ScanParts = 24, -- parts collected from one model before the largest ones are picked
+	ScanChildren = 60, -- child instances examined per model while collecting parts
+	MaxBoxSize = 150, -- studs; a model box larger than this is dropped (label only) so broken models never span the map
+	RecyclerRadius = 14, -- studs around the recycler's anchor part; parts farther away are not part of its box
+	RecyclerPartMax = 30, -- studs; recycler parts larger than this (zones, terrain) are ignored
 	ChamsFill = 0.2, -- fill opacity of the chams
 	ChamsThickness = 1, -- outline thickness of the chams
 	ChamsMerge = 1, -- pixels the polygon grows by
 })
 
--- Armor tier estimate by item id prefix (material). Edit to taste; the first matching prefix wins.
+-- Armor tier by item id prefix (workbench hierarchy). Items without a rule are clothes. The first matching prefix wins.
 local TIER_RULES: { { prefix: string, tier: number } } = {
-	{ prefix = "heavy", tier = 4 },
+	{ prefix = "heavy", tier = 3 },
 	{ prefix = "metal", tier = 3 },
-	{ prefix = "wood", tier = 2 },
-	{ prefix = "bone", tier = 2 },
+	{ prefix = "road", tier = 2 },
 	{ prefix = "coffee", tier = 2 },
-	{ prefix = "hide", tier = 1 },
-	{ prefix = "burlap", tier = 1 },
+	{ prefix = "wood", tier = 1 },
+	{ prefix = "bone", tier = 1 },
 }
 
 local COLORS = table.freeze({
@@ -925,14 +715,21 @@ local PICKUP_TYPES: { string } = table.freeze({
 	"wood", "stone", "metal", "sulfur", "hemp", "corn", "mushroom", "berries", "apple", "pumpkin", "potato", "carrot",
 })
 
--- Ore nodes: each type has its own chams / text color.
+-- Ore nodes: each type has its own chams / text color and its own distance (flag dist_ore_<key>).
 local ORE_KINDS: { [string]: { key: string, label: string, color: Color3 } } = {
 	MetalNode = { key = "metal", label = "Metal Ore", color = Color3.fromRGB(110, 200, 255) },
 	SulfurNode = { key = "sulfur", label = "Sulfur Ore", color = Color3.fromRGB(255, 225, 50) },
 	StoneNode = { key = "stone", label = "Stone", color = Color3.fromRGB(175, 175, 180) },
 }
 
--- Containers: each type has its own chams / text color.
+-- Ore menu rows: type filter and default distance.
+local ORE_MENU: { { key: string, name: string, on: boolean, dist: number } } = {
+	{ key = "metal", name = "Metal", on = true, dist = 300 },
+	{ key = "sulfur", name = "Sulfur", on = true, dist = 300 },
+	{ key = "stone", name = "Stone", on = true, dist = 300 },
+}
+
+-- Containers: each type has its own chams / text color and its own distance (flag dist_loot_<key>).
 local CRATE_KINDS: { [string]: { key: string, label: string, tbl: string, color: Color3 } } = {
 	LootCrate = { key = "wooden", label = "Wooden Crate", tbl = "crate_wooden", color = Color3.fromRGB(180, 125, 70) },
 	MilitaryCrate = { key = "military", label = "Military Crate", tbl = "crate_military", color = Color3.fromRGB(80, 205, 95) },
@@ -941,6 +738,17 @@ local CRATE_KINDS: { [string]: { key: string, label: string, tbl: string, color:
 	LockedCrate = { key = "locked", label = "Locked Crate", tbl = "locked_crate", color = Color3.fromRGB(255, 70, 70) },
 	HeliCrate = { key = "heli", label = "Heli Crate", tbl = "heli_crate", color = Color3.fromRGB(70, 150, 255) },
 	Airdrop = { key = "airdrop", label = "Airdrop", tbl = "airdrop", color = Color3.fromRGB(235, 240, 255) },
+}
+
+-- Loot menu rows: type filter and default distance.
+local LOOT_MENU: { { key: string, name: string, dist: number } } = {
+	{ key = "wooden", name = "Wooden", dist = 300 },
+	{ key = "military", name = "Military", dist = 300 },
+	{ key = "elite", name = "Elite", dist = 300 },
+	{ key = "barrel", name = "Barrel", dist = 200 },
+	{ key = "locked", name = "Locked", dist = 400 },
+	{ key = "heli", name = "Heli", dist = 600 },
+	{ key = "airdrop", name = "Airdrop", dist = 1000 },
 }
 
 -- Player-placed objects (Workspace.Deployables): category filter, label and color per model name.
@@ -967,6 +775,16 @@ local BASE_KINDS: { [string]: { cat: string, label: string, color: Color3 } } = 
 	SmallGenerator = { cat = "power", label = "Small Generator", color = Color3.fromRGB(255, 240, 110) },
 	SleepingBag = { cat = "bags", label = "Sleeping Bag", color = Color3.fromRGB(215, 160, 255) },
 	Backpack = { cat = "backpacks", label = "Backpack", color = Color3.fromRGB(235, 235, 120) },
+}
+
+-- Base menu rows: category filter, default state and default distance (flag base_<cat> / dist_base_<cat>).
+local BASE_MENU: { { cat: string, name: string, on: boolean, dist: number } } = {
+	{ cat = "turrets", name = "Turrets and traps", on = true, dist = 300 },
+	{ cat = "storage", name = "Boxes and cupboards", on = true, dist = 300 },
+	{ cat = "furnaces", name = "Furnaces", on = false, dist = 300 },
+	{ cat = "benches", name = "Workbenches", on = false, dist = 300 },
+	{ cat = "power", name = "Power", on = false, dist = 300 },
+	{ cat = "bags", name = "Sleeping bags", on = false, dist = 300 },
 }
 
 
@@ -1000,7 +818,8 @@ type Target = {
 	dead: boolean, -- true once the model vanished; dropped by the next roster sync
 	position: vector,
 	distSq: number,
-	nextUpdate: number, -- earliest time of the next position / health refresh
+	nextUpdate: number, -- earliest time of the next position refresh
+	healthAt: number, -- earliest time of the next health read
 	gearAt: number, -- time of the last equipment read
 	health: number, -- -1 when unknown
 	maxHealth: number,
@@ -1029,8 +848,9 @@ type GroundEntry = {
 }
 
 type WorldEntry = {
-	group: string, -- "ore", "loot" or "recycler"
+	group: string, -- "ore", "loot", "base", "backpack" or "recycler"
 	flag: string, -- type filter flag ("" = none)
+	distFlag: string, -- flag of this type's distance slider
 	label: string,
 	sub: string, -- second line ("" = none)
 	infoKey: string, -- loot table key of a crate ("" = none)
@@ -1040,6 +860,7 @@ type WorldEntry = {
 	distSq: number,
 	text: string, -- label with distance
 	poses: { any }, -- one pose with the model's bounding box (empty = label only)
+	model: any, -- set only for moving objects (airdrops) whose pose is re-read
 }
 
 type RecyclerInfo = { position: vector, label: string, on: boolean, poses: { any }, height: number }
@@ -1057,7 +878,6 @@ type View = {
 	clothes: boolean,
 	pack: boolean,
 	holster: boolean,
-	sleeperLift: number,
 }
 
 local Players: any = game:GetService("Players")
@@ -1070,27 +890,25 @@ local Sleepers: { Target } = {}
 local SnapGround: { GroundEntry } = {}
 local SnapWorld: { WorldEntry } = {}
 local Recyclers: { RecyclerInfo } = {}
+local RecyclerTop: { any }? = nil -- recycler models found directly under Workspace (searched once)
 local Camera: any = Workspace.CurrentCamera -- cached outside Render (Workspace.CurrentCamera is disallowed there)
+local NEAR_SQ = CONFIG.NearRange * CONFIG.NearRange
 local KnownPickup: { [string]: boolean } = {}
 for _, kind in PICKUP_TYPES do
 	KnownPickup[kind] = true
 end
 local ViewState: View = {
-	size = 13, hideEmpty = true, held = true, armor = true, tier = true, clothes = false, pack = false, holster = false, sleeperLift = 2,
+	size = 13, hideEmpty = true, held = true, armor = true, tier = true, clothes = false, pack = false, holster = false,
 }
 
 
 -- ===== Chams (convex hull outlines) =====
 
--- Projects model parts into screen polygons, fills them and draws one merged outline (convex hull per part).
+-- Projects model boxes into screen polygons, fills them and draws one outline each (convex hull of the 8 corners).
 local Chams: any = (function()
 	local ChamsCamera: any = Workspace.CurrentCamera
-	local Convex: any = {
-		Scratch = { Points = {}, Hull = {}, Poly = {} },
-		Static = { HWMPoints = 0, HWMHull = 0, HWMPoly = 0 },
-	}
-	local GROUP_EPSILON = 0.0001
-	local GROUP_JOIN_EPSILON = 0.75
+	local Scratch: any = { Points = {}, Hull = {}, Poly = {} }
+	local Static: any = { HWMPoints = 0, HWMHull = 0, HWMPoly = 0 }
 
 	local function TruncateBuffer(Buffer: any, NewSize: number, HighWaterMark: number): number
 		for Index = NewSize + 1, HighWaterMark do
@@ -1099,22 +917,20 @@ local Chams: any = (function()
 		return math.max(NewSize, HighWaterMark)
 	end
 
-	local function CrossDimension(OriginX: number, OriginY: number, PointAX: number, PointAY: number, PointBX: number, PointBY: number): number
-		return (PointAX - OriginX) * (PointBY - OriginY) - (PointAY - OriginY) * (PointBX - OriginX)
+	local function Cross(OriginX: number, OriginY: number, AX: number, AY: number, BX: number, BY: number): number
+		return (AX - OriginX) * (BY - OriginY) - (AY - OriginY) * (BX - OriginX)
 	end
 
+	-- Monotone-chain convex hull; returns the hull size.
 	local function CalculateConvexHull(Points: any, PointCount: number, Outer: any): number
 		if PointCount == 0 then
 			return 0
 		end
-		if PointCount == 1 then
-			Outer[1] = Points[1]
-			return 1
-		end
-		if PointCount == 2 then
-			Outer[1] = Points[1]
-			Outer[2] = Points[2]
-			return 2
+		if PointCount <= 2 then
+			for Index = 1, PointCount do
+				Outer[Index] = Points[Index]
+			end
+			return PointCount
 		end
 		table.sort(Points, function(PointA: any, PointB: any): boolean
 			return PointA.X < PointB.X or (PointA.X == PointB.X and PointA.Y < PointB.Y)
@@ -1122,7 +938,7 @@ local Chams: any = (function()
 		local Size = 0
 		for Index = 1, PointCount do
 			local Point = Points[Index]
-			while Size >= 2 and CrossDimension(Outer[Size - 1].X, Outer[Size - 1].Y, Outer[Size].X, Outer[Size].Y, Point.X, Point.Y) <= 0 do
+			while Size >= 2 and Cross(Outer[Size - 1].X, Outer[Size - 1].Y, Outer[Size].X, Outer[Size].Y, Point.X, Point.Y) <= 0 do
 				Size = Size - 1
 			end
 			Size = Size + 1
@@ -1131,7 +947,7 @@ local Chams: any = (function()
 		local LowerHullSize = Size
 		for Index = PointCount - 1, 1, -1 do
 			local Point = Points[Index]
-			while Size > LowerHullSize and CrossDimension(Outer[Size - 1].X, Outer[Size - 1].Y, Outer[Size].X, Outer[Size].Y, Point.X, Point.Y) <= 0 do
+			while Size > LowerHullSize and Cross(Outer[Size - 1].X, Outer[Size - 1].Y, Outer[Size].X, Outer[Size].Y, Point.X, Point.Y) <= 0 do
 				Size = Size - 1
 			end
 			Size = Size + 1
@@ -1140,25 +956,19 @@ local Chams: any = (function()
 		return Size - 1
 	end
 
-	local function ProjectPartCorners(Position: any, RightVector: any, UpVector: any, LookVector: any, PartSize: any, WriteOffset: number): number
-		local HalfSizeX = PartSize.X * 0.5
-		local HalfSizeY = PartSize.Y * 0.5
-		local HalfSizeZ = PartSize.Z * 0.5
-		local RightX = RightVector.X * HalfSizeX
-		local RightY = RightVector.Y * HalfSizeX
-		local RightZ = RightVector.Z * HalfSizeX
-		local UpX = UpVector.X * HalfSizeY
-		local UpY = UpVector.Y * HalfSizeY
-		local UpZ = UpVector.Z * HalfSizeY
-		local LookX = LookVector.X * HalfSizeZ
-		local LookY = LookVector.Y * HalfSizeZ
-		local LookZ = LookVector.Z * HalfSizeZ
-		local SignR = 1
-		for _ = 1, 2 do
-			local SignU = 1
-			for _ = 1, 2 do
-				local SignL = 1
-				for _ = 1, 2 do
+	-- Projects the 8 corners of a box; returns the point count and whether every corner is on screen.
+	local function ProjectCorners(Position: any, RightVector: any, UpVector: any, LookVector: any, PartSize: any): (number, boolean)
+		local HalfX = PartSize.X * 0.5
+		local HalfY = PartSize.Y * 0.5
+		local HalfZ = PartSize.Z * 0.5
+		local RightX, RightY, RightZ = RightVector.X * HalfX, RightVector.Y * HalfX, RightVector.Z * HalfX
+		local UpX, UpY, UpZ = UpVector.X * HalfY, UpVector.Y * HalfY, UpVector.Z * HalfY
+		local LookX, LookY, LookZ = LookVector.X * HalfZ, LookVector.Y * HalfZ, LookVector.Z * HalfZ
+		local Count = 0
+		local Complete = true
+		for SignR = -1, 1, 2 do
+			for SignU = -1, 1, 2 do
+				for SignL = -1, 1, 2 do
 					local WorldPoint = vector.create(
 						Position.X + SignR * RightX + SignU * UpX + SignL * LookX,
 						Position.Y + SignR * RightY + SignU * UpY + SignL * LookY,
@@ -1166,51 +976,21 @@ local Chams: any = (function()
 					)
 					local ScreenPoint, OnScreen = ChamsCamera:WorldToScreenPoint(WorldPoint)
 					if OnScreen then
-						WriteOffset = WriteOffset + 1
-						local Slot = Convex.Scratch.Points[WriteOffset]
+						Count += 1
+						local Slot = Scratch.Points[Count]
 						if Slot then
 							Slot.X = ScreenPoint.X
 							Slot.Y = ScreenPoint.Y
 						else
-							Convex.Scratch.Points[WriteOffset] = { X = ScreenPoint.X, Y = ScreenPoint.Y }
+							Scratch.Points[Count] = { X = ScreenPoint.X, Y = ScreenPoint.Y }
 						end
+					else
+						Complete = false
 					end
-					SignL = -1
 				end
-				SignU = -1
-			end
-			SignR = -1
-		end
-		return WriteOffset
-	end
-
-	local function DrawPolygon(Hull: any, Size: number, Color: Color3, Opacity: number)
-		if Size < 3 then
-			return
-		end
-		local Pivot = vector.create(Hull[1].X, Hull[1].Y, 0)
-		for Index = 2, Size - 1 do
-			DrawingImmediate.FilledTriangle(Pivot, vector.create(Hull[Index].X, Hull[Index].Y, 0), vector.create(Hull[Index + 1].X, Hull[Index + 1].Y, 0), Color, Opacity)
-		end
-	end
-
-	local function DrawOutline(Hull: any, Size: number, Color: Color3, Opacity: number, Thickness: number)
-		if Size < 2 then
-			return
-		end
-		for Index = 1, Size do
-			local Entry = Hull[Index]
-			Convex.Scratch.Poly[Index] = vector.create(Entry.X, Entry.Y, 0)
-		end
-		Convex.Scratch.Poly[Size + 1] = vector.create(Hull[1].X, Hull[1].Y, 0)
-		Convex.Scratch.Poly[Size + 2] = nil
-		if Size + 1 < Convex.Static.HWMPoly then
-			for Index = Size + 2, Convex.Static.HWMPoly do
-				Convex.Scratch.Poly[Index] = nil
 			end
 		end
-		Convex.Static.HWMPoly = math.max(Convex.Static.HWMPoly, Size + 1)
-		DrawingImmediate.Polyline(Convex.Scratch.Poly, Color, Opacity, Thickness)
+		return Count, Complete
 	end
 
 	local function PolygonArea(Poly: any): number
@@ -1224,18 +1004,8 @@ local Chams: any = (function()
 		return Area * 0.5
 	end
 
-	local function ReversePolygon(Poly: any)
-		local Left = 1
-		local Right = #Poly
-		while Left < Right do
-			Poly[Left], Poly[Right] = Poly[Right], Poly[Left]
-			Left += 1
-			Right -= 1
-		end
-	end
-
-	local function ExpandPolygon(Poly: any, Padding: number?)
-		if not Padding or Padding <= 0 then
+	local function ExpandPolygon(Poly: any, Padding: number)
+		if Padding <= 0 then
 			return
 		end
 		local CenterX = 0
@@ -1257,198 +1027,67 @@ local Chams: any = (function()
 		end
 	end
 
-	local function ProjectPartPolygon(Position: any, RightVector: any, UpVector: any, LookVector: any, PartSize: any, Padding: number?): any
-		local PointCount = ProjectPartCorners(Position, RightVector, UpVector, LookVector, PartSize, 0)
-		Convex.Static.HWMPoints = TruncateBuffer(Convex.Scratch.Points, PointCount, Convex.Static.HWMPoints)
-		if PointCount < 3 then
+	-- Hull polygon of one box, or nil when a corner is off screen (a clipped hull would be distorted).
+	local function ProjectPolygon(Position: any, RightVector: any, UpVector: any, LookVector: any, PartSize: any, Padding: number): any
+		local PointCount, Complete = ProjectCorners(Position, RightVector, UpVector, LookVector, PartSize)
+		Static.HWMPoints = TruncateBuffer(Scratch.Points, PointCount, Static.HWMPoints)
+		if not Complete or PointCount < 3 then
 			return nil
 		end
-		local Size = CalculateConvexHull(Convex.Scratch.Points, PointCount, Convex.Scratch.Hull)
-		Convex.Static.HWMHull = TruncateBuffer(Convex.Scratch.Hull, Size, Convex.Static.HWMHull)
+		local Size = CalculateConvexHull(Scratch.Points, PointCount, Scratch.Hull)
+		Static.HWMHull = TruncateBuffer(Scratch.Hull, Size, Static.HWMHull)
 		if Size < 3 then
 			return nil
 		end
 		local Poly: any = {}
 		for Index = 1, Size do
-			local Point = Convex.Scratch.Hull[Index]
+			local Point = Scratch.Hull[Index]
 			Poly[Index] = { X = Point.X, Y = Point.Y }
 		end
-		-- Every polygon is made counter-clockwise.
 		if PolygonArea(Poly) < 0 then
-			ReversePolygon(Poly)
+			local Left = 1
+			local Right = #Poly
+			while Left < Right do
+				Poly[Left], Poly[Right] = Poly[Right], Poly[Left]
+				Left += 1
+				Right -= 1
+			end
 		end
 		ExpandPolygon(Poly, Padding)
 		return Poly
 	end
 
-	local function PointInsideConvex(Point: any, Poly: any): boolean
-		for Index = 1, #Poly do
-			local A = Poly[Index]
-			local B = Poly[Index % #Poly + 1]
-			if CrossDimension(A.X, A.Y, B.X, B.Y, Point.X, Point.Y) < -GROUP_EPSILON then
-				return false
-			end
+	local function DrawPolygon(Poly: any, Color: Color3, Opacity: number)
+		local Size = #Poly
+		local Pivot = vector.create(Poly[1].X, Poly[1].Y, 0)
+		for Index = 2, Size - 1 do
+			DrawingImmediate.FilledTriangle(Pivot, vector.create(Poly[Index].X, Poly[Index].Y, 0), vector.create(Poly[Index + 1].X, Poly[Index + 1].Y, 0), Color, Opacity)
 		end
-		return true
 	end
 
-	local function SegmentIntersectionT(A: any, B: any, C: any, D: any): number?
-		local RX = B.X - A.X
-		local RY = B.Y - A.Y
-		local SX = D.X - C.X
-		local SY = D.Y - C.Y
-		local Denominator = RX * SY - RY * SX
-		if math.abs(Denominator) <= GROUP_EPSILON then
-			return nil
+	local function DrawOutline(Poly: any, Color: Color3, Opacity: number, Thickness: number)
+		local Size = #Poly
+		for Index = 1, Size do
+			Scratch.Poly[Index] = vector.create(Poly[Index].X, Poly[Index].Y, 0)
 		end
-		local QX = C.X - A.X
-		local QY = C.Y - A.Y
-		local T = (QX * SY - QY * SX) / Denominator
-		local U = (QX * RY - QY * RX) / Denominator
-		if T > GROUP_EPSILON and T < 1 - GROUP_EPSILON and U >= -GROUP_EPSILON and U <= 1 + GROUP_EPSILON then
-			return T
+		Scratch.Poly[Size + 1] = vector.create(Poly[1].X, Poly[1].Y, 0)
+		for Index = Size + 2, Static.HWMPoly do
+			Scratch.Poly[Index] = nil
 		end
-		return nil
+		Static.HWMPoly = math.max(Static.HWMPoly, Size + 1)
+		DrawingImmediate.Polyline(Scratch.Poly, Color, Opacity, Thickness)
 	end
 
-	local function LerpPoint(A: any, B: any, T: number): any
-		return { X = A.X + (B.X - A.X) * T, Y = A.Y + (B.Y - A.Y) * T }
-	end
-
-	local function BuildBoundarySegments(Polygons: any): any
-		local Boundary: any = {}
-		for PolygonIndex, Poly in Polygons do
-			for EdgeIndex = 1, #Poly do
-				local A = Poly[EdgeIndex]
-				local B = Poly[EdgeIndex % #Poly + 1]
-				local Splits: any = { 0, 1 }
-				for OtherIndex, Other in Polygons do
-					if OtherIndex ~= PolygonIndex then
-						for OtherEdgeIndex = 1, #Other do
-							local C = Other[OtherEdgeIndex]
-							local D = Other[OtherEdgeIndex % #Other + 1]
-							local T = SegmentIntersectionT(A, B, C, D)
-							if T then
-								Splits[#Splits + 1] = T
-							end
-						end
-					end
-				end
-				table.sort(Splits)
-				local CleanSplits: any = {}
-				for _, T in Splits do
-					if #CleanSplits == 0 or math.abs(T - CleanSplits[#CleanSplits]) > GROUP_EPSILON then
-						CleanSplits[#CleanSplits + 1] = T
-					end
-				end
-				for SplitIndex = 1, #CleanSplits - 1 do
-					local T1 = CleanSplits[SplitIndex]
-					local T2 = CleanSplits[SplitIndex + 1]
-					if T2 - T1 <= GROUP_EPSILON then
-						continue
-					end
-					local Mid = LerpPoint(A, B, (T1 + T2) * 0.5)
-					local Covered = false
-					for OtherIndex, Other in Polygons do
-						if OtherIndex ~= PolygonIndex and PointInsideConvex(Mid, Other) then
-							Covered = true
-							break
-						end
-					end
-					if not Covered then
-						Boundary[#Boundary + 1] = { A = LerpPoint(A, B, T1), B = LerpPoint(A, B, T2) }
-					end
-				end
-			end
-		end
-		return Boundary
-	end
-
-	local function SamePoint(A: any, B: any): boolean
-		local DX = A.X - B.X
-		local DY = A.Y - B.Y
-		return DX * DX + DY * DY <= GROUP_JOIN_EPSILON * GROUP_JOIN_EPSILON
-	end
-
-	local function StitchBoundary(Segments: any): any
-		local Loops: any = {}
-		local Used: any = {}
-		for StartIndex, StartSegment in Segments do
-			if Used[StartIndex] then
-				continue
-			end
-			Used[StartIndex] = true
-			local Loop: any = { StartSegment.A, StartSegment.B }
-			local StartPoint = StartSegment.A
-			local CurrentPoint = StartSegment.B
-			local Guard = 0
-			while not SamePoint(CurrentPoint, StartPoint) and Guard <= #Segments do
-				Guard += 1
-				local Found = false
-				for Index, Segment in Segments do
-					if Used[Index] then
-						continue
-					end
-					if SamePoint(Segment.A, CurrentPoint) then
-						Used[Index] = true
-						Loop[#Loop + 1] = Segment.B
-						CurrentPoint = Segment.B
-						Found = true
-						break
-					elseif SamePoint(Segment.B, CurrentPoint) then
-						Used[Index] = true
-						Loop[#Loop + 1] = Segment.A
-						CurrentPoint = Segment.A
-						Found = true
-						break
-					end
-				end
-				if not Found then
-					break
-				end
-			end
-			if #Loop >= 4 and SamePoint(Loop[#Loop], StartPoint) then
-				Loop[#Loop] = nil
-				if #Loop >= 3 then
-					Loops[#Loops + 1] = Loop
-				end
-			end
-		end
-		return Loops
-	end
-
-	-- Draws the fill of every part polygon and one merged outline around the whole group.
-	local function HighlightGroup(Parts: any, Color: Color3, OpacityFill: number, OpacityOutline: number, Thickness: number, MergePadding: number?)
-		MergePadding = MergePadding or 1.25
-		local Polygons: any = {}
+	-- Draws fill + outline of every pose (the viewer passes one pose per object).
+	local function HighlightGroup(Parts: any, Color: Color3, OpacityFill: number, OpacityOutline: number, Thickness: number, Padding: number)
 		for _, Target in Parts do
-			if not Target.Parent then
-				continue
-			end
-			local Success, Poly = pcall(ProjectPartPolygon, Target.Position, Target.RightVector, Target.UpVector, Target.LookVector, Target.PartSize, MergePadding)
+			local Success, Poly = pcall(ProjectPolygon, Target.Position, Target.RightVector, Target.UpVector, Target.LookVector, Target.PartSize, Padding)
 			if Success and Poly then
-				Polygons[#Polygons + 1] = Poly
-				if OpacityFill and OpacityFill > 0 then
-					DrawPolygon(Poly, #Poly, Color, OpacityFill)
+				if OpacityFill > 0 then
+					DrawPolygon(Poly, Color, OpacityFill)
 				end
+				DrawOutline(Poly, Color, OpacityOutline, Thickness)
 			end
-		end
-		if #Polygons == 0 then
-			return
-		end
-		if #Polygons == 1 then
-			DrawOutline(Polygons[1], #Polygons[1], Color, OpacityOutline, Thickness)
-			return
-		end
-		local Loops = StitchBoundary(BuildBoundarySegments(Polygons))
-		if #Loops == 0 then
-			for _, Poly in Polygons do
-				DrawOutline(Poly, #Poly, Color, OpacityOutline, Thickness)
-			end
-			return
-		end
-		for _, Loop in Loops do
-			DrawOutline(Loop, #Loop, Color, OpacityOutline, Thickness)
 		end
 	end
 
@@ -1461,7 +1100,6 @@ local Chams: any = (function()
 
 	return { HighlightGroup = HighlightGroup, SetCamera = SetCamera }
 end)()
-
 
 -- ===== Helpers =====
 
@@ -1585,36 +1223,54 @@ local function positionOf(model: any): vector?
 	return nil
 end
 
--- Builds ONE oriented box around all parts of a model (axes of its largest part); nil when it has no readable part.
-local function readPose(model: any): any
-	local parts: { any } = {}
+local SIGNS: { number } = table.freeze({ -1, 1 })
 
-	-- Adds one part when it exposes a complete pose.
+-- Builds ONE oriented box around the largest parts of a model (axes of its largest part); nil when it has no readable part.
+-- With radius > 0 only parts within radius studs of `anchor` (and not bigger than RecyclerPartMax) are used.
+-- A box larger than MaxBoxSize is dropped so a broken model can never span the map.
+local function readPose(model: any, anchor: vector?, radius: number): any
+	local parts: { any } = {}
+	local limitSq = radius * radius
+	local filtered = radius > 0 and anchor ~= nil
+
+	-- Adds one part when it exposes a complete pose and passes the filter.
 	local function add(part: any)
 		local size: any = safeGet(part, "Size")
 		if typeof(size) ~= "vector" then
 			return
 		end
+		if filtered and math.max(size.x, size.y, size.z) > CONFIG.RecyclerPartMax then
+			return
+		end
 		local position: any = safeGet(part, "Position")
+		if typeof(position) ~= "vector" then
+			return
+		end
+		if filtered then
+			local delta = position - (anchor :: vector)
+			if vector.dot(delta, delta) > limitSq then
+				return
+			end
+		end
 		local right: any = safeGet(part, "RightVector")
 		local up: any = safeGet(part, "UpVector")
 		local look: any = safeGet(part, "LookVector")
-		if typeof(position) == "vector" and typeof(right) == "vector" and typeof(up) == "vector" and typeof(look) == "vector" then
+		if typeof(right) == "vector" and typeof(up) == "vector" and typeof(look) == "vector" then
 			table.insert(parts, { position = position, right = right, up = up, look = look, size = size, volume = size.x * size.y * size.z })
 		end
 	end
 
 	add(model)
 	if #parts == 0 then
+		local examined = 0
 		for _, item in safeChildren(model) do
+			examined += 1
 			add(item)
 			for _, inner in safeChildren(item) do
-				if #parts >= CONFIG.ChamParts then
-					break
-				end
 				add(inner)
+				examined += 1
 			end
-			if #parts >= CONFIG.ChamParts then
+			if #parts >= CONFIG.ScanParts or examined >= CONFIG.ScanChildren then
 				break
 			end
 		end
@@ -1625,6 +1281,9 @@ local function readPose(model: any): any
 	table.sort(parts, function(a: any, b: any): boolean
 		return a.volume > b.volume
 	end)
+	for index = #parts, CONFIG.ChamParts + 1, -1 do
+		parts[index] = nil
+	end
 
 	local reference = parts[1]
 	local minR: number = math.huge
@@ -1635,9 +1294,9 @@ local function readPose(model: any): any
 	local maxL: number = -math.huge
 	for _, part in parts do
 		local hx, hy, hz = part.size.x * 0.5, part.size.y * 0.5, part.size.z * 0.5
-		for _, signR in { -1, 1 } do
-			for _, signU in { -1, 1 } do
-				for _, signL in { -1, 1 } do
+		for _, signR in SIGNS do
+			for _, signU in SIGNS do
+				for _, signL in SIGNS do
 					local cx = part.position.x + signR * hx * part.right.x + signU * hy * part.up.x + signL * hz * part.look.x
 					local cy = part.position.y + signR * hx * part.right.y + signU * hy * part.up.y + signL * hz * part.look.y
 					local cz = part.position.z + signR * hx * part.right.z + signU * hy * part.up.z + signL * hz * part.look.z
@@ -1656,6 +1315,10 @@ local function readPose(model: any): any
 		end
 	end
 
+	local boxSize = vector.create(maxR - minR, maxU - minU, maxL - minL)
+	if math.max(boxSize.x, boxSize.y, boxSize.z) > CONFIG.MaxBoxSize then
+		return nil
+	end
 	local center = reference.position
 		+ reference.right * ((minR + maxR) * 0.5)
 		+ reference.up * ((minU + maxU) * 0.5)
@@ -1665,7 +1328,7 @@ local function readPose(model: any): any
 		RightVector = reference.right,
 		UpVector = reference.up,
 		LookVector = reference.look,
-		PartSize = vector.create(maxR - minR, maxU - minU, maxL - minL),
+		PartSize = boxSize,
 		Parent = true,
 	}
 end
@@ -1726,6 +1389,22 @@ local function entryText(label: string, distSq: number, showDist: boolean): stri
 	return label
 end
 
+-- Squared range (distance slider + margin) of a distance flag.
+local function limitSqOf(flag: string): number
+	local limit = (Flags[flag] :: number) + 50
+	return limit * limit
+end
+
+-- Camera position, or nil without a camera.
+local function cameraPosition(): vector?
+	local camera: any = Workspace.CurrentCamera
+	if camera == nil then
+		return nil
+	end
+	local position: vector = camera.Position
+	return position
+end
+
 -- ===== Loot tables =====
 
 local LOOT: { [string]: LootTable } = {}
@@ -1744,9 +1423,9 @@ local previewCache: { [string]: string } = {}
 
 -- Returns the info line of a crate type: roll count and pool size (optionally the rarest possible drops).
 local function lootInfo(tableKey: string): string
-	local hit = previewCache[tableKey]
-	if hit ~= nil then
-		return hit
+	local cached = previewCache[tableKey]
+	if cached ~= nil then
+		return cached
 	end
 	local tbl = LOOT[tableKey]
 	local line = ""
@@ -1794,26 +1473,22 @@ local function readGear(character: any): (string, string, string)
 	if folder == nil then
 		return "", "", ""
 	end
-	local seenParts: { [string]: boolean } = {}
 	local seenItems: { [string]: boolean } = {}
 	local armor: { string } = {}
 	local armorPlain: { string } = {}
 	local clothes: { string } = {}
 	for _, part in safeChildren(folder) do
-		local name = tostring(safeGet(part, "Name"))
-		if not seenParts[name] then
-			seenParts[name] = true
-			local itemId = attribute(part, CONFIG.ItemIdAttribute)
-			if itemId ~= nil and not seenItems[itemId] then
-				seenItems[itemId] = true
-				local tier = tierOf(itemId)
-				local text = capitalize(prettify(itemId))
-				if (tier ~= nil and tier >= 2) or string.find(name, "armor", 1, true) ~= nil then
-					table.insert(armorPlain, text)
-					table.insert(armor, if tier ~= nil then text .. " T" .. tostring(tier) else text)
-				else
-					table.insert(clothes, text)
-				end
+		local itemId = attribute(part, CONFIG.ItemIdAttribute)
+		if itemId ~= nil and not seenItems[itemId] then
+			seenItems[itemId] = true
+			local name = tostring(safeGet(part, "Name"))
+			local tier = tierOf(itemId)
+			local text = capitalize(prettify(itemId))
+			if tier ~= nil or string.find(name, "armor", 1, true) ~= nil then
+				table.insert(armorPlain, text)
+				table.insert(armor, if tier ~= nil then text .. " T" .. tostring(tier) else text)
+			else
+				table.insert(clothes, text)
 			end
 		end
 	end
@@ -1895,7 +1570,7 @@ local function makeTarget(kind: string, name: string, model: any, cameraPos: vec
 		end
 	end
 	if kind == "npc" then
-		if (humanoid ~= nil and health >= 0 and health <= 0) or attribute(model, "Dead") == "true" then
+		if (humanoid ~= nil and health == 0) or attribute(model, "Dead") == "true" then
 			return nil
 		end
 	end
@@ -1914,6 +1589,7 @@ local function makeTarget(kind: string, name: string, model: any, cameraPos: vec
 		position = position,
 		distSq = distSq,
 		nextUpdate = 0,
+		healthAt = 0,
 		gearAt = -1000,
 		health = health,
 		maxHealth = maxHealth,
@@ -1934,44 +1610,36 @@ local function makeTarget(kind: string, name: string, model: any, cameraPos: vec
 	return target
 end
 
--- Returns the camera position and the squared range of a range flag, or nil without a camera.
-local function rangeOf(flag: string, margin: number): (vector?, number)
-	local camera: any = Workspace.CurrentCamera
-	if camera == nil then
-		return nil, 0
+-- Returns the entry of a list that already wraps this model.
+local function findTarget(list: { Target }, model: any): Target?
+	for _, target in list do
+		if target.model == model and not target.dead then
+			return target
+		end
 	end
-	local limit: number = (Flags[flag] :: number) + margin
-	return camera.Position, limit * limit
+	return nil
 end
 
 -- Syncs players and bots: keeps existing entries (no flicker), adds new ones, drops vanished ones.
 local function syncLive()
-	local cameraPos, playerSq = rangeOf("playerDist", 50)
-	local _, npcSq = rangeOf("npcDist", 50)
+	local cameraPos = cameraPosition()
 	if cameraPos == nil then
 		return
 	end
+	local playerSq = limitSqOf("dist_players")
+	local npcSq = limitSqOf("dist_bots")
 	local old = Live
 	local list: { Target } = {}
-
-	-- Returns the live entry that already wraps this model.
-	local function existing(model: any): Target?
-		for _, target in old do
-			if target.model == model and not target.dead then
-				return target
-			end
-		end
-		return nil
-	end
 
 	if Flags.playersOn == true then
 		local showSelf = Flags.showSelf == true
 		local localPlayer: any = Players.LocalPlayer
+		local localName: any = if localPlayer ~= nil then safeGet(localPlayer, "Name") else nil
 		for _, player in safeChildren(Players) do
-			if showSelf or player ~= localPlayer then
+			if showSelf or safeGet(player, "Name") ~= localName then
 				local character: any = safeGet(player, "Character")
 				if character ~= nil then
-					local target = existing(character)
+					local target = findTarget(old, character)
 					if target ~= nil then
 						if target.distSq <= playerSq * 1.44 then
 							table.insert(list, target)
@@ -1991,7 +1659,7 @@ local function syncLive()
 		local folder: any = child(Workspace, CONFIG.NpcFolder)
 		if folder ~= nil then
 			for _, npc in safeChildren(folder) do
-				local target = existing(npc)
+				local target = findTarget(old, npc)
 				if target ~= nil then
 					if target.distSq <= npcSq * 1.44 then
 						table.insert(list, target)
@@ -2009,17 +1677,25 @@ local function syncLive()
 	Live = list
 end
 
--- Rebuilds the (static) sleeper list.
+-- Syncs the (static) sleeper list; existing entries are reused, only new sleepers are read.
 local function syncSleepers()
 	local list: { Target } = {}
-	local cameraPos, sleeperSq = rangeOf("sleeperDist", 50)
+	local cameraPos = cameraPosition()
 	local folder: any = child(Workspace, CONFIG.SleeperFolder)
 	if cameraPos ~= nil and folder ~= nil and Flags.sleepersOn == true then
+		local sleeperSq = limitSqOf("dist_sleepers")
 		for _, sleeper in safeChildren(folder) do
-			local name = attribute(sleeper, CONFIG.SleeperNameAttribute) or tostring(safeGet(sleeper, "Name"))
-			local target = makeTarget("sleeper", name, sleeper, cameraPos, sleeperSq, true)
+			local target = findTarget(Sleepers, sleeper)
 			if target ~= nil then
-				table.insert(list, target)
+				if target.distSq <= sleeperSq * 1.44 then
+					table.insert(list, target)
+				end
+			else
+				local name = attribute(sleeper, CONFIG.SleeperNameAttribute) or tostring(safeGet(sleeper, "Name"))
+				target = makeTarget("sleeper", name, sleeper, cameraPos, sleeperSq, true)
+				if target ~= nil then
+					table.insert(list, target)
+				end
 			end
 		end
 	end
@@ -2031,17 +1707,29 @@ local equipCursor = 1
 -- Re-reads the equipment of the next targets in turn, until the time budget of this tick is used up.
 local function stepEquipment(now: number, deadline: number)
 	local count = #Live
-	local interval = (Flags.refreshMs :: number) / 1000
 	for _ = 1, count do
 		if equipCursor > count then
 			equipCursor = 1
 		end
 		local target = Live[equipCursor]
 		equipCursor += 1
-		if not target.dead and now - target.gearAt >= interval then
+		if not target.dead and now - target.gearAt >= CONFIG.EquipInterval then
 			readEquipment(target, now)
 			if os.clock() >= deadline then
 				return
+			end
+		end
+	end
+end
+
+-- Reads the health of players and bots (near ones every tick, far ones throttled).
+local function stepHealth(now: number)
+	for _, target in Live do
+		if not target.dead and target.humanoid ~= nil and now >= target.healthAt then
+			target.healthAt = now + (if target.distSq < NEAR_SQ then 0 else CONFIG.FarInterval)
+			local value: any = safeGet(target.humanoid, "Health")
+			if type(value) == "number" then
+				target.health = value
 			end
 		end
 	end
@@ -2071,7 +1759,7 @@ end
 
 -- Starts a scan of pickups and dropped items near the camera.
 local function startGroundScan(): Scan?
-	local cameraPos, limitSq = rangeOf("itemDist", 50)
+	local cameraPos = cameraPosition()
 	if cameraPos == nil then
 		return nil
 	end
@@ -2091,11 +1779,12 @@ local function startGroundScan(): Scan?
 	if Flags.pickupsOn == true then
 		local folder: any = child(Workspace, CONFIG.PickupFolder)
 		if folder ~= nil then
+			local limitSq = limitSqOf("dist_pickups")
 			table.insert(jobs, {
 				items = safeChildren(folder),
 				process = function(pickup: any)
 					local part: any = childOfClass(pickup, "MeshPart")
-					local position: any = if part ~= nil then safeGet(part, "Position") else nil
+					local position: any = if part ~= nil then safeGet(part, "Position") else positionOf(pickup)
 					if typeof(position) ~= "vector" then
 						return
 					end
@@ -2128,6 +1817,7 @@ local function startGroundScan(): Scan?
 	if Flags.droppedOn == true then
 		local folder: any = child(Workspace, CONFIG.WorldItemFolder)
 		if folder ~= nil then
+			local limitSq = limitSqOf("dist_dropped")
 			table.insert(jobs, {
 				items = safeChildren(folder),
 				process = function(item: any)
@@ -2170,9 +1860,9 @@ local function startGroundScan(): Scan?
 	}
 end
 
--- Returns the position of a recycler model (marker parts first, then any part).
-local function recyclerPosition(model: any): vector?
-	for _, name in { "Marker_Prompt", "Body", "Hopper", "Frame" } do
+-- Anchor position of a recycler: physical parts first, the prompt marker last.
+local function recyclerAnchor(model: any): vector?
+	for _, name in { "Body", "Hopper", "Frame", "Marker_Prompt" } do
 		local part: any = child(model, name)
 		if part ~= nil then
 			local position: any = safeGet(part, "Position")
@@ -2184,7 +1874,7 @@ local function recyclerPosition(model: any): vector?
 	return positionOf(model)
 end
 
--- Walks the monuments (one level of garages) and the workspace top for recycler models.
+-- Walks the monuments (one level of garages) for recycler models; models directly under Workspace are searched once.
 local function scanRecyclers(): { RecyclerInfo }
 	local out: { RecyclerInfo } = {}
 	local taken: { any } = {}
@@ -2204,16 +1894,17 @@ local function scanRecyclers(): { RecyclerInfo }
 		if kind == nil and child(model, "Marker_Prompt") == nil then
 			return
 		end
-		local pose = readPose(model)
-		local position = recyclerPosition(model)
-		if position == nil then
+		local anchor = recyclerAnchor(model)
+		if anchor == nil then
 			return
 		end
+		-- The box only wraps parts close to the anchor, so stray far-away parts can never stretch it across the map.
+		local pose = readPose(model, anchor, CONFIG.RecyclerRadius)
 		local parent: any = safeGet(model, "Parent")
 		local fallback = if parent ~= nil then tostring(safeGet(parent, "Name")) else CONFIG.RecyclerName
 		local place: string = attribute(model, "Monument") or attribute(model, "RecyclerId") or fallback
 		table.insert(out, {
-			position = position,
+			position = if pose ~= nil then pose.Position else anchor,
 			label = place,
 			on = attribute(model, "On") == "true",
 			poses = if pose ~= nil then { pose } else {},
@@ -2237,10 +1928,17 @@ local function scanRecyclers(): { RecyclerInfo }
 			end
 		end
 	end
-	for _, top in safeChildren(Workspace) do
-		if safeGet(top, "Name") == CONFIG.RecyclerName then
-			take(top)
+	if RecyclerTop == nil then
+		local found: { any } = {}
+		for _, top in safeChildren(Workspace) do
+			if safeGet(top, "Name") == CONFIG.RecyclerName then
+				table.insert(found, top)
+			end
 		end
+		RecyclerTop = found
+	end
+	for _, top in RecyclerTop :: { any } do
+		take(top)
 	end
 	return out
 end
@@ -2270,13 +1968,13 @@ local function baseLabel(def: { cat: string, label: string, color: Color3 }, mod
 	return label
 end
 
--- Starts a scan of ore nodes, crates, airdrops and recyclers near the camera.
+-- Starts a scan of ore nodes, crates, airdrops, base objects and recyclers near the camera.
+-- Every type is culled by its own distance slider; the cheap position check runs before the box is read.
 local function startWorldScan(): Scan?
-	local cameraPos, limitSq = rangeOf("worldDist", 50)
+	local cameraPos = cameraPosition()
 	if cameraPos == nil then
 		return nil
 	end
-	local _, baseSq = rangeOf("baseDist", 50)
 	local out: { WorldEntry } = {}
 	local jobs: { ScanJob } = {}
 	local showDist = Flags.showDist == true
@@ -2289,27 +1987,38 @@ local function startWorldScan(): Scan?
 		return dx * dx + dy * dy + dz * dz
 	end
 
-	if Flags.baseOn == true then
+	if Flags.baseOn == true or Flags.backpackOn == true then
 		local folder: any = child(Workspace, CONFIG.DeployableFolder)
 		if folder ~= nil then
 			table.insert(jobs, {
 				items = safeChildren(folder),
 				process = function(object: any)
 					local def = BASE_KINDS[tostring(safeGet(object, "Name"))]
-					if def == nil or Flags["base_" .. def.cat] ~= true then
+					if def == nil then
 						return
 					end
+					-- Backpacks are their own ESP (own toggle and distance); everything else belongs to the base filters.
+					local isPack = def.cat == "backpacks"
+					if isPack then
+						if Flags.backpackOn ~= true then
+							return
+						end
+					elseif Flags.baseOn ~= true or Flags["base_" .. def.cat] ~= true then
+						return
+					end
+					local distFlag = if isPack then "dist_backpacks" else "dist_base_" .. def.cat
 					local near = positionOf(object)
-					if near == nil or distanceSq(near) > baseSq then
+					if near == nil or distanceSq(near) > limitSqOf(distFlag) then
 						return
 					end
-					local pose = readPose(object)
+					local pose = readPose(object, nil, 0)
 					local position: vector = if pose ~= nil then pose.Position else near
 					local distSq = distanceSq(position)
 					local label = baseLabel(def, object)
 					table.insert(out, {
-						group = "base",
-						flag = "base_" .. def.cat,
+						group = if isPack then "backpack" else "base",
+						flag = if isPack then "" else "base_" .. def.cat,
+						distFlag = distFlag,
 						label = label,
 						sub = "",
 						infoKey = "",
@@ -2319,6 +2028,7 @@ local function startWorldScan(): Scan?
 						distSq = distSq,
 						text = entryText(label, distSq, showDist),
 						poses = if pose ~= nil then { pose } else {},
+						model = nil,
 					})
 				end,
 			})
@@ -2340,15 +2050,14 @@ local function startWorldScan(): Scan?
 					if onlyUnmined and def.key ~= "stone" and child(node, "Ore") == nil then
 						return
 					end
-					local pose = readPose(node)
-					local position: vector? = if pose ~= nil then pose.Position else positionOf(node)
-					if position == nil then
+					local distFlag = "dist_ore_" .. def.key
+					local near = positionOf(node)
+					if near == nil or distanceSq(near) > limitSqOf(distFlag) then
 						return
 					end
+					local pose = readPose(node, nil, 0)
+					local position: vector = if pose ~= nil then pose.Position else near
 					local distSq = distanceSq(position)
-					if distSq > limitSq then
-						return
-					end
 					local label = def.label
 					local hp = tonumber(attribute(node, CONFIG.HpAttribute))
 					local maxHp = tonumber(attribute(node, CONFIG.MaxHpAttribute))
@@ -2358,6 +2067,7 @@ local function startWorldScan(): Scan?
 					table.insert(out, {
 						group = "ore",
 						flag = "ore_" .. def.key,
+						distFlag = distFlag,
 						label = label,
 						sub = "",
 						infoKey = "",
@@ -2367,6 +2077,7 @@ local function startWorldScan(): Scan?
 						distSq = distSq,
 						text = entryText(label, distSq, showDist),
 						poses = if pose ~= nil then { pose } else {},
+						model = nil,
 					})
 				end,
 			})
@@ -2375,6 +2086,7 @@ local function startWorldScan(): Scan?
 
 	if Flags.lootOn == true then
 		local hideOpen = Flags.lootHideOpen == true
+		local withInfo = Flags.lootInfo == true
 		for _, folderName in { CONFIG.LootFolder, CONFIG.AirdropFolder } do
 			local folder: any = child(Workspace, folderName)
 			if folder ~= nil then
@@ -2388,20 +2100,20 @@ local function startWorldScan(): Scan?
 						if hideOpen and attribute(crate, CONFIG.OpenAttribute) == "true" then
 							return
 						end
-						local pose = readPose(crate)
-						local position: vector? = if pose ~= nil then pose.Position else positionOf(crate)
-						if position == nil then
+						local distFlag = "dist_loot_" .. def.key
+						local near = positionOf(crate)
+						if near == nil or distanceSq(near) > limitSqOf(distFlag) then
 							return
 						end
+						local pose = readPose(crate, nil, 0)
+						local position: vector = if pose ~= nil then pose.Position else near
 						local distSq = distanceSq(position)
-						if distSq > limitSq then
-							return
-						end
 						table.insert(out, {
 							group = "loot",
 							flag = "loot_" .. def.key,
+							distFlag = distFlag,
 							label = def.label,
-							sub = "",
+							sub = if withInfo then lootInfo(def.tbl) else "",
 							infoKey = def.tbl,
 							height = if pose ~= nil then poseHeight(pose) else 3,
 							color = def.color,
@@ -2409,6 +2121,7 @@ local function startWorldScan(): Scan?
 							distSq = distSq,
 							text = entryText(def.label, distSq, showDist),
 							poses = if pose ~= nil then { pose } else {},
+							model = if def.key == "airdrop" then crate else nil, -- airdrops fall: their pose is re-read
 						})
 					end,
 				})
@@ -2422,13 +2135,15 @@ local function startWorldScan(): Scan?
 		itemIndex = 1,
 		finish = function()
 			if Flags.recyclerOn == true then
+				local recyclerSq = limitSqOf("dist_recycler")
 				for _, recycler in Recyclers do
 					local distSq = distanceSq(recycler.position)
-					if distSq <= limitSq then
+					if distSq <= recyclerSq then
 						local label = "Recycler - " .. recycler.label
 						table.insert(out, {
 							group = "recycler",
 							flag = "",
+							distFlag = "dist_recycler",
 							label = label,
 							sub = if recycler.on then "running" else "",
 							infoKey = "",
@@ -2438,6 +2153,7 @@ local function startWorldScan(): Scan?
 							distSq = distSq,
 							text = entryText(label, distSq, showDist),
 							poses = recycler.poses,
+							model = nil,
 						})
 					end
 				end
@@ -2445,28 +2161,18 @@ local function startWorldScan(): Scan?
 			table.sort(out, function(a: WorldEntry, b: WorldEntry): boolean
 				return a.distSq < b.distSq
 			end)
-			-- Only the nearest crates get the second info line, so the screen stays legible.
-			if Flags.lootInfo == true then
-				local linesLeft = CONFIG.LootInfoLines
-				for _, entry in out do
-					if entry.group == "loot" and linesLeft > 0 then
-						linesLeft -= 1
-						entry.sub = lootInfo(entry.infoKey)
-					end
-				end
-			end
 			SnapWorld = out
 		end,
 	}
 end
 
-
 -- ===== Menu =====
 
 local ui: any = UI.new({
-	Title = "WORLD VIEW",
+	Title = "SEVERE | FUSTSURVIVAL",
 	Key = "RightShift",
 	Flags = Flags,
+	Width = 340,
 	Stat = {
 		Label = "Targets",
 		Value = function(): string
@@ -2481,6 +2187,10 @@ playersTab:toggle({ Name = "Players", Flag = "playersOn", Default = true })
 playersTab:toggle({ Name = "Sleepers", Flag = "sleepersOn", Default = false })
 playersTab:toggle({ Name = "Bots", Flag = "npcsOn", Default = false })
 playersTab:toggle({ Name = "Include myself", Flag = "showSelf", Default = false })
+local playerDistances = playersTab:foldout({ Name = "Distances" })
+playerDistances.Fold:slider({ Name = "Players", Flag = "dist_players", Min = 100, Max = 3000, Step = 100, Default = 3000, Suffix = " st" })
+playerDistances.Fold:slider({ Name = "Sleepers", Flag = "dist_sleepers", Min = 100, Max = 3000, Step = 100, Default = 500, Suffix = " st" })
+playerDistances.Fold:slider({ Name = "Bots", Flag = "dist_bots", Min = 100, Max = 3000, Step = 100, Default = 1000, Suffix = " st" })
 playersTab:section({ Title = "INFO", Divider = true })
 playersTab:dropdown({
 	Name = "Info rows",
@@ -2502,16 +2212,16 @@ playersTab:toggle({ Name = "Hide empty rows", Flag = "hideEmpty", Default = true
 local resourcesTab = ui:tab("Resources")
 resourcesTab:section({ Title = "ORE" })
 resourcesTab:toggle({ Name = "Ore", Flag = "oreOn", Default = false })
-resourcesTab:dropdown({
-	Name = "Ore types",
-	All = "All ore",
-	Items = {
-		{ Name = "Metal", Flag = "ore_metal", Default = true },
-		{ Name = "Sulfur", Flag = "ore_sulfur", Default = true },
-		{ Name = "Stone", Flag = "ore_stone", Default = false },
-	},
-})
+local oreItems: { any } = {}
+for _, row in ORE_MENU do
+	table.insert(oreItems, { Name = row.name, Flag = "ore_" .. row.key, Default = row.on })
+end
+resourcesTab:dropdown({ Name = "Ore types", All = "All ore", Items = oreItems })
 resourcesTab:toggle({ Name = "Only unmined", Flag = "oreUnmined", Default = true })
+local oreDistances = resourcesTab:foldout({ Name = "Ore distances" })
+for _, row in ORE_MENU do
+	oreDistances.Fold:slider({ Name = row.name, Flag = "dist_ore_" .. row.key, Min = 50, Max = 1000, Step = 10, Default = row.dist, Suffix = " st" })
+end
 
 local pickupItems: { any } = {}
 for _, kind in PICKUP_TYPES do
@@ -2523,68 +2233,111 @@ resourcesTab:section({ Title = "PICKUPS", Divider = true })
 resourcesTab:toggle({ Name = "Pickups", Flag = "pickupsOn", Default = false })
 resourcesTab:dropdown({ Name = "Pickup types", All = "All types", Items = pickupItems })
 resourcesTab:toggle({ Name = "Show amount", Flag = "showAmount", Default = true })
+resourcesTab:slider({ Name = "Pickup distance", Flag = "dist_pickups", Min = 50, Max = 2000, Step = 50, Default = 300, Suffix = " st" })
 resourcesTab:section({ Title = "DROPPED", Divider = true })
 resourcesTab:toggle({ Name = "Dropped items", Flag = "droppedOn", Default = false })
+resourcesTab:slider({ Name = "Dropped distance", Flag = "dist_dropped", Min = 50, Max = 2000, Step = 50, Default = 300, Suffix = " st" })
 
 local lootTab = ui:tab("Loot")
 lootTab:section({ Title = "CONTAINERS" })
 lootTab:toggle({ Name = "Loot", Flag = "lootOn", Default = false })
-lootTab:dropdown({
-	Name = "Container types",
-	All = "All containers",
-	Items = {
-		{ Name = "Wooden", Flag = "loot_wooden", Default = true },
-		{ Name = "Military", Flag = "loot_military", Default = true },
-		{ Name = "Elite", Flag = "loot_elite", Default = true },
-		{ Name = "Barrel", Flag = "loot_barrel", Default = true },
-		{ Name = "Locked", Flag = "loot_locked", Default = true },
-		{ Name = "Heli", Flag = "loot_heli", Default = true },
-		{ Name = "Airdrop", Flag = "loot_airdrop", Default = true },
-	},
-})
+local lootItems: { any } = {}
+for _, row in LOOT_MENU do
+	table.insert(lootItems, { Name = row.name, Flag = "loot_" .. row.key, Default = true })
+end
+lootTab:dropdown({ Name = "Container types", All = "All containers", Items = lootItems })
 lootTab:toggle({ Name = "Hide opened", Flag = "lootHideOpen", Default = true })
 lootTab:toggle({ Name = "Info line", Flag = "lootInfo", Default = false })
+local lootDistances = lootTab:foldout({ Name = "Container distances" })
+for _, row in LOOT_MENU do
+	lootDistances.Fold:slider({ Name = row.name, Flag = "dist_loot_" .. row.key, Min = 50, Max = 2000, Step = 50, Default = row.dist, Suffix = " st" })
+end
 lootTab:section({ Title = "MACHINES", Divider = true })
 lootTab:toggle({ Name = "Recyclers", Flag = "recyclerOn", Default = false })
+lootTab:slider({ Name = "Recycler distance", Flag = "dist_recycler", Min = 50, Max = 2000, Step = 50, Default = 500, Suffix = " st" })
 
 local baseTab = ui:tab("Base")
 baseTab:section({ Title = "PLAYER-PLACED" })
 baseTab:toggle({ Name = "Base objects", Flag = "baseOn", Default = false })
-baseTab:dropdown({
-	Name = "Categories",
-	All = "All objects",
-	Items = {
-		{ Name = "Turrets and traps", Flag = "base_turrets", Default = true },
-		{ Name = "Boxes and cupboards", Flag = "base_storage", Default = true },
-		{ Name = "Backpacks", Flag = "base_backpacks", Default = true },
-		{ Name = "Furnaces", Flag = "base_furnaces", Default = false },
-		{ Name = "Workbenches", Flag = "base_benches", Default = false },
-		{ Name = "Power", Flag = "base_power", Default = false },
-		{ Name = "Sleeping bags", Flag = "base_bags", Default = false },
-	},
-})
+local baseItems: { any } = {}
+for _, row in BASE_MENU do
+	table.insert(baseItems, { Name = row.name, Flag = "base_" .. row.cat, Default = row.on })
+end
+baseTab:dropdown({ Name = "Categories", All = "All objects", Items = baseItems })
+local baseDistances = baseTab:foldout({ Name = "Object distances" })
+for _, row in BASE_MENU do
+	baseDistances.Fold:slider({ Name = row.name, Flag = "dist_base_" .. row.cat, Min = 50, Max = 1500, Step = 50, Default = row.dist, Suffix = " st" })
+end
 
-local rangesTab = ui:tab("Ranges")
-rangesTab:section({ Title = "DISTANCE" })
-rangesTab:slider({ Name = "PLAYERS", Flag = "playerDist", Min = 100, Max = 3000, Step = 100, Default = 3000, Suffix = " st" })
-rangesTab:slider({ Name = "SLEEPERS", Flag = "sleeperDist", Min = 100, Max = 3000, Step = 100, Default = 500, Suffix = " st" })
-rangesTab:slider({ Name = "BOTS", Flag = "npcDist", Min = 100, Max = 3000, Step = 100, Default = 1000, Suffix = " st" })
-rangesTab:slider({ Name = "ORE / LOOT / RECYCLERS", Flag = "worldDist", Min = 50, Max = 1000, Step = 10, Default = 300, Suffix = " st" })
-rangesTab:slider({ Name = "BASE OBJECTS", Flag = "baseDist", Min = 50, Max = 1500, Step = 50, Default = 300, Suffix = " st" })
-rangesTab:slider({ Name = "PICKUPS / DROPPED", Flag = "itemDist", Min = 50, Max = 2000, Step = 50, Default = 300, Suffix = " st" })
+baseTab:section({ Title = "BACKPACKS", Divider = true })
+baseTab:toggle({ Name = "Backpacks", Flag = "backpackOn", Default = false })
+baseTab:slider({ Name = "Backpack distance", Flag = "dist_backpacks", Min = 50, Max = 1500, Step = 50, Default = 300, Suffix = " st" })
 
 local settingsTab = ui:tab("Settings")
 settingsTab:section({ Title = "TEXT" })
-settingsTab:slider({ Name = "TEXT SIZE", Flag = "textSize", Min = 10, Max = 20, Step = 1, Default = 13 })
-settingsTab:slider({ Name = "SLEEPER TEXT HEIGHT", Flag = "sleeperLift", Min = 0, Max = 10, Step = 1, Default = 2, Suffix = " st" })
+settingsTab:slider({ Name = "Text size", Flag = "textSize", Min = 10, Max = 20, Step = 1, Default = 13 })
 settingsTab:section({ Title = "WORLD STYLE", Divider = true })
 settingsTab:toggle({ Name = "Chams", Flag = "chamsOn", Default = true })
-settingsTab:section({ Title = "PERFORMANCE", Divider = true })
-settingsTab:slider({ Name = "EQUIPMENT REFRESH", Flag = "refreshMs", Min = 250, Max = 3000, Step = 250, Default = 1000, Suffix = " ms" })
+
+-- ===== Settings save / load =====
+
+local SETTINGS_FILE = "fustsurvival_settings.txt"
+local savedText = ""
+local lastSave = 0
+
+-- All flag values as sorted "name=value" lines.
+local function serializeFlags(): string
+	local keys: { string } = {}
+	for key, value in Flags do
+		if type(value) == "boolean" or type(value) == "number" then
+			table.insert(keys, key)
+		end
+	end
+	table.sort(keys)
+	local lines: { string } = {}
+	for _, key in keys do
+		table.insert(lines, key .. "=" .. tostring(Flags[key]))
+	end
+	return table.concat(lines, "\n")
+end
+
+-- Applies a saved file to the menu flags (unknown names and wrong types are ignored).
+pcall(function()
+	if not isfile(SETTINGS_FILE) then
+		return
+	end
+	for line in string.gmatch(readfile(SETTINGS_FILE), "[^\r\n]+") do
+		local key, value = string.match(line, "^([%w_]+)=(.+)$")
+		if key ~= nil and value ~= nil then
+			local current = Flags[key]
+			if type(current) == "boolean" then
+				Flags[key] = value == "true"
+			elseif type(current) == "number" then
+				local number = tonumber(value)
+				if number ~= nil then
+					Flags[key] = number
+				end
+			end
+		end
+	end
+end)
+savedText = serializeFlags()
+
+-- Writes the settings when they changed (checked once a second, never while the mouse is held).
+local function saveSettings(now: number)
+	if now - lastSave < 1 or ui.Input.down then
+		return
+	end
+	lastSave = now
+	local text = serializeFlags()
+	if text ~= savedText then
+		savedText = text
+		pcall(writefile, SETTINGS_FILE, text)
+	end
+end
 
 -- ===== Events =====
 
-local NEAR_SQ = CONFIG.NearRange * CONFIG.NearRange
 local lastRoster = -1000
 local lastSlow = -1000
 local lastRecyclers = -1000
@@ -2593,7 +2346,7 @@ local lastTextUpdate = 0
 local groundScan: Scan? = nil
 local worldScan: Scan? = nil
 
--- Model step: roster syncs, scans and equipment reads, all sliced to a small time budget per tick.
+-- Model step: roster syncs, scans, equipment and health reads, all sliced to a small time budget per tick.
 local function modelStep(now: number)
 	lastModelStep = now
 	if now - lastRoster >= CONFIG.RosterRate then
@@ -2616,6 +2369,7 @@ local function modelStep(now: number)
 	end
 
 	stepEquipment(now, os.clock() + CONFIG.SliceBudget)
+	stepHealth(now)
 
 	local ground = groundScan
 	if ground ~= nil and stepScan(ground, os.clock() + CONFIG.SliceBudget) then
@@ -2634,7 +2388,7 @@ RunService.PostModel:Connect(function()
 	modelStep(os.clock())
 end)
 
--- Refreshes position, health and distance of one target and rebuilds its header only when something changed.
+-- Refreshes position and distance of one target and rebuilds its header only when something changed.
 local function refreshTarget(target: Target, cameraPos: vector, now: number, bits: number)
 	if not target.static then
 		if now < target.nextUpdate then
@@ -2649,12 +2403,6 @@ local function refreshTarget(target: Target, cameraPos: vector, now: number, bit
 		end
 		target.position = position
 		target.ready = true
-		if target.humanoid ~= nil then
-			local value: any = safeGet(target.humanoid, "Health")
-			if type(value) == "number" then
-				target.health = value
-			end
-		end
 	end
 	local dx = target.position.x - cameraPos.x
 	local dy = target.position.y - cameraPos.y
@@ -2675,10 +2423,11 @@ local function refreshTarget(target: Target, cameraPos: vector, now: number, bit
 	end
 end
 
--- Local step: menu input, camera, positions, health and distances; also drives the model step if PostModel stalls.
+-- Local step: menu input, camera, positions and distances; also drives the model step if PostModel stalls.
 RunService.PostLocal:Connect(function()
 	ui:update()
 	local now = os.clock()
+	saveSettings(now)
 	if now - lastModelStep > CONFIG.FallbackAfter then
 		modelStep(now)
 	end
@@ -2698,10 +2447,21 @@ RunService.PostLocal:Connect(function()
 		refreshTarget(target, cameraPos, now, bits)
 	end
 
-	-- Static world entries: distances every tick, label strings four times a second.
+	-- Static world entries: distances every tick, label strings and ordering four times a second.
 	local updateText = now - lastTextUpdate >= 0.25
 	if updateText then
 		lastTextUpdate = now
+		-- Falling airdrops: re-read their pose
+		for _, entry in SnapWorld do
+			if entry.model ~= nil then
+				local pose = readPose(entry.model, nil, 0)
+				if pose ~= nil then
+					entry.poses = { pose }
+					entry.position = pose.Position
+					entry.height = poseHeight(pose)
+				end
+			end
+		end
 	end
 	local showDist = Flags.showDist == true
 	for _, entry in SnapGround do
@@ -2721,6 +2481,12 @@ RunService.PostLocal:Connect(function()
 		if updateText then
 			entry.text = entryText(entry.label, entry.distSq, showDist)
 		end
+	end
+	-- Nearest first, so the label / chams limits always go to the objects closest to the camera right now.
+	if updateText then
+		table.sort(SnapWorld, function(a: WorldEntry, b: WorldEntry): boolean
+			return a.distSq < b.distSq
+		end)
 	end
 end)
 
@@ -2747,7 +2513,7 @@ end
 -- Draws one target: header (name / distance with health in front) and the equipment rows.
 local function drawTarget(target: Target, camera: any)
 	local position = target.position
-	local offset = if target.kind == "sleeper" then ViewState.sleeperLift else CONFIG.AnchorOffset
+	local offset = if target.kind == "sleeper" then CONFIG.SleeperOffset else CONFIG.AnchorOffset
 	local screen, visible = camera:WorldToScreenPoint(vector.create(position.x, position.y + offset, position.z))
 	if not visible then
 		return
@@ -2797,6 +2563,10 @@ local function worldVisible(entry: WorldEntry): boolean
 		if Flags.baseOn ~= true then
 			return false
 		end
+	elseif group == "backpack" then
+		if Flags.backpackOn ~= true then
+			return false
+		end
 	elseif Flags.recyclerOn ~= true then
 		return false
 	end
@@ -2819,11 +2589,10 @@ RunService.Render:Connect(function()
 	ViewState.clothes = Flags.showClothes == true
 	ViewState.pack = Flags.showPack == true
 	ViewState.holster = Flags.showHolster == true
-	ViewState.sleeperLift = Flags.sleeperLift :: number
 
-	local playerDist = Flags.playerDist :: number
-	local npcDist = Flags.npcDist :: number
-	local sleeperDist = Flags.sleeperDist :: number
+	local playerDist = Flags.dist_players :: number
+	local npcDist = Flags.dist_bots :: number
+	local sleeperDist = Flags.dist_sleepers :: number
 	local playerSq = playerDist * playerDist
 	local npcSq = npcDist * npcDist
 	local sleeperSq = sleeperDist * sleeperDist
@@ -2850,15 +2619,13 @@ RunService.Render:Connect(function()
 		end
 	end
 
-	local worldDist = Flags.worldDist :: number
-	local worldSq = worldDist * worldDist
-	local baseDist = Flags.baseDist :: number
-	local baseSq = baseDist * baseDist
 	local labelSq = CONFIG.LabelRange * CONFIG.LabelRange
 	local labelsLeft = CONFIG.LabelMax
+	local infoLeft = CONFIG.LootInfoLines
 	local chamsLeft = if Flags.chamsOn == true then CONFIG.ChamsLimit else 0
 	for _, entry in SnapWorld do
-		if entry.distSq <= (if entry.group == "base" then baseSq else worldSq) and worldVisible(entry) then
+		local range = Flags[entry.distFlag] :: number
+		if entry.distSq <= range * range and worldVisible(entry) then
 			local position = entry.position
 			local center, centerVisible = camera:WorldToScreenPoint(position)
 			if centerVisible then
@@ -2871,7 +2638,10 @@ RunService.Render:Connect(function()
 					labelsLeft -= 1
 					local top = camera:WorldToScreenPoint(vector.create(position.x, position.y + entry.height, position.z))
 					drawText(top.x, top.y - size - 3, size, entry.color, entry.text)
-					if entry.sub ~= "" then
+					if entry.sub ~= "" and (entry.group ~= "loot" or infoLeft > 0) then
+						if entry.group == "loot" then
+							infoLeft -= 1
+						end
 						drawText(center.x, center.y + (center.y - top.y) + 2, size - 1, entry.color, entry.sub)
 					end
 				end
@@ -2879,19 +2649,19 @@ RunService.Render:Connect(function()
 		end
 	end
 
-	local itemDist = Flags.itemDist :: number
+	local itemDist = Flags.dist_pickups :: number
 	local itemSq = itemDist * itemDist
+	local droppedDist = Flags.dist_dropped :: number
+	local droppedSq = droppedDist * droppedDist
 	local pickupsOn = Flags.pickupsOn == true
 	local droppedOn = Flags.droppedOn == true
 	for _, entry in SnapGround do
-		if entry.distSq <= itemSq then
-			local visibleGroup = if entry.group == "pickups" then pickupsOn and Flags[entry.flag] == true else droppedOn
-			if visibleGroup then
-				local position = entry.position
-				local screen, visible = camera:WorldToScreenPoint(vector.create(position.x, position.y + CONFIG.GroundLift, position.z))
-				if visible then
-					drawText(screen.x, screen.y, size, entry.color, entry.text)
-				end
+		local visibleGroup = if entry.group == "pickups" then pickupsOn and entry.distSq <= itemSq and Flags[entry.flag] == true else droppedOn and entry.distSq <= droppedSq
+		if visibleGroup then
+			local position = entry.position
+			local screen, visible = camera:WorldToScreenPoint(vector.create(position.x, position.y + CONFIG.GroundLift, position.z))
+			if visible then
+				drawText(screen.x, screen.y, size, entry.color, entry.text)
 			end
 		end
 	end
