@@ -1,0 +1,2898 @@
+--!strict
+--!optimize 2
+
+-- World viewer: players (health, held item, armor with tier, clothes, backpack, holstered guns), sleepers, bots,
+-- ore nodes, loot crates / airdrops, recyclers and player-placed objects (one chams box per object),
+-- dropped items and ground pickups.
+-- PostModel reads the world in small time slices, PostLocal refreshes positions / health / distances and the menu,
+-- Render only draws.
+
+-- Immediate-mode menu library (embedded).
+local UI: any = (function()
+local UI: any = {}
+UI.__index = UI
+
+local DEBUG = false -- test hook: records the rectangle of every control in ui.Hits
+
+local vec = vector.create
+local floor = math.floor
+
+local THEME = table.freeze({
+	Bg = Color3.fromRGB(15, 15, 17),
+	Divider = Color3.fromRGB(26, 26, 30),
+	TextMain = Color3.fromRGB(255, 255, 255),
+	TextRow = Color3.fromRGB(166, 166, 172),
+	TextOff = Color3.fromRGB(94, 94, 101),
+	TextDim = Color3.fromRGB(72, 72, 78),
+	Chip = Color3.fromRGB(23, 23, 26),
+	Track = Color3.fromRGB(26, 26, 30),
+	PillBg = Color3.fromRGB(28, 28, 32),
+	PillLine = Color3.fromRGB(60, 60, 66),
+	PillBgOff = Color3.fromRGB(20, 20, 23),
+	PillLineOff = Color3.fromRGB(38, 38, 43),
+	Knob = Color3.fromRGB(245, 245, 247),
+	KnobOff = Color3.fromRGB(96, 96, 104),
+	White = Color3.new(1, 1, 1),
+})
+UI.Theme = THEME
+local T = THEME
+
+local HEADER_H = 38 -- title bar (drag handle)
+local TAB_H = 26
+local ROW_H = 28 -- normal row
+local DROP_ROW_H = 24 -- row inside a list
+local DROP_GAP = 1
+local SLIDER_ROW_H = 56
+local CHIP_H = 22
+local CHIP_GAP = 4
+local DROP_TOP_GAP = 6 -- space between a list header and its content
+local KEY_POLL = 0.03 -- seconds between key reads
+
+local EMPTY_KEYS: { any } = {}
+table.freeze(EMPTY_KEYS)
+
+-- Key names accepted by Key options (virtual-key codes); letters, digits and F1-F12 are added below
+local KEY_CODES: { [string]: number } = {
+	RightShift = 0xA1,
+	LeftShift = 0xA0,
+	RightControl = 0xA3,
+	LeftControl = 0xA2,
+	RightAlt = 0xA5,
+	LeftAlt = 0xA4,
+	Return = 0x0D,
+	Enter = 0x0D,
+	Space = 0x20,
+	Tab = 0x09,
+	Escape = 0x1B,
+	Insert = 0x2D,
+	Delete = 0x2E,
+	Home = 0x24,
+	End = 0x23,
+	PageUp = 0x21,
+	PageDown = 0x22,
+}
+for i = 0, 25 do
+	KEY_CODES[string.char(65 + i)] = 65 + i
+end
+for i = 0, 9 do
+	KEY_CODES[tostring(i)] = 48 + i
+end
+for i = 1, 12 do
+	KEY_CODES["F" .. i] = 0x6F + i
+end
+table.freeze(KEY_CODES)
+UI.Keys = KEY_CODES
+
+local current: any = nil -- window being rendered (used by the test hook)
+
+-- ───────────────────────── Helpers ─────────────────────────
+
+-- True if a key spec (name, virtual-key code or a list of them) is in the pressed keys.
+local function keyDown(keys: { any }, spec: any): boolean
+	if type(spec) == "table" then
+		for _, one in spec do
+			if table.find(keys, one) ~= nil then
+				return true
+			end
+			local code = if type(one) == "string" then KEY_CODES[one] else nil
+			if code ~= nil and table.find(keys, code) ~= nil then
+				return true
+			end
+		end
+		return false
+	end
+	if table.find(keys, spec) ~= nil then
+		return true
+	end
+	local code = if type(spec) == "string" then KEY_CODES[spec] else nil
+	return code ~= nil and table.find(keys, code) ~= nil
+end
+
+-- Text shown for a key spec.
+local function keyLabel(spec: any): string
+	if type(spec) == "table" then
+		for _, one in spec do
+			if type(one) == "string" then
+				return one
+			end
+		end
+		return "?"
+	end
+	if type(spec) == "number" then
+		return string.format("0x%02X", spec)
+	end
+	if spec == "RightShift" then
+		return "RShift"
+	elseif spec == "LeftShift" then
+		return "LShift"
+	end
+	return tostring(spec)
+end
+
+local function inRect(px: number, py: number, x: number, y: number, w: number, h: number): boolean
+	return px >= x and px <= x + w and py >= y and py <= y + h
+end
+
+local function shortLabel(s: string, maxLen: number): string
+	if #s > maxLen then
+		return string.sub(s, 1, maxLen - 1) .. "."
+	end
+	return s
+end
+
+local function hit(label: string, x: number, y: number, w: number, h: number): ()
+	if DEBUG and current ~= nil then
+		current.Hits[label] = { x = x, y = y, w = w, h = h }
+	end
+end
+
+-- Queues a callback; it runs in the next ui:update() (PostLocal), not in Render.
+local function push(ui: any, fn: any, a: any, b: any): ()
+	local n = ui.QN + 1
+	ui.QN = n
+	ui.QFn[n] = fn
+	ui.QA[n] = a
+	ui.QB[n] = b
+end
+
+-- ───────────────────────── Drawing primitives ─────────────────────────
+
+-- Immediate mode has no rounding: corners are built from rectangles (small radii) or circles (large ones).
+local function RoundRect(x: number, y: number, w: number, h: number, r: number, color: Color3): ()
+	if r <= 3 then
+		DrawingImmediate.FilledRectangle(vec(x + 1, y, 0), vec(w - 2, h, 0), color, 1)
+		DrawingImmediate.FilledRectangle(vec(x, y + 1, 0), vec(w, h - 2, 0), color, 1)
+		return
+	end
+	if r <= 6 then
+		local i1 = floor(r * 0.6 + 0.5)
+		local i2 = math.max(1, floor(r * 0.25 + 0.5))
+		local t = floor(r * 0.6)
+		DrawingImmediate.FilledRectangle(vec(x + i1, y, 0), vec(w - 2 * i1, h, 0), color, 1)
+		DrawingImmediate.FilledRectangle(vec(x + i2, y + 1, 0), vec(w - 2 * i2, h - 2, 0), color, 1)
+		DrawingImmediate.FilledRectangle(vec(x, y + t, 0), vec(w, h - 2 * t, 0), color, 1)
+		return
+	end
+	DrawingImmediate.FilledRectangle(vec(x + r, y, 0), vec(w - 2 * r, h, 0), color, 1)
+	DrawingImmediate.FilledRectangle(vec(x, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
+	DrawingImmediate.FilledRectangle(vec(x + w - r, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
+	DrawingImmediate.FilledCircle(vec(x + r, y + r, 0), r, color, 1)
+	DrawingImmediate.FilledCircle(vec(x + w - r, y + r, 0), r, color, 1)
+	DrawingImmediate.FilledCircle(vec(x + r, y + h - r, 0), r, color, 1)
+	DrawingImmediate.FilledCircle(vec(x + w - r, y + h - r, 0), r, color, 1)
+end
+
+-- Toggle pill with a 1px outline and a square knob (right = on, left = off).
+local function DrawPill(x: number, y: number, w: number, h: number, on: boolean): ()
+	RoundRect(x, y, w, h, 5, if on then T.PillLine else T.PillLineOff)
+	RoundRect(x + 1, y + 1, w - 2, h - 2, 4, if on then T.PillBg else T.PillBgOff)
+	local knob = 10
+	local kx = if on then (x + w - knob - 4) else (x + 4)
+	RoundRect(kx, y + (h - knob) / 2, knob, knob, 3, if on then T.Knob else T.KnobOff)
+end
+
+-- One toggle row (optional color swatch). Returns true if the row was clicked.
+local function DrawToggleRow(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	enabled: boolean,
+	clicked: boolean,
+	mp: vector,
+	swatch: Color3?
+): boolean
+	local labelX = x + 10
+	if swatch then
+		DrawingImmediate.FilledRectangle(vec(x + 10, y + h / 2 - 3, 0), vec(6, 6, 0), swatch, 1)
+		labelX = x + 22
+	end
+	DrawingImmediate.Text(vec(labelX, y + h / 2 - 6, 0), 13, if enabled then T.TextRow else T.TextOff, 1, label, false)
+	DrawPill(x + w - 32 - 10, y + (h - 18) / 2, 32, 18, enabled)
+	hit(label, x, y, w, h)
+	return clicked and inRect(mp.x, mp.y, x, y, w, h)
+end
+
+-- A row with a small button on the right. Returns true if the button was clicked.
+local function DrawActionRow(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	btnText: string,
+	clicked: boolean,
+	mp: vector
+): boolean
+	DrawingImmediate.Text(vec(x + 10, y + h / 2 - 6, 0), 13, T.TextRow, 1, label, false)
+	local bw = 64
+	local bh = 18
+	local bx = x + w - bw - 10
+	local by = y + (h - bh) / 2
+	local hover = inRect(mp.x, mp.y, bx, by, bw, bh)
+	RoundRect(bx, by, bw, bh, 5, T.PillLine)
+	RoundRect(bx + 1, by + 1, bw - 2, bh - 2, 4, if hover then T.PillLine else T.PillBg)
+	DrawingImmediate.Text(vec(bx + bw / 2, by + 3, 0), 12, T.TextMain, 1, btnText, true)
+	hit(label, bx, by, bw, bh)
+	return clicked and hover
+end
+
+-- A compact chip; `on` = nil hides the on/off indicator. Returns true if it was clicked.
+local function DrawChip(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	on: boolean?,
+	clicked: boolean,
+	mp: vector
+): boolean
+	local hover = inRect(mp.x, mp.y, x, y, w, h)
+	RoundRect(x, y, w, h, 5, if hover then T.PillLine else T.Chip)
+	local labelX = x + 10
+	if on ~= nil then
+		DrawingImmediate.FilledRectangle(vec(x + 8, y + h / 2 - 3, 0), vec(6, 6, 0), if on then T.Knob else T.PillLineOff, 1)
+		labelX = x + 20
+	end
+	DrawingImmediate.Text(vec(labelX, y + h / 2 - 6, 0), 11, if on == false then T.TextOff else T.TextRow, 1, label, false)
+	hit(label, x, y, w, h)
+	return clicked and hover
+end
+
+-- Collapsible list header (label, counter, arrow). Returns true if clicked.
+local function DrawDropdownHeader(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	countText: string,
+	open: boolean,
+	clicked: boolean,
+	mp: vector
+): boolean
+	local hover = inRect(mp.x, mp.y, x, y, w, h)
+	if hover or open then
+		RoundRect(x, y, w, h, 6, T.Chip)
+	end
+	DrawingImmediate.Text(vec(x + 10, y + h / 2 - 6, 0), 13, T.TextMain, 1, label, false)
+	DrawingImmediate.Text(vec(x + w - 46, y + h / 2 - 6, 0), 12, T.TextDim, 1, countText, true)
+	local cx = x + w - 16
+	local cy = y + h / 2
+	if open then
+		DrawingImmediate.FilledTriangle(vec(cx - 5, cy - 3, 0), vec(cx + 5, cy - 3, 0), vec(cx, cy + 3, 0), T.Knob, 1)
+	else
+		DrawingImmediate.FilledTriangle(vec(cx - 3, cy - 5, 0), vec(cx - 3, cy + 5, 0), vec(cx + 3, cy, 0), T.Knob, 1)
+	end
+	hit(label, x, y, w, h)
+	return clicked and hover
+end
+
+-- Slider row; returns the new value and keeps dragging while the button is held.
+local function DrawSliderRow(ui: any, el: any, x: number, y: number, w: number, value: number, clicked: boolean, ldown: boolean, mp: vector): number
+	local minV: number = el.Min
+	local maxV: number = el.Max
+	local step: number = el.Step
+	DrawingImmediate.Text(vec(x + 10, y + 9, 0), 11, T.TextDim, 1, el.Name, false)
+	RoundRect(x + w - 55, y + 9, 45, 14, 4, T.Chip)
+	DrawingImmediate.Text(vec(x + w - 32.5, y + 10, 0), 11, T.TextMain, 1, tostring(floor(value)) .. el.Suffix, true)
+
+	local tX = x + 10
+	local tW = w - 20
+	local tC = y + 43 -- vertical center of the track
+
+	if clicked and inRect(mp.x, mp.y, tX - 6, tC - 10, tW + 12, 20) then
+		ui.SliderActive = el
+	end
+	if not ldown then
+		ui.SliderActive = nil
+	end
+	if ui.SliderActive == el then
+		local rel = math.clamp((mp.x - tX) / tW, 0, 1)
+		value = floor((minV + rel * (maxV - minV)) / step + 0.5) * step
+		value = math.clamp(value, minV, maxV)
+	end
+
+	RoundRect(tX, tC - 2, tW, 4, 2, T.Track)
+	local frac = math.clamp((value - minV) / (maxV - minV), 0, 1)
+	RoundRect(tX + floor(tW * frac) - 5, tC - 5, 10, 10, 3, T.Knob)
+	hit(el.Name, tX, tC - 10, tW, 20)
+	return value
+end
+
+local function DrawLabel(x: number, y: number, text: string): ()
+	DrawingImmediate.Text(vec(x + 18, y, 0), 11, T.TextDim, 1, text, false)
+end
+
+-- ───────────────────────── Controls ─────────────────────────
+
+local function getValue(ui: any, el: any): any
+	if el.Get ~= nil then
+		return el.Get()
+	end
+	local store = el.Store or ui.Flags
+	return store[el.Flag]
+end
+
+-- Stores a new value and queues OnChange.
+local function setValue(ui: any, el: any, value: any): ()
+	if el.Set ~= nil then
+		el.Set(value)
+	else
+		local store = el.Store or ui.Flags
+		store[el.Flag] = value
+	end
+	if el.OnChange ~= nil then
+		push(ui, el.OnChange, value, el.Flag)
+	end
+end
+
+local function drawToggle(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	local on = getValue(ui, el) == true
+	if DrawToggleRow(ux + 8, yo, uw - 16, ROW_H, el.Label, on, clicked, mp, el.Swatch) then
+		setValue(ui, el, not on)
+	end
+	return yo + ROW_H + el.Gap
+end
+
+local function drawAction(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	if DrawActionRow(ux + 8, yo, uw - 16, ROW_H, el.Label, el.Button, clicked, mp) and el.Callback ~= nil then
+		push(ui, el.Callback, nil, nil)
+	end
+	return yo + ROW_H + el.Gap
+end
+
+local function drawSlider(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	local value: number = getValue(ui, el)
+	local nextValue = DrawSliderRow(ui, el, ux + 8, yo, uw - 16, value, clicked, ui.Input.down, mp)
+	if nextValue ~= value then
+		setValue(ui, el, nextValue)
+	end
+	return yo + SLIDER_ROW_H + 9 + el.Gap
+end
+
+local function drawSection(ui: any, el: any, ux: number, yo: number, uw: number): number
+	if el.Divider then
+		DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
+		DrawLabel(ux, yo + 12, el.Title)
+		return yo + 30
+	end
+	DrawLabel(ux, yo + 2, el.Title)
+	return yo + 20
+end
+
+local function drawNote(ui: any, el: any, ux: number, yo: number): number
+	yo += el.Before
+	for i, line in el.Lines do
+		DrawLabel(ux, yo + (i - 1) * 14, line)
+	end
+	return yo + #el.Lines * 14 + 6
+end
+
+-- Open state of a list: one open list per accordion id, or one flag per list.
+local function isOpen(ui: any, el: any): boolean
+	if el.Accordion ~= nil then
+		return ui.Accordion[el.Accordion] == el
+	end
+	return ui.Open[el] == true
+end
+
+local function toggleOpen(ui: any, el: any): ()
+	local open = isOpen(ui, el)
+	if el.Accordion ~= nil then
+		ui.Accordion[el.Accordion] = if open then nil else el
+	else
+		ui.Open[el] = not open
+	end
+end
+
+local function drawDropdown(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	local items: { any } = el.Items
+	local store = el.Store or ui.Flags
+	local chips = el.Layout == "chips"
+	local size = #items
+
+	-- Counter: on / total for flag items, the item count for plain action chips
+	local flagged = false
+	local onCount = 0
+	for _, item in items do
+		if item.Flag ~= nil then
+			flagged = true
+			if store[item.Flag] == true then
+				onCount += 1
+			end
+		end
+	end
+	local countText = if flagged then `{onCount}/{size}` else tostring(size)
+
+	local open = isOpen(ui, el)
+	if DrawDropdownHeader(ux + 8, yo, uw - 16, ROW_H, el.Name, countText, open, clicked, mp) then
+		toggleOpen(ui, el)
+	end
+	yo += ROW_H
+	if not open then
+		return yo + el.Gap
+	end
+	yo += DROP_TOP_GAP
+
+	-- "All" row switches every flag item at once
+	if el.All ~= nil and flagged then
+		local allOn = onCount == size
+		if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, el.All, allOn, clicked, mp, T.White) then
+			for _, item in items do
+				store[item.Flag] = not allOn
+			end
+			if el.OnChange ~= nil then
+				push(ui, el.OnChange, nil, not allOn)
+			end
+		end
+		yo += DROP_ROW_H + DROP_GAP + (if chips then 2 else 0)
+	end
+
+	if chips then
+		local cw = (uw - 32 - CHIP_GAP) / 2
+		for i, item in items do
+			local col = (i - 1) % 2
+			local row = floor((i - 1) / 2)
+			local cx = ux + 16 + col * (cw + CHIP_GAP)
+			local cy = yo + row * (CHIP_H + CHIP_GAP)
+			local label = shortLabel(item.Name, el.MaxLabel)
+			if item.Flag ~= nil then
+				local on = store[item.Flag] == true
+				if DrawChip(cx, cy, cw, CHIP_H, label, on, clicked, mp) then
+					store[item.Flag] = not on
+					if el.OnChange ~= nil then
+						push(ui, el.OnChange, item.Flag, not on)
+					end
+				end
+			elseif DrawChip(cx, cy, cw, CHIP_H, label, nil, clicked, mp) and item.Callback ~= nil then
+				push(ui, item.Callback, item, nil)
+			end
+		end
+		yo += floor((size + 1) / 2) * (CHIP_H + CHIP_GAP) + 4
+	else
+		for _, item in items do
+			local on = store[item.Flag] == true
+			if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, item.Name, on, clicked, mp, item.Swatch) then
+				store[item.Flag] = not on
+				if el.OnChange ~= nil then
+					push(ui, el.OnChange, item.Flag, not on)
+				end
+			end
+			yo += DROP_ROW_H + DROP_GAP
+		end
+		yo += 4
+	end
+	return yo + el.Gap
+end
+
+-- Draws one control and returns the y of the next one.
+local function drawElement(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	if el.Show ~= nil and not el.Show() then
+		return yo
+	end
+	local kind = el.Kind
+	if kind == "toggle" then
+		return drawToggle(ui, el, ux, yo, uw, clicked, mp)
+	elseif kind == "action" then
+		return drawAction(ui, el, ux, yo, uw, clicked, mp)
+	elseif kind == "slider" then
+		return drawSlider(ui, el, ux, yo, uw, clicked, mp)
+	elseif kind == "dropdown" then
+		return drawDropdown(ui, el, ux, yo, uw, clicked, mp)
+	elseif kind == "section" then
+		return drawSection(ui, el, ux, yo, uw)
+	end
+	return drawNote(ui, el, ux, yo)
+end
+
+-- ───────────────────────── Tabs ─────────────────────────
+
+local Tab: any = {}
+Tab.__index = Tab
+
+-- Registers a control: defaults, hotkey, label.
+function Tab:_add(kind: string, o: any): any
+	local ui = self.Ui
+	o.Kind = kind
+	o.Gap = o.Gap or 0
+	local name: string? = o.Name
+	if name ~= nil then
+		o.Label = if o.Key ~= nil then `{name} [{o.KeyLabel or keyLabel(o.Key)}]` else name
+	end
+	local store = o.Store or ui.Flags
+	if o.Flag ~= nil and store[o.Flag] == nil then
+		if kind == "slider" then
+			store[o.Flag] = o.Default or o.Min
+		else
+			store[o.Flag] = o.Default == true
+		end
+	end
+	if o.Items ~= nil then
+		for _, item in o.Items do
+			if item.Flag ~= nil and store[item.Flag] == nil then
+				store[item.Flag] = item.Default == true
+			end
+		end
+	end
+	if o.Key ~= nil then
+		o.KeyWasDown = false
+		table.insert(ui.Hotkeys, o)
+	end
+	table.insert(self.Elements, o)
+	return o
+end
+
+-- Toggle: Name, Flag (or Get / Set), Default, Key, KeyLabel, Swatch, Gap, Store, OnChange(value, flag).
+function Tab:toggle(o: any): any
+	return self:_add("toggle", o)
+end
+
+-- Button row: Name, Button (text), Callback(), Key, KeyLabel, Gap.
+function Tab:action(o: any): any
+	o.Button = o.Button or "Run"
+	return self:_add("action", o)
+end
+
+-- Slider: Name, Flag, Min, Max, Default, Step (10), Suffix, Gap, OnChange(value, flag).
+function Tab:slider(o: any): any
+	o.Step = o.Step or 10
+	o.Suffix = o.Suffix or ""
+	return self:_add("slider", o)
+end
+
+-- Small heading: Title, Divider (line above it).
+function Tab:section(o: any): any
+	return self:_add("section", o)
+end
+
+-- Dim text lines: Lines, Before (space above, 0).
+function Tab:note(o: any): any
+	o.Before = o.Before or 0
+	return self:_add("note", o)
+end
+
+-- Collapsible list: Name, Items, All (text of the all-row), Layout ("rows" or "chips"), Accordion (id: only one list
+-- of that id stays open), Store, Gap, MaxLabel, OnChange(flag, value) (flag = nil for the all-row).
+-- Items: { Name, Flag, Swatch, Default } for switches, { Name, Callback } for plain chips.
+function Tab:dropdown(o: any): any
+	o.MaxLabel = o.MaxLabel or 19
+	return self:_add("dropdown", o)
+end
+
+-- ───────────────────────── Window ─────────────────────────
+
+-- Options: Title, Key (menu key, "RightShift"), KeyLabel, Flags (table that holds the values), X, Y, Width (290),
+-- Stat = { Label, Value = function() -> string } (left footer text).
+function UI.new(opts: any): any
+	local self = setmetatable({
+		Title = opts.Title or "MENU",
+		Flags = opts.Flags or {},
+		Tabs = {},
+		TabIndex = 1,
+		X = opts.X or 200,
+		Y = opts.Y or 100,
+		Width = opts.Width or 290,
+		PanelH = 320, -- measured by the last drawn frame
+		Visible = true,
+		MenuKey = opts.Key or "RightShift",
+		MenuKeyLabel = opts.KeyLabel or keyLabel(opts.Key or "RightShift"),
+		Stat = opts.Stat,
+		Alive = true,
+		Dragging = false,
+		DragDX = 0,
+		DragDY = 0,
+		SliderActive = nil,
+		Open = {},
+		Accordion = {},
+		Hotkeys = {},
+		MenuKeyWasDown = false,
+		Input = { mx = 0, my = 0, down = false, clicked = false },
+		ViewW = 0,
+		ViewH = 0,
+		ViewAt = -math.huge,
+		KeysAt = -math.huge,
+		QN = 0,
+		QFn = {},
+		QA = {},
+		QB = {},
+		Hits = {},
+	}, UI)
+	UI.Last = self
+	return self
+end
+
+-- Adds a tab.
+function UI:tab(name: string): any
+	local tab = setmetatable({ Name = name, Ui = self, Elements = {} }, Tab)
+	table.insert(self.Tabs, tab)
+	return tab
+end
+
+function UI:get(flag: string): any
+	return self.Flags[flag]
+end
+
+function UI:set(flag: string, value: any): ()
+	self.Flags[flag] = value
+end
+
+function UI:setVisible(visible: boolean): ()
+	self.Visible = visible
+end
+
+function UI:isVisible(): boolean
+	return self.Visible
+end
+
+-- Stops drawing and input (call it from the script's cleanup).
+function UI:destroy(): ()
+	self.Alive = false
+end
+
+-- Hotkey pressed: flips a toggle or runs an action.
+local function fireHotkey(ui: any, el: any): ()
+	if el.Kind == "toggle" then
+		setValue(ui, el, getValue(ui, el) ~= true)
+	elseif el.Callback ~= nil then
+		push(ui, el.Callback, nil, nil)
+	end
+end
+
+-- PostLocal: samples the mouse, reads keys (menu key + hotkeys), refreshes the viewport, runs queued callbacks.
+function UI:update(): ()
+	if not self.Alive then
+		return
+	end
+	local now = os.clock()
+	local active = isrbxactive()
+
+	local input = self.Input
+	local mouse = getmouseposition()
+	local down: boolean = active and isleftpressed()
+	if down and not input.down then
+		input.clicked = true
+	end
+	input.down = down
+	input.mx = mouse.x
+	input.my = mouse.y
+
+	if now - self.ViewAt >= 1 then
+		self.ViewAt = now
+		local cam = workspace.CurrentCamera
+		if cam ~= nil then
+			local vp = cam.ViewportSize
+			self.ViewW = vp.x
+			self.ViewH = vp.y
+		end
+	end
+
+	-- Keys are read only while Roblox is the active window
+	if now - self.KeysAt >= KEY_POLL then
+		self.KeysAt = now
+		local keys: { any } = if active then getpressedkeys() else EMPTY_KEYS
+		local menuDown = keyDown(keys, self.MenuKey)
+		if menuDown and not self.MenuKeyWasDown then
+			self.Visible = not self.Visible
+		end
+		self.MenuKeyWasDown = menuDown
+		for _, el in self.Hotkeys do
+			local pressed = keyDown(keys, el.Key)
+			if pressed and not el.KeyWasDown then
+				fireHotkey(self, el)
+			end
+			el.KeyWasDown = pressed
+		end
+	end
+
+	-- Callbacks queued by Render and by hotkeys; ones queued while draining wait for the next update
+	local n = self.QN
+	if n > 0 then
+		local fns, qa, qb = self.QFn, self.QA, self.QB
+		for i = 1, n do
+			fns[i](qa[i], qb[i])
+		end
+		local total = self.QN
+		for i = n + 1, total do
+			fns[i - n] = fns[i]
+			qa[i - n] = qa[i]
+			qb[i - n] = qb[i]
+		end
+		self.QN = total - n
+	end
+end
+
+-- Render: draws the menu and handles clicks (state changes only, no memory calls).
+function UI:render(): ()
+	if not self.Alive then
+		return
+	end
+	current = self
+	if DEBUG then
+		self.Hits = {}
+	end
+	local input = self.Input
+	local clicked: boolean = input.clicked
+	input.clicked = false
+	local ldown: boolean = input.down
+	local mx: number = input.mx
+	local my: number = input.my
+	local mp: vector = vec(mx, my, 0)
+	local uw: number = self.Width
+
+	if ldown then
+		if not self.Dragging then
+			if self.Visible and self.SliderActive == nil and inRect(mx, my, self.X, self.Y, uw, HEADER_H) then
+				self.Dragging = true
+				self.DragDX = mx - self.X
+				self.DragDY = my - self.Y
+			end
+		else
+			self.X = math.clamp(mx - self.DragDX, 0, math.max(0, self.ViewW - uw))
+			self.Y = math.clamp(my - self.DragDY, 0, math.max(0, self.ViewH - self.PanelH))
+		end
+	else
+		self.Dragging = false
+	end
+
+	if not self.Visible then
+		return
+	end
+
+	local ux: number = self.X
+	local uy: number = self.Y
+	RoundRect(ux, uy, uw, self.PanelH, 10, T.Bg)
+
+	DrawingImmediate.FilledRectangle(vec(ux + 18, uy + 18, 0), vec(6, 6, 0), T.White, 1)
+	DrawingImmediate.Text(vec(ux + 30, uy + 14, 0), 13, T.TextMain, 1, self.Title, false)
+	DrawingImmediate.Text(vec(ux + 31, uy + 14, 0), 13, T.TextMain, 1, self.Title, false) -- second pass = bolder title
+	DrawingImmediate.Text(vec(ux + uw - 26, uy + 13, 0), 14, T.TextDim, 1, "x", false)
+	hit("x", ux + uw - 28, uy, 28, HEADER_H)
+	if clicked and inRect(mx, my, ux + uw - 28, uy, 28, HEADER_H) then
+		self.Visible = false
+		return
+	end
+
+	-- Tab bar
+	local tabs: { any } = self.Tabs
+	local count = #tabs
+	if count == 0 then
+		return
+	end
+	local gap = 4
+	local tabsW = uw - 16
+	local tabW = (tabsW - gap * (count - 1)) / count
+	for i, tab in tabs do
+		local tx = ux + 8 + (i - 1) * (tabW + gap)
+		local ty = uy + HEADER_H
+		local active = self.TabIndex == i
+		local hover = inRect(mx, my, tx, ty, tabW, TAB_H)
+		if active or hover then
+			RoundRect(tx, ty, tabW, TAB_H, 6, T.Chip)
+		end
+		DrawingImmediate.Text(vec(tx + tabW / 2, ty + TAB_H / 2 - 6, 0), 12, if active then T.TextMain else T.TextOff, 1, tab.Name, true)
+		hit(tab.Name, tx, ty, tabW, TAB_H)
+		if clicked and hover then
+			self.TabIndex = i
+		end
+	end
+
+	-- Controls of the open tab
+	local yo: number = uy + HEADER_H + TAB_H + 8
+	local tab = tabs[self.TabIndex]
+	for _, el in tab.Elements do
+		yo = drawElement(self, el, ux, yo, uw, clicked, mp)
+	end
+	yo += 6
+
+	-- Footer: optional status text on the left, the menu key on the right
+	DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
+	local stat = self.Stat
+	if stat ~= nil then
+		DrawingImmediate.Text(vec(ux + 18, yo + 11, 0), 11, T.TextDim, 1, stat.Label, false)
+		DrawingImmediate.Text(vec(ux + 62, yo + 11, 0), 11, T.TextRow, 1, stat.Value(), false)
+	end
+	DrawingImmediate.Text(vec(ux + 114, yo + 11, 0), 11, T.TextDim, 1, "Hide menu:", false)
+	DrawingImmediate.Text(vec(ux + 188, yo + 11, 0), 11, T.TextMain, 1, self.MenuKeyLabel, false)
+	self.PanelH = yo + 32 - uy
+end
+
+return UI
+end)()
+
+-- ===== Config =====
+local CONFIG = table.freeze({
+	WearFolder = "FustWear", -- character folder with worn clothes / armor parts
+	PackFolder = "FustPack", -- character folder with the worn backpack model
+	HolsterFolder = "FustHolster", -- character folder with holstered weapon models
+	NpcFolder = "Npcs", -- Workspace folder with NPC (bot) models
+	SleeperFolder = "Sleepers", -- Workspace folder with sleeping (offline) players
+	WorldItemFolder = "WorldItems", -- Workspace folder with items dropped by players
+	PickupFolder = "Pickups", -- Workspace folder with ground resources
+	NodeFolder = "Nodes", -- Workspace folder with ore nodes
+	LootFolder = "Loot", -- Workspace folder with crates and barrels
+	AirdropFolder = "Airdrops", -- Workspace folder with airdrops
+	DeployableFolder = "Deployables", -- Workspace folder with player-placed objects (turrets, boxes, furnaces ...)
+	MapFolder = "Map", -- Workspace folder that contains Monuments
+	MonumentFolder = "Monuments", -- Map folder with the monument models
+	RecyclerName = "Recycler", -- recycler model name
+	ItemIdAttribute = "ItemId", -- worn part / dropped item attribute with the item id
+	HolsterItemAttribute = "HolsterItem", -- holster model attribute with the weapon id
+	NpcKindAttribute = "NpcKind", -- NPC attribute with its type (guard)
+	WeaponAttribute = "Weapon", -- NPC attribute with its weapon id
+	SleeperNameAttribute = "SleeperName", -- sleeper attribute with the player's name
+	PickupTypeAttribute = "PickupType", -- pickup attribute with the item type
+	PickupAmountAttribute = "Remaining", -- pickup attribute with the remaining amount
+	WorldItemAttributes = { "ItemId", "Item" }, -- dropped item attributes tried as its label (falls back to the model name)
+	AmountAttributes = { "Count", "Amount", "Quantity", "Stack" }, -- dropped item attributes tried as its amount
+	OpenAttribute = "Open", -- crate attribute: true once the lid is open
+	HpAttribute = "Hp", -- node attribute: current health
+	MaxHpAttribute = "MaxHp", -- node attribute: full health
+	AnchorOffset = -3.2, -- studs relative to a model's root part where the text block starts (negative = below the feet)
+	GroundLift = 1, -- studs above a ground item where its label is drawn
+	Font = "Tamzen", -- monospace overlay font (health padding relies on equal character widths)
+	NearRange = 500, -- studs; targets closer than this are refreshed every frame, farther ones throttled
+	FarInterval = 0.15, -- seconds between refreshes of far targets
+	RosterRate = 1, -- seconds between player / bot roster syncs
+	SlowRate = 2, -- seconds between sleeper, ground and world scans
+	RecyclerRate = 6, -- seconds between recycler tree walks
+	SliceBudget = 0.002, -- seconds of model reading allowed per PostModel tick (keeps the frame time flat)
+	FallbackAfter = 0.5, -- PostLocal drives the model step itself if PostModel has not run for this long
+	LabelMax = 12, -- world labels on screen at once (nearest first)
+	LabelRange = 250, -- studs; past this a world object gets only its chams
+	LootInfoLines = 3, -- crates that get the second info line (nearest first)
+	PreviewPossible = false, -- true = the info line also names the rarest items the crate type can drop
+	PreviewCount = 2, -- how many possible drops the info line names
+	ChamsLimit = 30, -- world objects drawn with chams at once (nearest first)
+	ChamParts = 12, -- parts of one model that are wrapped by its single box
+	ChamsFill = 0.2, -- fill opacity of the chams
+	ChamsThickness = 1, -- outline thickness of the chams
+	ChamsMerge = 1, -- pixels the polygon grows by
+})
+
+-- Armor tier estimate by item id prefix (material). Edit to taste; the first matching prefix wins.
+local TIER_RULES: { { prefix: string, tier: number } } = {
+	{ prefix = "heavy", tier = 4 },
+	{ prefix = "metal", tier = 3 },
+	{ prefix = "wood", tier = 2 },
+	{ prefix = "bone", tier = 2 },
+	{ prefix = "coffee", tier = 2 },
+	{ prefix = "hide", tier = 1 },
+	{ prefix = "burlap", tier = 1 },
+}
+
+local COLORS = table.freeze({
+	Player = Color3.fromRGB(255, 255, 255), -- player name + distance
+	Sleeper = Color3.fromRGB(150, 150, 175), -- sleeping player
+	Npc = Color3.fromRGB(255, 120, 120), -- bot
+	Held = Color3.fromRGB(255, 220, 90), -- held item
+	Armor = Color3.fromRGB(130, 190, 255), -- armor
+	Clothes = Color3.fromRGB(175, 165, 215), -- clothes
+	Pack = Color3.fromRGB(120, 230, 140), -- backpack
+	Holster = Color3.fromRGB(255, 160, 80), -- holstered guns
+	Dropped = Color3.fromRGB(255, 130, 200), -- items dropped by players
+	Recycler = Color3.fromRGB(255, 215, 0), -- recyclers (gold)
+	PickupOther = Color3.fromRGB(215, 215, 150), -- pickups without a dedicated color
+})
+
+-- Pickup colors picked from the item name (wood = brown, berries = red ...).
+local PICKUP_COLORS: { [string]: Color3 } = {
+	wood = Color3.fromRGB(160, 105, 55),
+	stone = Color3.fromRGB(165, 165, 175),
+	metal = Color3.fromRGB(120, 175, 225),
+	sulfur = Color3.fromRGB(245, 225, 60),
+	hemp = Color3.fromRGB(90, 190, 90),
+	corn = Color3.fromRGB(240, 205, 70),
+	mushroom = Color3.fromRGB(215, 170, 145),
+	berries = Color3.fromRGB(205, 40, 95),
+	apple = Color3.fromRGB(255, 80, 60),
+	pumpkin = Color3.fromRGB(240, 115, 20),
+	potato = Color3.fromRGB(200, 170, 110),
+	carrot = Color3.fromRGB(255, 150, 50),
+}
+
+local EMPTY_ROWS = table.freeze({
+	Held = "Held: -",
+	Armor = "Armor: -",
+	Clothes = "Clothes: -",
+	Pack = "Pack: -",
+	Holster = "Holster: -",
+})
+
+local PICKUP_TYPES: { string } = table.freeze({
+	"wood", "stone", "metal", "sulfur", "hemp", "corn", "mushroom", "berries", "apple", "pumpkin", "potato", "carrot",
+})
+
+-- Ore nodes: each type has its own chams / text color.
+local ORE_KINDS: { [string]: { key: string, label: string, color: Color3 } } = {
+	MetalNode = { key = "metal", label = "Metal Ore", color = Color3.fromRGB(110, 200, 255) },
+	SulfurNode = { key = "sulfur", label = "Sulfur Ore", color = Color3.fromRGB(255, 225, 50) },
+	StoneNode = { key = "stone", label = "Stone", color = Color3.fromRGB(175, 175, 180) },
+}
+
+-- Containers: each type has its own chams / text color.
+local CRATE_KINDS: { [string]: { key: string, label: string, tbl: string, color: Color3 } } = {
+	LootCrate = { key = "wooden", label = "Wooden Crate", tbl = "crate_wooden", color = Color3.fromRGB(180, 125, 70) },
+	MilitaryCrate = { key = "military", label = "Military Crate", tbl = "crate_military", color = Color3.fromRGB(80, 205, 95) },
+	EliteCrate = { key = "elite", label = "Elite Crate", tbl = "crate_elite", color = Color3.fromRGB(200, 95, 255) },
+	LootBarrel = { key = "barrel", label = "Loot Barrel", tbl = "barrel", color = Color3.fromRGB(255, 140, 40) },
+	LockedCrate = { key = "locked", label = "Locked Crate", tbl = "locked_crate", color = Color3.fromRGB(255, 70, 70) },
+	HeliCrate = { key = "heli", label = "Heli Crate", tbl = "heli_crate", color = Color3.fromRGB(70, 150, 255) },
+	Airdrop = { key = "airdrop", label = "Airdrop", tbl = "airdrop", color = Color3.fromRGB(235, 240, 255) },
+}
+
+-- Player-placed objects (Workspace.Deployables): category filter, label and color per model name.
+local BASE_KINDS: { [string]: { cat: string, label: string, color: Color3 } } = {
+	AutoTurret = { cat = "turrets", label = "Auto Turret", color = Color3.fromRGB(255, 60, 60) },
+	AATurret = { cat = "turrets", label = "AA Turret", color = Color3.fromRGB(255, 110, 70) },
+	ShotgunTrap = { cat = "turrets", label = "Shotgun Trap", color = Color3.fromRGB(255, 85, 135) },
+	ToolCupboard = { cat = "storage", label = "Tool Cupboard", color = Color3.fromRGB(255, 170, 30) },
+	WoodenBox = { cat = "storage", label = "Wooden Box", color = Color3.fromRGB(205, 165, 105) },
+	LargeBox = { cat = "storage", label = "Large Box", color = Color3.fromRGB(150, 125, 255) },
+	Locker = { cat = "storage", label = "Locker", color = Color3.fromRGB(110, 195, 255) },
+	Wardrobe = { cat = "storage", label = "Wardrobe", color = Color3.fromRGB(140, 170, 255) },
+	Shelves = { cat = "storage", label = "Shelves", color = Color3.fromRGB(185, 185, 120) },
+	Furnace = { cat = "furnaces", label = "Furnace", color = Color3.fromRGB(235, 110, 50) },
+	LargeFurnace = { cat = "furnaces", label = "Large Furnace", color = Color3.fromRGB(235, 140, 80) },
+	Workbench = { cat = "benches", label = "Workbench T1", color = Color3.fromRGB(70, 225, 205) },
+	Workbench2 = { cat = "benches", label = "Workbench T2", color = Color3.fromRGB(70, 225, 205) },
+	Workbench3 = { cat = "benches", label = "Workbench T3", color = Color3.fromRGB(70, 225, 205) },
+	RepairBench = { cat = "benches", label = "Repair Bench", color = Color3.fromRGB(100, 235, 160) },
+	SkinBench = { cat = "benches", label = "Skin Bench", color = Color3.fromRGB(100, 200, 235) },
+	MixingTable = { cat = "benches", label = "Mixing Table", color = Color3.fromRGB(150, 235, 120) },
+	Battery = { cat = "power", label = "Battery", color = Color3.fromRGB(255, 240, 110) },
+	SolarPanel = { cat = "power", label = "Solar Panel", color = Color3.fromRGB(255, 240, 110) },
+	SmallGenerator = { cat = "power", label = "Small Generator", color = Color3.fromRGB(255, 240, 110) },
+	SleepingBag = { cat = "bags", label = "Sleeping Bag", color = Color3.fromRGB(215, 160, 255) },
+	Backpack = { cat = "backpacks", label = "Backpack", color = Color3.fromRGB(235, 235, 120) },
+}
+
+
+-- Loot tables of the game's LootTables module: { rollsLow, rollsHigh, "item:chance ..." } (chance per crate in percent).
+local BAKED: { [string]: { any } } = {
+	barrel = { 1, 2, "semi_body:1.188 bone_knife:3.13 burlap_shirt:4.166 burlap_trousers:4.166 burlap_headwrap:4.166 burlap_shoes:4.166 bandage:5 stone_hatchet:5.199 stone_pickaxe:5.199 tech_trash:5.893 sheet_metal:5.893 can_of_tuna:6 wood:6.227 stones:6.227 mushroom:6.227 torch:6.227 sulfur:6.227 corn:6.227 water_bottle:8 can_of_beans:8 tarp:11.665 charcoal:12.32 wooden_arrow:14.32 metal_spring:15.445 sewing_kit:15.445 gears:19.17 metal_pipe:21.011 metal_blade:22.838 cloth:24.087 rope:26.449 metal_fragments:27.882 low_grade_fuel:30 scrap:100" },
+	crate_wooden = { 2, 3, "satchel_charge:0.2 compound_bow:1 crossbow:1.2 smg_body:4.189 bone_club:4.921 code_lock:4.921 semi_body:6.923 bandage:8 wood_armor_pants:8.12 metal_hatchet:8.12 metal_pickaxe:8.12 wood_chestplate:8.12 burlap_headwrap:9.694 burlap_shoes:9.694 burlap_shirt:9.694 burlap_trousers:9.694 wooden_spear:9.694 water_bottle_full:10 can_of_tuna:10 stone_pickaxe:11.253 stone_hatchet:11.253 wood:12.795 sulfur:12.795 hunting_bow:12.795 can_of_beans:14 tech_trash:15.161 tarp:19.885 sheet_metal:19.885 sewing_kit:22.945 wooden_arrow:24.554 cloth:24.554 low_grade_fuel:25 rope:25.934 metal_pipe:28.852 gears:28.852 metal_blade:28.852 metal_spring:28.852 metal_fragments:35.306 scrap:100" },
+	crate_military = { 4, 6, "assault_rifle:0.744 scar:0.8 c4:1.114 bolt_action_rifle:1.2 hv_rocket:1.5 incendiary_rocket:1.5 drum_smg:1.5 scope_4x:2 tactical_smg:2 semi_auto_rifle:2.156 pump_shotgun:2.5 lever_carbine:2.5 holo_sight:3 double_barrel:3 crossbow:3 compound_bow:3 satchel_charge:3.674 supply_signal:4 service_pistol:4 semi_auto_pistol:5 explosive_rifle_ammo:5 red_dot_sight:6 slug_shell:6 metal_door:6.062 explosives:7.239 custom_smg:7.239 pipe_shotgun:10.698 revolver:11.827 code_lock:11.827 metal_hatchet:11.827 metal_pickaxe:11.827 bandage:12 buckshot_shell:12 sewing_kit:12.035 rope:12.035 rifle_ammo:17.305 burlap_headwrap:17.305 sheet_metal:17.709 sulfur:22.508 high_quality_metal:22.508 metal_pipe:23.157 smg_body:25.797 semi_body:25.797 gears:28.382 low_grade_fuel:30 wood_chestplate:32.128 wood_armor_pants:32.128 tech_trash:38.179 metal_fragments:40.767 metal_spring:42.757 handmade_shell:48.504 gunpowder:48.504 pistol_bullet:71.017 scrap:100" },
+	crate_elite = { 5, 7, "assault_rifle:3.346 scar:4 hv_rocket:4 incendiary_rocket:4 crossbow:4 compound_bow:4 pump_shotgun:4 tactical_smg:4 drum_smg:4 large_backpack:6 bolt_action_rifle:6 c4:6.598 scope_4x:10 explosive_rifle_ammo:10 buckshot_shell:10 slug_shell:10 holo_sight:12 satchel_charge:13.691 code_lock:13.691 semi_auto_rifle:14.545 sheet_metal:18.136 explosives:21.92 wood_chestplate:25.783 wood_armor_pants:25.783 bandage:25.783 gears:26.399 custom_smg:29.485 smg_body:34.14 semi_body:34.14 metal_fragments:45.77 gunpowder:45.77 tech_trash:48.103 high_quality_metal:51.339 metal_spring:54.349 pistol_bullet:56.422 rifle_ammo:86.284 scrap:100" },
+	locked_crate = { 6, 9, "armored_double_door:4.851 hv_rocket:8 incendiary_rocket:8 armored_door:9.496 code_lock:11.744 bolt_action_rifle:15 supply_signal:15 large_backpack:20 buckshot_shell:20 slug_shell:20 scope_4x:25 scar:25 explosive_rifle_ammo:25 smg_body:31.981 gears:31.981 custom_smg:34.187 gunpowder:34.61 satchel_charge:34.61 bandage:34.61 semi_body:41.038 pistol_bullet:45.212 metal_fragments:45.212 explosives:45.212 semi_auto_rifle:48.183 metal_spring:49.33 high_quality_metal:49.929 c4:50.958 assault_rifle:56.819 tech_trash:56.88 rifle_ammo:97.152 scrap:100" },
+	heli_crate = { 6, 8, "lr_sniper:4 scope_4x:8 bolt_action_rifle:8 buckshot_shell:12 slug_shell:12 satchel_charge:14.299 scar:18 c4:20.055 gears:23.927 large_medkit:26.808 bandage:26.808 semi_body:31.406 gunpowder:34.248 semi_auto_rifle:38.112 metal_spring:38.623 assault_rifle:40.11 tech_trash:45.567 metal_fragments:47.204 explosives:47.204 medical_syringe:47.204 high_quality_metal:85.008 rifle_ammo:95.932 scrap:100" },
+	airdrop = { 7, 11, "night_vision_goggles:1.8 scar:3.5 armored_double_door:4.046 bolt_action_rifle:5 crossbow:5 compound_bow:5 drum_smg:5 scope_4x:6 hv_rocket:6 incendiary_rocket:6 pump_shotgun:6 tactical_smg:6 armored_door:7.946 holo_sight:8 service_pistol:10 red_dot_sight:12 semi_auto_pistol:15 slug_shell:15 code_lock:15.326 c4:18.815 explosive_rifle_ammo:20 buckshot_shell:20 sheet_metal:20.988 pipe_shotgun:25.412 smg_body:27.435 gears:27.435 semi_body:27.435 semi_auto_rifle:32.696 satchel_charge:34.415 metal_spring:39.506 tech_trash:39.506 gunpowder:39.867 revolver:39.867 explosives:39.867 handmade_shell:44.912 custom_smg:44.912 low_grade_fuel:50 metal_fragments:64.925 rifle_ammo:69.933 high_quality_metal:81.556 pistol_bullet:88.364 scrap:100" },
+}
+
+
+type LootTable = {
+	low: number,
+	high: number,
+	items: { { id: string, p: number } }, -- rarest first
+}
+
+type Target = {
+	kind: string, -- "player", "sleeper" or "npc"
+	model: any, -- the character / npc / sleeper model
+	name: string,
+	nameColor: Color3,
+	root: any,
+	humanoid: any,
+	static: boolean, -- true = position never changes (sleepers)
+	ready: boolean, -- true once PostLocal has read a fresh position (Render skips others)
+	dead: boolean, -- true once the model vanished; dropped by the next roster sync
+	position: vector,
+	distSq: number,
+	nextUpdate: number, -- earliest time of the next position / health refresh
+	gearAt: number, -- time of the last equipment read
+	health: number, -- -1 when unknown
+	maxHealth: number,
+	hpColor: Color3,
+	lastHp: number, -- change detectors for the header strings
+	lastDist: number,
+	lastBits: number,
+	headA: string, -- name + distance line (padded when health is shown)
+	headB: string, -- health text (padded, drawn over headA in the health color)
+	held: string, -- row texts; "" when empty
+	armor: string, -- armor row with tiers
+	armorPlain: string, -- armor row without tiers
+	clothes: string,
+	pack: string,
+	holster: string,
+}
+
+type GroundEntry = {
+	group: string, -- "pickups" or "dropped"
+	flag: string, -- pickup type filter flag
+	base: string,
+	position: vector,
+	distSq: number,
+	text: string,
+	color: Color3,
+}
+
+type WorldEntry = {
+	group: string, -- "ore", "loot" or "recycler"
+	flag: string, -- type filter flag ("" = none)
+	label: string,
+	sub: string, -- second line ("" = none)
+	infoKey: string, -- loot table key of a crate ("" = none)
+	height: number, -- studs above the position where the label is anchored
+	color: Color3,
+	position: vector,
+	distSq: number,
+	text: string, -- label with distance
+	poses: { any }, -- one pose with the model's bounding box (empty = label only)
+}
+
+type RecyclerInfo = { position: vector, label: string, on: boolean, poses: { any }, height: number }
+
+type ScanJob = { items: { any }, process: (any) -> () }
+
+type Scan = { jobs: { ScanJob }, jobIndex: number, itemIndex: number, finish: () -> () }
+
+type View = {
+	size: number,
+	hideEmpty: boolean,
+	held: boolean,
+	armor: boolean,
+	tier: boolean,
+	clothes: boolean,
+	pack: boolean,
+	holster: boolean,
+	sleeperLift: number,
+}
+
+local Players: any = game:GetService("Players")
+local Workspace: any = game:GetService("Workspace")
+local RunService: any = game:GetService("RunService")
+
+local Flags: { [string]: any } = {}
+local Live: { Target } = {} -- players and bots (persistent entries, synced by roster)
+local Sleepers: { Target } = {}
+local SnapGround: { GroundEntry } = {}
+local SnapWorld: { WorldEntry } = {}
+local Recyclers: { RecyclerInfo } = {}
+local Camera: any = Workspace.CurrentCamera -- cached outside Render (Workspace.CurrentCamera is disallowed there)
+local KnownPickup: { [string]: boolean } = {}
+for _, kind in PICKUP_TYPES do
+	KnownPickup[kind] = true
+end
+local ViewState: View = {
+	size = 13, hideEmpty = true, held = true, armor = true, tier = true, clothes = false, pack = false, holster = false, sleeperLift = 2,
+}
+
+
+-- ===== Chams (convex hull outlines) =====
+
+-- Projects model parts into screen polygons, fills them and draws one merged outline (convex hull per part).
+local Chams: any = (function()
+	local ChamsCamera: any = Workspace.CurrentCamera
+	local Convex: any = {
+		Scratch = { Points = {}, Hull = {}, Poly = {} },
+		Static = { HWMPoints = 0, HWMHull = 0, HWMPoly = 0 },
+	}
+	local GROUP_EPSILON = 0.0001
+	local GROUP_JOIN_EPSILON = 0.75
+
+	local function TruncateBuffer(Buffer: any, NewSize: number, HighWaterMark: number): number
+		for Index = NewSize + 1, HighWaterMark do
+			Buffer[Index] = nil
+		end
+		return math.max(NewSize, HighWaterMark)
+	end
+
+	local function CrossDimension(OriginX: number, OriginY: number, PointAX: number, PointAY: number, PointBX: number, PointBY: number): number
+		return (PointAX - OriginX) * (PointBY - OriginY) - (PointAY - OriginY) * (PointBX - OriginX)
+	end
+
+	local function CalculateConvexHull(Points: any, PointCount: number, Outer: any): number
+		if PointCount == 0 then
+			return 0
+		end
+		if PointCount == 1 then
+			Outer[1] = Points[1]
+			return 1
+		end
+		if PointCount == 2 then
+			Outer[1] = Points[1]
+			Outer[2] = Points[2]
+			return 2
+		end
+		table.sort(Points, function(PointA: any, PointB: any): boolean
+			return PointA.X < PointB.X or (PointA.X == PointB.X and PointA.Y < PointB.Y)
+		end)
+		local Size = 0
+		for Index = 1, PointCount do
+			local Point = Points[Index]
+			while Size >= 2 and CrossDimension(Outer[Size - 1].X, Outer[Size - 1].Y, Outer[Size].X, Outer[Size].Y, Point.X, Point.Y) <= 0 do
+				Size = Size - 1
+			end
+			Size = Size + 1
+			Outer[Size] = Point
+		end
+		local LowerHullSize = Size
+		for Index = PointCount - 1, 1, -1 do
+			local Point = Points[Index]
+			while Size > LowerHullSize and CrossDimension(Outer[Size - 1].X, Outer[Size - 1].Y, Outer[Size].X, Outer[Size].Y, Point.X, Point.Y) <= 0 do
+				Size = Size - 1
+			end
+			Size = Size + 1
+			Outer[Size] = Point
+		end
+		return Size - 1
+	end
+
+	local function ProjectPartCorners(Position: any, RightVector: any, UpVector: any, LookVector: any, PartSize: any, WriteOffset: number): number
+		local HalfSizeX = PartSize.X * 0.5
+		local HalfSizeY = PartSize.Y * 0.5
+		local HalfSizeZ = PartSize.Z * 0.5
+		local RightX = RightVector.X * HalfSizeX
+		local RightY = RightVector.Y * HalfSizeX
+		local RightZ = RightVector.Z * HalfSizeX
+		local UpX = UpVector.X * HalfSizeY
+		local UpY = UpVector.Y * HalfSizeY
+		local UpZ = UpVector.Z * HalfSizeY
+		local LookX = LookVector.X * HalfSizeZ
+		local LookY = LookVector.Y * HalfSizeZ
+		local LookZ = LookVector.Z * HalfSizeZ
+		local SignR = 1
+		for _ = 1, 2 do
+			local SignU = 1
+			for _ = 1, 2 do
+				local SignL = 1
+				for _ = 1, 2 do
+					local WorldPoint = vector.create(
+						Position.X + SignR * RightX + SignU * UpX + SignL * LookX,
+						Position.Y + SignR * RightY + SignU * UpY + SignL * LookY,
+						Position.Z + SignR * RightZ + SignU * UpZ + SignL * LookZ
+					)
+					local ScreenPoint, OnScreen = ChamsCamera:WorldToScreenPoint(WorldPoint)
+					if OnScreen then
+						WriteOffset = WriteOffset + 1
+						local Slot = Convex.Scratch.Points[WriteOffset]
+						if Slot then
+							Slot.X = ScreenPoint.X
+							Slot.Y = ScreenPoint.Y
+						else
+							Convex.Scratch.Points[WriteOffset] = { X = ScreenPoint.X, Y = ScreenPoint.Y }
+						end
+					end
+					SignL = -1
+				end
+				SignU = -1
+			end
+			SignR = -1
+		end
+		return WriteOffset
+	end
+
+	local function DrawPolygon(Hull: any, Size: number, Color: Color3, Opacity: number)
+		if Size < 3 then
+			return
+		end
+		local Pivot = vector.create(Hull[1].X, Hull[1].Y, 0)
+		for Index = 2, Size - 1 do
+			DrawingImmediate.FilledTriangle(Pivot, vector.create(Hull[Index].X, Hull[Index].Y, 0), vector.create(Hull[Index + 1].X, Hull[Index + 1].Y, 0), Color, Opacity)
+		end
+	end
+
+	local function DrawOutline(Hull: any, Size: number, Color: Color3, Opacity: number, Thickness: number)
+		if Size < 2 then
+			return
+		end
+		for Index = 1, Size do
+			local Entry = Hull[Index]
+			Convex.Scratch.Poly[Index] = vector.create(Entry.X, Entry.Y, 0)
+		end
+		Convex.Scratch.Poly[Size + 1] = vector.create(Hull[1].X, Hull[1].Y, 0)
+		Convex.Scratch.Poly[Size + 2] = nil
+		if Size + 1 < Convex.Static.HWMPoly then
+			for Index = Size + 2, Convex.Static.HWMPoly do
+				Convex.Scratch.Poly[Index] = nil
+			end
+		end
+		Convex.Static.HWMPoly = math.max(Convex.Static.HWMPoly, Size + 1)
+		DrawingImmediate.Polyline(Convex.Scratch.Poly, Color, Opacity, Thickness)
+	end
+
+	local function PolygonArea(Poly: any): number
+		local Area = 0
+		local Count = #Poly
+		for Index = 1, Count do
+			local A = Poly[Index]
+			local B = Poly[Index % Count + 1]
+			Area += A.X * B.Y - B.X * A.Y
+		end
+		return Area * 0.5
+	end
+
+	local function ReversePolygon(Poly: any)
+		local Left = 1
+		local Right = #Poly
+		while Left < Right do
+			Poly[Left], Poly[Right] = Poly[Right], Poly[Left]
+			Left += 1
+			Right -= 1
+		end
+	end
+
+	local function ExpandPolygon(Poly: any, Padding: number?)
+		if not Padding or Padding <= 0 then
+			return
+		end
+		local CenterX = 0
+		local CenterY = 0
+		for _, Point in Poly do
+			CenterX += Point.X
+			CenterY += Point.Y
+		end
+		CenterX /= #Poly
+		CenterY /= #Poly
+		for _, Point in Poly do
+			local DX = Point.X - CenterX
+			local DY = Point.Y - CenterY
+			local Length = math.sqrt(DX * DX + DY * DY)
+			if Length > 0 then
+				Point.X += DX / Length * Padding
+				Point.Y += DY / Length * Padding
+			end
+		end
+	end
+
+	local function ProjectPartPolygon(Position: any, RightVector: any, UpVector: any, LookVector: any, PartSize: any, Padding: number?): any
+		local PointCount = ProjectPartCorners(Position, RightVector, UpVector, LookVector, PartSize, 0)
+		Convex.Static.HWMPoints = TruncateBuffer(Convex.Scratch.Points, PointCount, Convex.Static.HWMPoints)
+		if PointCount < 3 then
+			return nil
+		end
+		local Size = CalculateConvexHull(Convex.Scratch.Points, PointCount, Convex.Scratch.Hull)
+		Convex.Static.HWMHull = TruncateBuffer(Convex.Scratch.Hull, Size, Convex.Static.HWMHull)
+		if Size < 3 then
+			return nil
+		end
+		local Poly: any = {}
+		for Index = 1, Size do
+			local Point = Convex.Scratch.Hull[Index]
+			Poly[Index] = { X = Point.X, Y = Point.Y }
+		end
+		-- Every polygon is made counter-clockwise.
+		if PolygonArea(Poly) < 0 then
+			ReversePolygon(Poly)
+		end
+		ExpandPolygon(Poly, Padding)
+		return Poly
+	end
+
+	local function PointInsideConvex(Point: any, Poly: any): boolean
+		for Index = 1, #Poly do
+			local A = Poly[Index]
+			local B = Poly[Index % #Poly + 1]
+			if CrossDimension(A.X, A.Y, B.X, B.Y, Point.X, Point.Y) < -GROUP_EPSILON then
+				return false
+			end
+		end
+		return true
+	end
+
+	local function SegmentIntersectionT(A: any, B: any, C: any, D: any): number?
+		local RX = B.X - A.X
+		local RY = B.Y - A.Y
+		local SX = D.X - C.X
+		local SY = D.Y - C.Y
+		local Denominator = RX * SY - RY * SX
+		if math.abs(Denominator) <= GROUP_EPSILON then
+			return nil
+		end
+		local QX = C.X - A.X
+		local QY = C.Y - A.Y
+		local T = (QX * SY - QY * SX) / Denominator
+		local U = (QX * RY - QY * RX) / Denominator
+		if T > GROUP_EPSILON and T < 1 - GROUP_EPSILON and U >= -GROUP_EPSILON and U <= 1 + GROUP_EPSILON then
+			return T
+		end
+		return nil
+	end
+
+	local function LerpPoint(A: any, B: any, T: number): any
+		return { X = A.X + (B.X - A.X) * T, Y = A.Y + (B.Y - A.Y) * T }
+	end
+
+	local function BuildBoundarySegments(Polygons: any): any
+		local Boundary: any = {}
+		for PolygonIndex, Poly in Polygons do
+			for EdgeIndex = 1, #Poly do
+				local A = Poly[EdgeIndex]
+				local B = Poly[EdgeIndex % #Poly + 1]
+				local Splits: any = { 0, 1 }
+				for OtherIndex, Other in Polygons do
+					if OtherIndex ~= PolygonIndex then
+						for OtherEdgeIndex = 1, #Other do
+							local C = Other[OtherEdgeIndex]
+							local D = Other[OtherEdgeIndex % #Other + 1]
+							local T = SegmentIntersectionT(A, B, C, D)
+							if T then
+								Splits[#Splits + 1] = T
+							end
+						end
+					end
+				end
+				table.sort(Splits)
+				local CleanSplits: any = {}
+				for _, T in Splits do
+					if #CleanSplits == 0 or math.abs(T - CleanSplits[#CleanSplits]) > GROUP_EPSILON then
+						CleanSplits[#CleanSplits + 1] = T
+					end
+				end
+				for SplitIndex = 1, #CleanSplits - 1 do
+					local T1 = CleanSplits[SplitIndex]
+					local T2 = CleanSplits[SplitIndex + 1]
+					if T2 - T1 <= GROUP_EPSILON then
+						continue
+					end
+					local Mid = LerpPoint(A, B, (T1 + T2) * 0.5)
+					local Covered = false
+					for OtherIndex, Other in Polygons do
+						if OtherIndex ~= PolygonIndex and PointInsideConvex(Mid, Other) then
+							Covered = true
+							break
+						end
+					end
+					if not Covered then
+						Boundary[#Boundary + 1] = { A = LerpPoint(A, B, T1), B = LerpPoint(A, B, T2) }
+					end
+				end
+			end
+		end
+		return Boundary
+	end
+
+	local function SamePoint(A: any, B: any): boolean
+		local DX = A.X - B.X
+		local DY = A.Y - B.Y
+		return DX * DX + DY * DY <= GROUP_JOIN_EPSILON * GROUP_JOIN_EPSILON
+	end
+
+	local function StitchBoundary(Segments: any): any
+		local Loops: any = {}
+		local Used: any = {}
+		for StartIndex, StartSegment in Segments do
+			if Used[StartIndex] then
+				continue
+			end
+			Used[StartIndex] = true
+			local Loop: any = { StartSegment.A, StartSegment.B }
+			local StartPoint = StartSegment.A
+			local CurrentPoint = StartSegment.B
+			local Guard = 0
+			while not SamePoint(CurrentPoint, StartPoint) and Guard <= #Segments do
+				Guard += 1
+				local Found = false
+				for Index, Segment in Segments do
+					if Used[Index] then
+						continue
+					end
+					if SamePoint(Segment.A, CurrentPoint) then
+						Used[Index] = true
+						Loop[#Loop + 1] = Segment.B
+						CurrentPoint = Segment.B
+						Found = true
+						break
+					elseif SamePoint(Segment.B, CurrentPoint) then
+						Used[Index] = true
+						Loop[#Loop + 1] = Segment.A
+						CurrentPoint = Segment.A
+						Found = true
+						break
+					end
+				end
+				if not Found then
+					break
+				end
+			end
+			if #Loop >= 4 and SamePoint(Loop[#Loop], StartPoint) then
+				Loop[#Loop] = nil
+				if #Loop >= 3 then
+					Loops[#Loops + 1] = Loop
+				end
+			end
+		end
+		return Loops
+	end
+
+	-- Draws the fill of every part polygon and one merged outline around the whole group.
+	local function HighlightGroup(Parts: any, Color: Color3, OpacityFill: number, OpacityOutline: number, Thickness: number, MergePadding: number?)
+		MergePadding = MergePadding or 1.25
+		local Polygons: any = {}
+		for _, Target in Parts do
+			if not Target.Parent then
+				continue
+			end
+			local Success, Poly = pcall(ProjectPartPolygon, Target.Position, Target.RightVector, Target.UpVector, Target.LookVector, Target.PartSize, MergePadding)
+			if Success and Poly then
+				Polygons[#Polygons + 1] = Poly
+				if OpacityFill and OpacityFill > 0 then
+					DrawPolygon(Poly, #Poly, Color, OpacityFill)
+				end
+			end
+		end
+		if #Polygons == 0 then
+			return
+		end
+		if #Polygons == 1 then
+			DrawOutline(Polygons[1], #Polygons[1], Color, OpacityOutline, Thickness)
+			return
+		end
+		local Loops = StitchBoundary(BuildBoundarySegments(Polygons))
+		if #Loops == 0 then
+			for _, Poly in Polygons do
+				DrawOutline(Poly, #Poly, Color, OpacityOutline, Thickness)
+			end
+			return
+		end
+		for _, Loop in Loops do
+			DrawOutline(Loop, #Loop, Color, OpacityOutline, Thickness)
+		end
+	end
+
+	-- Replaces the camera used for projection.
+	local function SetCamera(NewCamera: any)
+		if NewCamera then
+			ChamsCamera = NewCamera
+		end
+	end
+
+	return { HighlightGroup = HighlightGroup, SetCamera = SetCamera }
+end)()
+
+
+-- ===== Helpers =====
+
+-- Reads a property without throwing when it does not exist.
+local function safeGet(object: any, property: string): any
+	local ok, value = pcall(function(): any
+		return object[property]
+	end)
+	if ok then
+		return value
+	end
+	return nil
+end
+
+-- Returns the children of an instance, or an empty table on failure.
+local function safeChildren(object: any): { any }
+	local ok, result = pcall(function(): any
+		return object:GetChildren()
+	end)
+	if ok and type(result) == "table" then
+		return result
+	end
+	return {}
+end
+
+-- Returns a named child, or nil.
+local function child(object: any, name: string): any
+	local ok, result = pcall(function(): any
+		return object:FindFirstChild(name)
+	end)
+	if ok then
+		return result
+	end
+	return nil
+end
+
+-- Returns the first child of a class, or nil.
+local function childOfClass(object: any, className: string): any
+	local ok, result = pcall(function(): any
+		return object:FindFirstChildOfClass(className)
+	end)
+	if ok then
+		return result
+	end
+	return nil
+end
+
+-- Returns an attribute as text, or nil when it is missing or empty.
+local function attribute(object: any, name: string): string?
+	local ok, value = pcall(function(): any
+		return object:GetAttribute(name)
+	end)
+	if not ok or value == nil then
+		return nil
+	end
+	local text = tostring(value)
+	if text == "" then
+		return nil
+	end
+	return text
+end
+
+-- Returns the first non-empty attribute of the list, or nil.
+local function firstAttribute(object: any, names: { string }): string?
+	for _, name in names do
+		local value = attribute(object, name)
+		if value ~= nil then
+			return value
+		end
+	end
+	return nil
+end
+
+-- Replaces underscores with spaces ("custom_smg" -> "custom smg").
+local function prettify(text: string): string
+	return (string.gsub(text, "_", " "))
+end
+
+-- Upper-cases the first letter.
+local function capitalize(text: string): string
+	return string.upper(string.sub(text, 1, 1)) .. string.sub(text, 2)
+end
+
+-- Sorts labels and joins them into one row; "" when there are none.
+local function joinLabels(prefix: string, labels: { string }): string
+	if #labels == 0 then
+		return ""
+	end
+	table.sort(labels)
+	return prefix .. ": " .. table.concat(labels, ", ")
+end
+
+-- True when the instance has a vector Size and Position (i.e. it is a BasePart).
+local function isBasePart(object: any): boolean
+	return typeof(safeGet(object, "Size")) == "vector" and typeof(safeGet(object, "Position")) == "vector"
+end
+
+-- Finds a part that represents the model's position.
+local function findRoot(model: any): any
+	local root: any = child(model, "HumanoidRootPart") or child(model, "Head")
+	if root ~= nil then
+		return root
+	end
+	if isBasePart(model) then
+		return model
+	end
+	local primary: any = safeGet(model, "PrimaryPart")
+	if primary ~= nil then
+		return primary
+	end
+	return childOfClass(model, "MeshPart") or childOfClass(model, "Part")
+end
+
+-- Returns the position of a model's root part, or nil.
+local function positionOf(model: any): vector?
+	local root: any = findRoot(model)
+	local position: any = if root ~= nil then safeGet(root, "Position") else nil
+	if typeof(position) == "vector" then
+		return position
+	end
+	return nil
+end
+
+-- Builds ONE oriented box around all parts of a model (axes of its largest part); nil when it has no readable part.
+local function readPose(model: any): any
+	local parts: { any } = {}
+
+	-- Adds one part when it exposes a complete pose.
+	local function add(part: any)
+		local size: any = safeGet(part, "Size")
+		if typeof(size) ~= "vector" then
+			return
+		end
+		local position: any = safeGet(part, "Position")
+		local right: any = safeGet(part, "RightVector")
+		local up: any = safeGet(part, "UpVector")
+		local look: any = safeGet(part, "LookVector")
+		if typeof(position) == "vector" and typeof(right) == "vector" and typeof(up) == "vector" and typeof(look) == "vector" then
+			table.insert(parts, { position = position, right = right, up = up, look = look, size = size, volume = size.x * size.y * size.z })
+		end
+	end
+
+	add(model)
+	if #parts == 0 then
+		for _, item in safeChildren(model) do
+			add(item)
+			for _, inner in safeChildren(item) do
+				if #parts >= CONFIG.ChamParts then
+					break
+				end
+				add(inner)
+			end
+			if #parts >= CONFIG.ChamParts then
+				break
+			end
+		end
+	end
+	if #parts == 0 then
+		return nil
+	end
+	table.sort(parts, function(a: any, b: any): boolean
+		return a.volume > b.volume
+	end)
+
+	local reference = parts[1]
+	local minR: number = math.huge
+	local maxR: number = -math.huge
+	local minU: number = math.huge
+	local maxU: number = -math.huge
+	local minL: number = math.huge
+	local maxL: number = -math.huge
+	for _, part in parts do
+		local hx, hy, hz = part.size.x * 0.5, part.size.y * 0.5, part.size.z * 0.5
+		for _, signR in { -1, 1 } do
+			for _, signU in { -1, 1 } do
+				for _, signL in { -1, 1 } do
+					local cx = part.position.x + signR * hx * part.right.x + signU * hy * part.up.x + signL * hz * part.look.x
+					local cy = part.position.y + signR * hx * part.right.y + signU * hy * part.up.y + signL * hz * part.look.y
+					local cz = part.position.z + signR * hx * part.right.z + signU * hy * part.up.z + signL * hz * part.look.z
+					local delta = vector.create(cx - reference.position.x, cy - reference.position.y, cz - reference.position.z)
+					local r = vector.dot(delta, reference.right)
+					local u = vector.dot(delta, reference.up)
+					local l = vector.dot(delta, reference.look)
+					minR = math.min(minR, r)
+					maxR = math.max(maxR, r)
+					minU = math.min(minU, u)
+					maxU = math.max(maxU, u)
+					minL = math.min(minL, l)
+					maxL = math.max(maxL, l)
+				end
+			end
+		end
+	end
+
+	local center = reference.position
+		+ reference.right * ((minR + maxR) * 0.5)
+		+ reference.up * ((minU + maxU) * 0.5)
+		+ reference.look * ((minL + maxL) * 0.5)
+	return {
+		Position = center,
+		RightVector = reference.right,
+		UpVector = reference.up,
+		LookVector = reference.look,
+		PartSize = vector.create(maxR - minR, maxU - minU, maxL - minL),
+		Parent = true,
+	}
+end
+
+-- Studs above a pose's center where its label is anchored.
+local function poseHeight(pose: any): number
+	local size = pose.PartSize
+	return math.max(size.x, size.y, size.z) * 0.5 + 0.4
+end
+
+-- Returns the armor tier estimate for an item id, or nil when unknown.
+local function tierOf(itemId: string): number?
+	for _, rule in TIER_RULES do
+		if string.find(itemId, rule.prefix, 1, true) == 1 then
+			return rule.tier
+		end
+	end
+	return nil
+end
+
+-- Returns a color that fades from green (full health) to red (dead).
+local function healthColor(health: number, maxHealth: number): Color3
+	local ratio = math.clamp(health / maxHealth, 0, 1)
+	return Color3.fromRGB(math.floor(255 - 175 * ratio), math.floor(60 + 195 * ratio), math.floor(60 + 60 * ratio))
+end
+
+-- Packs the header toggles into one number (used as a change detector).
+local function headerBits(): number
+	return (if Flags.showName == true then 1 else 0) + (if Flags.showHealth == true then 2 else 0) + (if Flags.showDist == true then 4 else 0)
+end
+
+-- Builds the two header strings; health is drawn over the padded part of the first one.
+local function buildHeader(target: Target, bits: number)
+	local text = ""
+	if bit32.band(bits, 1) ~= 0 then
+		text = target.name
+	end
+	if bit32.band(bits, 4) ~= 0 then
+		local dist = "[" .. tostring(math.floor(math.sqrt(target.distSq))) .. "m]"
+		text = if text == "" then dist else text .. " " .. dist
+	end
+	if bit32.band(bits, 2) ~= 0 and target.health >= 0 then
+		local hp = tostring(math.floor(target.health))
+		local textLength = utf8.len(text) or #text
+		target.headA = if text == "" then "" else string.rep(" ", #hp + 1) .. text
+		target.headB = if text == "" then hp else hp .. string.rep(" ", textLength + 1)
+	else
+		target.headA = text
+		target.headB = ""
+	end
+end
+
+-- Returns "label  [123m]" or just the label.
+local function entryText(label: string, distSq: number, showDist: boolean): string
+	if showDist then
+		return label .. "  [" .. tostring(math.floor(math.sqrt(distSq))) .. "m]"
+	end
+	return label
+end
+
+-- ===== Loot tables =====
+
+local LOOT: { [string]: LootTable } = {}
+for name, data in BAKED do
+	local items: { { id: string, p: number } } = {}
+	for id, chance in string.gmatch(data[3] :: string, "([%w_]+):([%d%.]+)") do
+		table.insert(items, { id = id, p = tonumber(chance) or 0 })
+	end
+	table.sort(items, function(a: { id: string, p: number }, b: { id: string, p: number }): boolean
+		return a.p < b.p
+	end)
+	LOOT[name] = { low = data[1] :: number, high = data[2] :: number, items = items }
+end
+
+local previewCache: { [string]: string } = {}
+
+-- Returns the info line of a crate type: roll count and pool size (optionally the rarest possible drops).
+local function lootInfo(tableKey: string): string
+	local hit = previewCache[tableKey]
+	if hit ~= nil then
+		return hit
+	end
+	local tbl = LOOT[tableKey]
+	local line = ""
+	if tbl ~= nil then
+		line = string.format("%d-%d rolls", tbl.low, tbl.high)
+		local body = ""
+		if CONFIG.PreviewPossible and CONFIG.PreviewCount > 0 then
+			local parts: { string } = {}
+			for index = 1, math.min(CONFIG.PreviewCount, #tbl.items) do
+				table.insert(parts, prettify(tbl.items[index].id))
+			end
+			body = table.concat(parts, ", ")
+			local more = #tbl.items - #parts
+			if more > 0 then
+				body ..= "  +" .. tostring(more)
+			end
+			if #body > 46 then
+				body = string.sub(body, 1, 43) .. "..."
+			end
+		end
+		if body ~= "" then
+			line ..= " | could drop: " .. body
+		else
+			line = string.format("%s, %d possible items", line, #tbl.items)
+		end
+	end
+	previewCache[tableKey] = line
+	return line
+end
+
+-- ===== Equipment readers =====
+
+-- Held row: the equipped Tool.
+local function readHeld(character: any): string
+	local tool: any = childOfClass(character, "Tool")
+	if tool == nil then
+		return ""
+	end
+	return "Held: " .. tostring(safeGet(tool, "Name"))
+end
+
+-- Armor (with and without tiers) and clothes rows: item names from the ItemId of every worn part.
+local function readGear(character: any): (string, string, string)
+	local folder: any = child(character, CONFIG.WearFolder)
+	if folder == nil then
+		return "", "", ""
+	end
+	local seenParts: { [string]: boolean } = {}
+	local seenItems: { [string]: boolean } = {}
+	local armor: { string } = {}
+	local armorPlain: { string } = {}
+	local clothes: { string } = {}
+	for _, part in safeChildren(folder) do
+		local name = tostring(safeGet(part, "Name"))
+		if not seenParts[name] then
+			seenParts[name] = true
+			local itemId = attribute(part, CONFIG.ItemIdAttribute)
+			if itemId ~= nil and not seenItems[itemId] then
+				seenItems[itemId] = true
+				local tier = tierOf(itemId)
+				local text = capitalize(prettify(itemId))
+				if (tier ~= nil and tier >= 2) or string.find(name, "armor", 1, true) ~= nil then
+					table.insert(armorPlain, text)
+					table.insert(armor, if tier ~= nil then text .. " T" .. tostring(tier) else text)
+				else
+					table.insert(clothes, text)
+				end
+			end
+		end
+	end
+	return joinLabels("Armor", armor), joinLabels("Armor", armorPlain), joinLabels("Clothes", clothes)
+end
+
+-- Backpack row: names of the models in the pack folder.
+local function readPack(character: any): string
+	local folder: any = child(character, CONFIG.PackFolder)
+	if folder == nil then
+		return ""
+	end
+	local labels: { string } = {}
+	for _, item in safeChildren(folder) do
+		table.insert(labels, tostring(safeGet(item, "Name")))
+	end
+	return joinLabels("Pack", labels)
+end
+
+-- Holster row: weapon id of every holstered model (falls back to the model name).
+local function readHolster(character: any): string
+	local folder: any = child(character, CONFIG.HolsterFolder)
+	if folder == nil then
+		return ""
+	end
+	local labels: { string } = {}
+	for _, item in safeChildren(folder) do
+		table.insert(labels, prettify(attribute(item, CONFIG.HolsterItemAttribute) or tostring(safeGet(item, "Name"))))
+	end
+	return joinLabels("Holster", labels)
+end
+
+-- Re-reads the equipment rows of one target.
+local function readEquipment(target: Target, now: number)
+	target.gearAt = now
+	local model = target.model
+	if target.kind == "player" then
+		target.held = readHeld(model)
+		target.armor, target.armorPlain, target.clothes = readGear(model)
+		target.pack = readPack(model)
+		target.holster = readHolster(model)
+	elseif target.kind == "npc" then
+		local weapon = attribute(model, CONFIG.WeaponAttribute)
+		target.held = if weapon ~= nil then "Held: " .. prettify(weapon) else ""
+	end
+end
+
+-- ===== Targets (players, bots, sleepers) =====
+
+-- Builds one target for a model, or nil when it is out of range, dead or has no usable part.
+local function makeTarget(kind: string, name: string, model: any, cameraPos: vector, limitSq: number, static: boolean): Target?
+	local root: any = findRoot(model)
+	if root == nil then
+		return nil
+	end
+	local position: any = safeGet(root, "Position")
+	if typeof(position) ~= "vector" then
+		return nil
+	end
+	local dx = position.x - cameraPos.x
+	local dy = position.y - cameraPos.y
+	local dz = position.z - cameraPos.z
+	local distSq = dx * dx + dy * dy + dz * dz
+	if distSq > limitSq then
+		return nil
+	end
+
+	local humanoid: any = childOfClass(model, "Humanoid")
+	local health = -1
+	local maxHealth = 100
+	if humanoid ~= nil then
+		local value: any = safeGet(humanoid, "Health")
+		if type(value) == "number" then
+			health = value
+		end
+		local maxValue: any = safeGet(humanoid, "MaxHealth")
+		if type(maxValue) == "number" and maxValue > 0 then
+			maxHealth = maxValue
+		end
+	end
+	if kind == "npc" then
+		if (humanoid ~= nil and health >= 0 and health <= 0) or attribute(model, "Dead") == "true" then
+			return nil
+		end
+	end
+
+	local bits = headerBits()
+	local target: Target = {
+		kind = kind,
+		model = model,
+		name = name,
+		nameColor = if kind == "player" then COLORS.Player elseif kind == "sleeper" then COLORS.Sleeper else COLORS.Npc,
+		root = root,
+		humanoid = humanoid,
+		static = static,
+		ready = static, -- moving targets wait for PostLocal's first position read
+		dead = false,
+		position = position,
+		distSq = distSq,
+		nextUpdate = 0,
+		gearAt = -1000,
+		health = health,
+		maxHealth = maxHealth,
+		hpColor = if health >= 0 then healthColor(health, maxHealth) else COLORS.Player,
+		lastHp = math.floor(health),
+		lastDist = math.floor(math.sqrt(distSq)),
+		lastBits = bits,
+		headA = "",
+		headB = "",
+		held = "",
+		armor = "",
+		armorPlain = "",
+		clothes = "",
+		pack = "",
+		holster = "",
+	}
+	buildHeader(target, bits)
+	return target
+end
+
+-- Returns the camera position and the squared range of a range flag, or nil without a camera.
+local function rangeOf(flag: string, margin: number): (vector?, number)
+	local camera: any = Workspace.CurrentCamera
+	if camera == nil then
+		return nil, 0
+	end
+	local limit: number = (Flags[flag] :: number) + margin
+	return camera.Position, limit * limit
+end
+
+-- Syncs players and bots: keeps existing entries (no flicker), adds new ones, drops vanished ones.
+local function syncLive()
+	local cameraPos, playerSq = rangeOf("playerDist", 50)
+	local _, npcSq = rangeOf("npcDist", 50)
+	if cameraPos == nil then
+		return
+	end
+	local old = Live
+	local list: { Target } = {}
+
+	-- Returns the live entry that already wraps this model.
+	local function existing(model: any): Target?
+		for _, target in old do
+			if target.model == model and not target.dead then
+				return target
+			end
+		end
+		return nil
+	end
+
+	if Flags.playersOn == true then
+		local showSelf = Flags.showSelf == true
+		local localPlayer: any = Players.LocalPlayer
+		for _, player in safeChildren(Players) do
+			if showSelf or player ~= localPlayer then
+				local character: any = safeGet(player, "Character")
+				if character ~= nil then
+					local target = existing(character)
+					if target ~= nil then
+						if target.distSq <= playerSq * 1.44 then
+							table.insert(list, target)
+						end
+					else
+						target = makeTarget("player", tostring(safeGet(player, "DisplayName")), character, cameraPos, playerSq, false)
+						if target ~= nil then
+							table.insert(list, target)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if Flags.npcsOn == true then
+		local folder: any = child(Workspace, CONFIG.NpcFolder)
+		if folder ~= nil then
+			for _, npc in safeChildren(folder) do
+				local target = existing(npc)
+				if target ~= nil then
+					if target.distSq <= npcSq * 1.44 then
+						table.insert(list, target)
+					end
+				else
+					local name = capitalize(prettify(attribute(npc, CONFIG.NpcKindAttribute) or tostring(safeGet(npc, "Name"))))
+					target = makeTarget("npc", name, npc, cameraPos, npcSq, false)
+					if target ~= nil then
+						table.insert(list, target)
+					end
+				end
+			end
+		end
+	end
+	Live = list
+end
+
+-- Rebuilds the (static) sleeper list.
+local function syncSleepers()
+	local list: { Target } = {}
+	local cameraPos, sleeperSq = rangeOf("sleeperDist", 50)
+	local folder: any = child(Workspace, CONFIG.SleeperFolder)
+	if cameraPos ~= nil and folder ~= nil and Flags.sleepersOn == true then
+		for _, sleeper in safeChildren(folder) do
+			local name = attribute(sleeper, CONFIG.SleeperNameAttribute) or tostring(safeGet(sleeper, "Name"))
+			local target = makeTarget("sleeper", name, sleeper, cameraPos, sleeperSq, true)
+			if target ~= nil then
+				table.insert(list, target)
+			end
+		end
+	end
+	Sleepers = list
+end
+
+local equipCursor = 1
+
+-- Re-reads the equipment of the next targets in turn, until the time budget of this tick is used up.
+local function stepEquipment(now: number, deadline: number)
+	local count = #Live
+	local interval = (Flags.refreshMs :: number) / 1000
+	for _ = 1, count do
+		if equipCursor > count then
+			equipCursor = 1
+		end
+		local target = Live[equipCursor]
+		equipCursor += 1
+		if not target.dead and now - target.gearAt >= interval then
+			readEquipment(target, now)
+			if os.clock() >= deadline then
+				return
+			end
+		end
+	end
+end
+
+-- ===== Time-sliced scans (ground items, world objects) =====
+
+-- Runs a scan until the deadline; returns true once every job is finished.
+local function stepScan(scan: Scan, deadline: number): boolean
+	while scan.jobIndex <= #scan.jobs do
+		local job = scan.jobs[scan.jobIndex]
+		local items = job.items
+		local processed = 0
+		while scan.itemIndex <= #items do
+			job.process(items[scan.itemIndex])
+			scan.itemIndex += 1
+			processed += 1
+			if processed % 4 == 0 and os.clock() >= deadline then
+				return false
+			end
+		end
+		scan.jobIndex += 1
+		scan.itemIndex = 1
+	end
+	return true
+end
+
+-- Starts a scan of pickups and dropped items near the camera.
+local function startGroundScan(): Scan?
+	local cameraPos, limitSq = rangeOf("itemDist", 50)
+	if cameraPos == nil then
+		return nil
+	end
+	local out: { GroundEntry } = {}
+	local jobs: { ScanJob } = {}
+	local showAmount = Flags.showAmount == true
+	local showDist = Flags.showDist == true
+
+	-- Squared distance from the camera.
+	local function distanceSq(position: vector): number
+		local dx = position.x - cameraPos.x
+		local dy = position.y - cameraPos.y
+		local dz = position.z - cameraPos.z
+		return dx * dx + dy * dy + dz * dz
+	end
+
+	if Flags.pickupsOn == true then
+		local folder: any = child(Workspace, CONFIG.PickupFolder)
+		if folder ~= nil then
+			table.insert(jobs, {
+				items = safeChildren(folder),
+				process = function(pickup: any)
+					local part: any = childOfClass(pickup, "MeshPart")
+					local position: any = if part ~= nil then safeGet(part, "Position") else nil
+					if typeof(position) ~= "vector" then
+						return
+					end
+					local distSq = distanceSq(position)
+					if distSq > limitSq then
+						return
+					end
+					local kind = string.lower(attribute(pickup, CONFIG.PickupTypeAttribute) or tostring(safeGet(pickup, "Name")))
+					local base = capitalize(prettify(kind))
+					if showAmount then
+						local amount = tonumber(attribute(pickup, CONFIG.PickupAmountAttribute))
+						if amount ~= nil then
+							base ..= " x" .. tostring(math.floor(amount))
+						end
+					end
+					table.insert(out, {
+						group = "pickups",
+						flag = if KnownPickup[kind] then "type_" .. kind else "type_other",
+						base = base,
+						position = position,
+						distSq = distSq,
+						text = if showDist then base .. " [" .. tostring(math.floor(math.sqrt(distSq))) .. "m]" else base,
+						color = PICKUP_COLORS[kind] or COLORS.PickupOther,
+					})
+				end,
+			})
+		end
+	end
+
+	if Flags.droppedOn == true then
+		local folder: any = child(Workspace, CONFIG.WorldItemFolder)
+		if folder ~= nil then
+			table.insert(jobs, {
+				items = safeChildren(folder),
+				process = function(item: any)
+					local position = positionOf(item)
+					if position == nil then
+						return
+					end
+					local distSq = distanceSq(position)
+					if distSq > limitSq then
+						return
+					end
+					local base = capitalize(prettify(firstAttribute(item, CONFIG.WorldItemAttributes) or tostring(safeGet(item, "Name"))))
+					if showAmount then
+						local amount = tonumber(firstAttribute(item, CONFIG.AmountAttributes))
+						if amount ~= nil then
+							base ..= " x" .. tostring(math.floor(amount))
+						end
+					end
+					table.insert(out, {
+						group = "dropped",
+						flag = "",
+						base = base,
+						position = position,
+						distSq = distSq,
+						text = if showDist then base .. " [" .. tostring(math.floor(math.sqrt(distSq))) .. "m]" else base,
+						color = COLORS.Dropped,
+					})
+				end,
+			})
+		end
+	end
+
+	return {
+		jobs = jobs,
+		jobIndex = 1,
+		itemIndex = 1,
+		finish = function()
+			SnapGround = out
+		end,
+	}
+end
+
+-- Returns the position of a recycler model (marker parts first, then any part).
+local function recyclerPosition(model: any): vector?
+	for _, name in { "Marker_Prompt", "Body", "Hopper", "Frame" } do
+		local part: any = child(model, name)
+		if part ~= nil then
+			local position: any = safeGet(part, "Position")
+			if typeof(position) == "vector" then
+				return position
+			end
+		end
+	end
+	return positionOf(model)
+end
+
+-- Walks the monuments (one level of garages) and the workspace top for recycler models.
+local function scanRecyclers(): { RecyclerInfo }
+	local out: { RecyclerInfo } = {}
+	local taken: { any } = {}
+
+	-- Adds one recycler model once (a model reachable through two paths is only counted once).
+	local function take(model: any)
+		for _, other in taken do
+			if other == model then
+				return
+			end
+		end
+		table.insert(taken, model)
+		local kind = attribute(model, "Kind")
+		if kind ~= nil and kind ~= "recycler" then
+			return
+		end
+		if kind == nil and child(model, "Marker_Prompt") == nil then
+			return
+		end
+		local pose = readPose(model)
+		local position = recyclerPosition(model)
+		if position == nil then
+			return
+		end
+		local parent: any = safeGet(model, "Parent")
+		local fallback = if parent ~= nil then tostring(safeGet(parent, "Name")) else CONFIG.RecyclerName
+		local place: string = attribute(model, "Monument") or attribute(model, "RecyclerId") or fallback
+		table.insert(out, {
+			position = position,
+			label = place,
+			on = attribute(model, "On") == "true",
+			poses = if pose ~= nil then { pose } else {},
+			height = if pose ~= nil then poseHeight(pose) else 3,
+		})
+	end
+
+	local map: any = child(Workspace, CONFIG.MapFolder)
+	local monuments: any = if map ~= nil then child(map, CONFIG.MonumentFolder) else nil
+	if monuments ~= nil then
+		for _, monument in safeChildren(monuments) do
+			local direct: any = child(monument, CONFIG.RecyclerName)
+			if direct ~= nil then
+				take(direct)
+			end
+			for _, sub in safeChildren(monument) do
+				local nested: any = child(sub, CONFIG.RecyclerName)
+				if nested ~= nil then
+					take(nested)
+				end
+			end
+		end
+	end
+	for _, top in safeChildren(Workspace) do
+		if safeGet(top, "Name") == CONFIG.RecyclerName then
+			take(top)
+		end
+	end
+	return out
+end
+
+-- Label of a player-placed object, with its power / lock / lit state when it has one.
+local function baseLabel(def: { cat: string, label: string, color: Color3 }, model: any): string
+	local label = def.label
+	if def.cat == "turrets" or def.cat == "power" then
+		local power = attribute(model, "PowerOn")
+		if power ~= nil then
+			label ..= if power == "true" then " [on]" else " [off]"
+		end
+	elseif def.cat == "storage" then
+		if attribute(model, "Locked") == "true" then
+			label ..= " [locked]"
+		end
+	elseif def.cat == "furnaces" then
+		if attribute(model, "Lit") == "true" then
+			label ..= " [lit]"
+		end
+	elseif def.cat == "bags" then
+		local owner = attribute(model, "BagName")
+		if owner ~= nil then
+			label ..= " - " .. owner
+		end
+	end
+	return label
+end
+
+-- Starts a scan of ore nodes, crates, airdrops and recyclers near the camera.
+local function startWorldScan(): Scan?
+	local cameraPos, limitSq = rangeOf("worldDist", 50)
+	if cameraPos == nil then
+		return nil
+	end
+	local _, baseSq = rangeOf("baseDist", 50)
+	local out: { WorldEntry } = {}
+	local jobs: { ScanJob } = {}
+	local showDist = Flags.showDist == true
+
+	-- Squared distance from the camera.
+	local function distanceSq(position: vector): number
+		local dx = position.x - cameraPos.x
+		local dy = position.y - cameraPos.y
+		local dz = position.z - cameraPos.z
+		return dx * dx + dy * dy + dz * dz
+	end
+
+	if Flags.baseOn == true then
+		local folder: any = child(Workspace, CONFIG.DeployableFolder)
+		if folder ~= nil then
+			table.insert(jobs, {
+				items = safeChildren(folder),
+				process = function(object: any)
+					local def = BASE_KINDS[tostring(safeGet(object, "Name"))]
+					if def == nil or Flags["base_" .. def.cat] ~= true then
+						return
+					end
+					local near = positionOf(object)
+					if near == nil or distanceSq(near) > baseSq then
+						return
+					end
+					local pose = readPose(object)
+					local position: vector = if pose ~= nil then pose.Position else near
+					local distSq = distanceSq(position)
+					local label = baseLabel(def, object)
+					table.insert(out, {
+						group = "base",
+						flag = "base_" .. def.cat,
+						label = label,
+						sub = "",
+						infoKey = "",
+						height = if pose ~= nil then poseHeight(pose) else 2,
+						color = def.color,
+						position = position,
+						distSq = distSq,
+						text = entryText(label, distSq, showDist),
+						poses = if pose ~= nil then { pose } else {},
+					})
+				end,
+			})
+		end
+	end
+
+	if Flags.oreOn == true then
+		local folder: any = child(Workspace, CONFIG.NodeFolder)
+		local onlyUnmined = Flags.oreUnmined == true
+		if folder ~= nil then
+			table.insert(jobs, {
+				items = safeChildren(folder),
+				process = function(node: any)
+					local def = ORE_KINDS[tostring(safeGet(node, "Name"))]
+					if def == nil or Flags["ore_" .. def.key] ~= true then
+						return
+					end
+					-- A metal / sulfur node keeps its Ore child only while it can still be mined; stone never has one.
+					if onlyUnmined and def.key ~= "stone" and child(node, "Ore") == nil then
+						return
+					end
+					local pose = readPose(node)
+					local position: vector? = if pose ~= nil then pose.Position else positionOf(node)
+					if position == nil then
+						return
+					end
+					local distSq = distanceSq(position)
+					if distSq > limitSq then
+						return
+					end
+					local label = def.label
+					local hp = tonumber(attribute(node, CONFIG.HpAttribute))
+					local maxHp = tonumber(attribute(node, CONFIG.MaxHpAttribute))
+					if hp ~= nil and maxHp ~= nil and maxHp > 0 and hp < maxHp then
+						label = string.format("%s  %.0f%%", def.label, 100 * hp / maxHp)
+					end
+					table.insert(out, {
+						group = "ore",
+						flag = "ore_" .. def.key,
+						label = label,
+						sub = "",
+						infoKey = "",
+						height = if pose ~= nil then poseHeight(pose) else 3,
+						color = def.color,
+						position = position,
+						distSq = distSq,
+						text = entryText(label, distSq, showDist),
+						poses = if pose ~= nil then { pose } else {},
+					})
+				end,
+			})
+		end
+	end
+
+	if Flags.lootOn == true then
+		local hideOpen = Flags.lootHideOpen == true
+		for _, folderName in { CONFIG.LootFolder, CONFIG.AirdropFolder } do
+			local folder: any = child(Workspace, folderName)
+			if folder ~= nil then
+				table.insert(jobs, {
+					items = safeChildren(folder),
+					process = function(crate: any)
+						local def = CRATE_KINDS[tostring(safeGet(crate, "Name"))]
+						if def == nil or Flags["loot_" .. def.key] ~= true then
+							return
+						end
+						if hideOpen and attribute(crate, CONFIG.OpenAttribute) == "true" then
+							return
+						end
+						local pose = readPose(crate)
+						local position: vector? = if pose ~= nil then pose.Position else positionOf(crate)
+						if position == nil then
+							return
+						end
+						local distSq = distanceSq(position)
+						if distSq > limitSq then
+							return
+						end
+						table.insert(out, {
+							group = "loot",
+							flag = "loot_" .. def.key,
+							label = def.label,
+							sub = "",
+							infoKey = def.tbl,
+							height = if pose ~= nil then poseHeight(pose) else 3,
+							color = def.color,
+							position = position,
+							distSq = distSq,
+							text = entryText(def.label, distSq, showDist),
+							poses = if pose ~= nil then { pose } else {},
+						})
+					end,
+				})
+			end
+		end
+	end
+
+	return {
+		jobs = jobs,
+		jobIndex = 1,
+		itemIndex = 1,
+		finish = function()
+			if Flags.recyclerOn == true then
+				for _, recycler in Recyclers do
+					local distSq = distanceSq(recycler.position)
+					if distSq <= limitSq then
+						local label = "Recycler - " .. recycler.label
+						table.insert(out, {
+							group = "recycler",
+							flag = "",
+							label = label,
+							sub = if recycler.on then "running" else "",
+							infoKey = "",
+							height = recycler.height,
+							color = COLORS.Recycler,
+							position = recycler.position,
+							distSq = distSq,
+							text = entryText(label, distSq, showDist),
+							poses = recycler.poses,
+						})
+					end
+				end
+			end
+			table.sort(out, function(a: WorldEntry, b: WorldEntry): boolean
+				return a.distSq < b.distSq
+			end)
+			-- Only the nearest crates get the second info line, so the screen stays legible.
+			if Flags.lootInfo == true then
+				local linesLeft = CONFIG.LootInfoLines
+				for _, entry in out do
+					if entry.group == "loot" and linesLeft > 0 then
+						linesLeft -= 1
+						entry.sub = lootInfo(entry.infoKey)
+					end
+				end
+			end
+			SnapWorld = out
+		end,
+	}
+end
+
+
+-- ===== Menu =====
+
+local ui: any = UI.new({
+	Title = "WORLD VIEW",
+	Key = "RightShift",
+	Flags = Flags,
+	Stat = {
+		Label = "Targets",
+		Value = function(): string
+			return tostring(#Live + #Sleepers) .. " / " .. tostring(#SnapGround + #SnapWorld)
+		end,
+	},
+})
+
+local playersTab = ui:tab("Players")
+playersTab:section({ Title = "ESP" })
+playersTab:toggle({ Name = "Players", Flag = "playersOn", Default = true })
+playersTab:toggle({ Name = "Sleepers", Flag = "sleepersOn", Default = false })
+playersTab:toggle({ Name = "Bots", Flag = "npcsOn", Default = false })
+playersTab:toggle({ Name = "Include myself", Flag = "showSelf", Default = false })
+playersTab:section({ Title = "INFO", Divider = true })
+playersTab:dropdown({
+	Name = "Info rows",
+	All = "All rows",
+	Items = {
+		{ Name = "Name", Flag = "showName", Default = true },
+		{ Name = "Health", Flag = "showHealth", Default = true },
+		{ Name = "Distance", Flag = "showDist", Default = true },
+		{ Name = "Held item", Flag = "showHeld", Default = true },
+		{ Name = "Armor", Flag = "showArmor", Default = true },
+		{ Name = "Armor tier", Flag = "showTier", Default = true },
+		{ Name = "Clothes", Flag = "showClothes", Default = false },
+		{ Name = "Backpack", Flag = "showPack", Default = false },
+		{ Name = "Holstered guns", Flag = "showHolster", Default = false },
+	},
+})
+playersTab:toggle({ Name = "Hide empty rows", Flag = "hideEmpty", Default = true })
+
+local resourcesTab = ui:tab("Resources")
+resourcesTab:section({ Title = "ORE" })
+resourcesTab:toggle({ Name = "Ore", Flag = "oreOn", Default = false })
+resourcesTab:dropdown({
+	Name = "Ore types",
+	All = "All ore",
+	Items = {
+		{ Name = "Metal", Flag = "ore_metal", Default = true },
+		{ Name = "Sulfur", Flag = "ore_sulfur", Default = true },
+		{ Name = "Stone", Flag = "ore_stone", Default = false },
+	},
+})
+resourcesTab:toggle({ Name = "Only unmined", Flag = "oreUnmined", Default = true })
+
+local pickupItems: { any } = {}
+for _, kind in PICKUP_TYPES do
+	table.insert(pickupItems, { Name = capitalize(kind), Flag = "type_" .. kind, Default = true })
+end
+table.insert(pickupItems, { Name = "Other", Flag = "type_other", Default = true })
+
+resourcesTab:section({ Title = "PICKUPS", Divider = true })
+resourcesTab:toggle({ Name = "Pickups", Flag = "pickupsOn", Default = false })
+resourcesTab:dropdown({ Name = "Pickup types", All = "All types", Items = pickupItems })
+resourcesTab:toggle({ Name = "Show amount", Flag = "showAmount", Default = true })
+resourcesTab:section({ Title = "DROPPED", Divider = true })
+resourcesTab:toggle({ Name = "Dropped items", Flag = "droppedOn", Default = false })
+
+local lootTab = ui:tab("Loot")
+lootTab:section({ Title = "CONTAINERS" })
+lootTab:toggle({ Name = "Loot", Flag = "lootOn", Default = false })
+lootTab:dropdown({
+	Name = "Container types",
+	All = "All containers",
+	Items = {
+		{ Name = "Wooden", Flag = "loot_wooden", Default = true },
+		{ Name = "Military", Flag = "loot_military", Default = true },
+		{ Name = "Elite", Flag = "loot_elite", Default = true },
+		{ Name = "Barrel", Flag = "loot_barrel", Default = true },
+		{ Name = "Locked", Flag = "loot_locked", Default = true },
+		{ Name = "Heli", Flag = "loot_heli", Default = true },
+		{ Name = "Airdrop", Flag = "loot_airdrop", Default = true },
+	},
+})
+lootTab:toggle({ Name = "Hide opened", Flag = "lootHideOpen", Default = true })
+lootTab:toggle({ Name = "Info line", Flag = "lootInfo", Default = false })
+lootTab:section({ Title = "MACHINES", Divider = true })
+lootTab:toggle({ Name = "Recyclers", Flag = "recyclerOn", Default = false })
+
+local baseTab = ui:tab("Base")
+baseTab:section({ Title = "PLAYER-PLACED" })
+baseTab:toggle({ Name = "Base objects", Flag = "baseOn", Default = false })
+baseTab:dropdown({
+	Name = "Categories",
+	All = "All objects",
+	Items = {
+		{ Name = "Turrets and traps", Flag = "base_turrets", Default = true },
+		{ Name = "Boxes and cupboards", Flag = "base_storage", Default = true },
+		{ Name = "Backpacks", Flag = "base_backpacks", Default = true },
+		{ Name = "Furnaces", Flag = "base_furnaces", Default = false },
+		{ Name = "Workbenches", Flag = "base_benches", Default = false },
+		{ Name = "Power", Flag = "base_power", Default = false },
+		{ Name = "Sleeping bags", Flag = "base_bags", Default = false },
+	},
+})
+
+local rangesTab = ui:tab("Ranges")
+rangesTab:section({ Title = "DISTANCE" })
+rangesTab:slider({ Name = "PLAYERS", Flag = "playerDist", Min = 100, Max = 3000, Step = 100, Default = 3000, Suffix = " st" })
+rangesTab:slider({ Name = "SLEEPERS", Flag = "sleeperDist", Min = 100, Max = 3000, Step = 100, Default = 500, Suffix = " st" })
+rangesTab:slider({ Name = "BOTS", Flag = "npcDist", Min = 100, Max = 3000, Step = 100, Default = 1000, Suffix = " st" })
+rangesTab:slider({ Name = "ORE / LOOT / RECYCLERS", Flag = "worldDist", Min = 50, Max = 1000, Step = 10, Default = 300, Suffix = " st" })
+rangesTab:slider({ Name = "BASE OBJECTS", Flag = "baseDist", Min = 50, Max = 1500, Step = 50, Default = 300, Suffix = " st" })
+rangesTab:slider({ Name = "PICKUPS / DROPPED", Flag = "itemDist", Min = 50, Max = 2000, Step = 50, Default = 300, Suffix = " st" })
+
+local settingsTab = ui:tab("Settings")
+settingsTab:section({ Title = "TEXT" })
+settingsTab:slider({ Name = "TEXT SIZE", Flag = "textSize", Min = 10, Max = 20, Step = 1, Default = 13 })
+settingsTab:slider({ Name = "SLEEPER TEXT HEIGHT", Flag = "sleeperLift", Min = 0, Max = 10, Step = 1, Default = 2, Suffix = " st" })
+settingsTab:section({ Title = "WORLD STYLE", Divider = true })
+settingsTab:toggle({ Name = "Chams", Flag = "chamsOn", Default = true })
+settingsTab:section({ Title = "PERFORMANCE", Divider = true })
+settingsTab:slider({ Name = "EQUIPMENT REFRESH", Flag = "refreshMs", Min = 250, Max = 3000, Step = 250, Default = 1000, Suffix = " ms" })
+
+-- ===== Events =====
+
+local NEAR_SQ = CONFIG.NearRange * CONFIG.NearRange
+local lastRoster = -1000
+local lastSlow = -1000
+local lastRecyclers = -1000
+local lastModelStep = 0
+local lastTextUpdate = 0
+local groundScan: Scan? = nil
+local worldScan: Scan? = nil
+
+-- Model step: roster syncs, scans and equipment reads, all sliced to a small time budget per tick.
+local function modelStep(now: number)
+	lastModelStep = now
+	if now - lastRoster >= CONFIG.RosterRate then
+		lastRoster = now
+		syncLive()
+	end
+	if now - lastSlow >= CONFIG.SlowRate then
+		lastSlow = now
+		syncSleepers()
+		if Flags.recyclerOn == true and now - lastRecyclers >= CONFIG.RecyclerRate then
+			lastRecyclers = now
+			Recyclers = scanRecyclers()
+		end
+		if groundScan == nil then
+			groundScan = startGroundScan()
+		end
+		if worldScan == nil then
+			worldScan = startWorldScan()
+		end
+	end
+
+	stepEquipment(now, os.clock() + CONFIG.SliceBudget)
+
+	local ground = groundScan
+	if ground ~= nil and stepScan(ground, os.clock() + CONFIG.SliceBudget) then
+		ground.finish()
+		groundScan = nil
+	end
+	local world = worldScan
+	if world ~= nil and stepScan(world, os.clock() + CONFIG.SliceBudget) then
+		world.finish()
+		worldScan = nil
+	end
+end
+
+-- Model step: character / world models are read here.
+RunService.PostModel:Connect(function()
+	modelStep(os.clock())
+end)
+
+-- Refreshes position, health and distance of one target and rebuilds its header only when something changed.
+local function refreshTarget(target: Target, cameraPos: vector, now: number, bits: number)
+	if not target.static then
+		if now < target.nextUpdate then
+			return
+		end
+		target.nextUpdate = now + (if target.distSq < NEAR_SQ then 0 else CONFIG.FarInterval)
+		local position: any = safeGet(target.root, "Position")
+		if typeof(position) ~= "vector" then
+			target.dead = true
+			target.ready = false
+			return
+		end
+		target.position = position
+		target.ready = true
+		if target.humanoid ~= nil then
+			local value: any = safeGet(target.humanoid, "Health")
+			if type(value) == "number" then
+				target.health = value
+			end
+		end
+	end
+	local dx = target.position.x - cameraPos.x
+	local dy = target.position.y - cameraPos.y
+	local dz = target.position.z - cameraPos.z
+	local distSq = dx * dx + dy * dy + dz * dz
+	target.distSq = distSq
+
+	local hp = math.floor(target.health)
+	local dist = math.floor(math.sqrt(distSq))
+	if hp ~= target.lastHp or dist ~= target.lastDist or bits ~= target.lastBits then
+		if hp ~= target.lastHp and target.health >= 0 then
+			target.hpColor = healthColor(target.health, target.maxHealth)
+		end
+		target.lastHp = hp
+		target.lastDist = dist
+		target.lastBits = bits
+		buildHeader(target, bits)
+	end
+end
+
+-- Local step: menu input, camera, positions, health and distances; also drives the model step if PostModel stalls.
+RunService.PostLocal:Connect(function()
+	ui:update()
+	local now = os.clock()
+	if now - lastModelStep > CONFIG.FallbackAfter then
+		modelStep(now)
+	end
+
+	local camera: any = Workspace.CurrentCamera
+	if camera == nil then
+		return
+	end
+	Camera = camera
+	Chams.SetCamera(camera)
+	local cameraPos: vector = camera.Position
+	local bits = headerBits()
+	for _, target in Live do
+		refreshTarget(target, cameraPos, now, bits)
+	end
+	for _, target in Sleepers do
+		refreshTarget(target, cameraPos, now, bits)
+	end
+
+	-- Static world entries: distances every tick, label strings four times a second.
+	local updateText = now - lastTextUpdate >= 0.25
+	if updateText then
+		lastTextUpdate = now
+	end
+	local showDist = Flags.showDist == true
+	for _, entry in SnapGround do
+		local dx = entry.position.x - cameraPos.x
+		local dy = entry.position.y - cameraPos.y
+		local dz = entry.position.z - cameraPos.z
+		entry.distSq = dx * dx + dy * dy + dz * dz
+		if updateText then
+			entry.text = if showDist then entry.base .. " [" .. tostring(math.floor(math.sqrt(entry.distSq))) .. "m]" else entry.base
+		end
+	end
+	for _, entry in SnapWorld do
+		local dx = entry.position.x - cameraPos.x
+		local dy = entry.position.y - cameraPos.y
+		local dz = entry.position.z - cameraPos.z
+		entry.distSq = dx * dx + dy * dy + dz * dz
+		if updateText then
+			entry.text = entryText(entry.label, entry.distSq, showDist)
+		end
+	end
+end)
+
+-- ===== Drawing =====
+
+-- Draws one text line centered at x.
+local function drawText(x: number, y: number, size: number, color: Color3, text: string)
+	DrawingImmediate.OutlinedText(vector.create(x, y, 0), size, color, 1, text, true, CONFIG.Font)
+end
+
+-- Draws one info row and returns the next line index; empty rows are skipped or replaced by a placeholder.
+local function drawRow(x: number, y: number, line: number, color: Color3, text: string, emptyText: string): number
+	local shown = text
+	if shown == "" then
+		if ViewState.hideEmpty then
+			return line
+		end
+		shown = emptyText
+	end
+	drawText(x, y + line * (ViewState.size + 2), ViewState.size, color, shown)
+	return line + 1
+end
+
+-- Draws one target: header (name / distance with health in front) and the equipment rows.
+local function drawTarget(target: Target, camera: any)
+	local position = target.position
+	local offset = if target.kind == "sleeper" then ViewState.sleeperLift else CONFIG.AnchorOffset
+	local screen, visible = camera:WorldToScreenPoint(vector.create(position.x, position.y + offset, position.z))
+	if not visible then
+		return
+	end
+	local x: number = screen.x
+	local y: number = screen.y
+	local size = ViewState.size
+	local line = 0
+	if target.headA ~= "" or target.headB ~= "" then
+		if target.headA ~= "" then
+			drawText(x, y, size, target.nameColor, target.headA)
+		end
+		if target.headB ~= "" then
+			drawText(x, y, size, target.hpColor, target.headB)
+		end
+		line = 1
+	end
+	if ViewState.held then
+		line = drawRow(x, y, line, COLORS.Held, target.held, EMPTY_ROWS.Held)
+	end
+	if ViewState.armor then
+		line = drawRow(x, y, line, COLORS.Armor, if ViewState.tier then target.armor else target.armorPlain, EMPTY_ROWS.Armor)
+	end
+	if ViewState.clothes then
+		line = drawRow(x, y, line, COLORS.Clothes, target.clothes, EMPTY_ROWS.Clothes)
+	end
+	if ViewState.pack then
+		line = drawRow(x, y, line, COLORS.Pack, target.pack, EMPTY_ROWS.Pack)
+	end
+	if ViewState.holster then
+		drawRow(x, y, line, COLORS.Holster, target.holster, EMPTY_ROWS.Holster)
+	end
+end
+
+-- True when the world entry's group and type toggles are on.
+local function worldVisible(entry: WorldEntry): boolean
+	local group = entry.group
+	if group == "ore" then
+		if Flags.oreOn ~= true then
+			return false
+		end
+	elseif group == "loot" then
+		if Flags.lootOn ~= true then
+			return false
+		end
+	elseif group == "base" then
+		if Flags.baseOn ~= true then
+			return false
+		end
+	elseif Flags.recyclerOn ~= true then
+		return false
+	end
+	return entry.flag == "" or Flags[entry.flag] == true
+end
+
+-- Render step: menu + overlay, drawing only.
+RunService.Render:Connect(function()
+	ui:render()
+	local camera: any = Camera
+	if camera == nil then
+		return
+	end
+	local size = Flags.textSize :: number
+	ViewState.size = size
+	ViewState.hideEmpty = Flags.hideEmpty == true
+	ViewState.held = Flags.showHeld == true
+	ViewState.armor = Flags.showArmor == true
+	ViewState.tier = Flags.showTier == true
+	ViewState.clothes = Flags.showClothes == true
+	ViewState.pack = Flags.showPack == true
+	ViewState.holster = Flags.showHolster == true
+	ViewState.sleeperLift = Flags.sleeperLift :: number
+
+	local playerDist = Flags.playerDist :: number
+	local npcDist = Flags.npcDist :: number
+	local sleeperDist = Flags.sleeperDist :: number
+	local playerSq = playerDist * playerDist
+	local npcSq = npcDist * npcDist
+	local sleeperSq = sleeperDist * sleeperDist
+
+	local playersOn = Flags.playersOn == true
+	local npcsOn = Flags.npcsOn == true
+	for _, target in Live do
+		if target.ready then
+			if target.kind == "player" then
+				if playersOn and target.distSq <= playerSq then
+					drawTarget(target, camera)
+				end
+			elseif npcsOn and target.distSq <= npcSq then
+				drawTarget(target, camera)
+			end
+		end
+	end
+
+	if Flags.sleepersOn == true then
+		for _, target in Sleepers do
+			if target.distSq <= sleeperSq then
+				drawTarget(target, camera)
+			end
+		end
+	end
+
+	local worldDist = Flags.worldDist :: number
+	local worldSq = worldDist * worldDist
+	local baseDist = Flags.baseDist :: number
+	local baseSq = baseDist * baseDist
+	local labelSq = CONFIG.LabelRange * CONFIG.LabelRange
+	local labelsLeft = CONFIG.LabelMax
+	local chamsLeft = if Flags.chamsOn == true then CONFIG.ChamsLimit else 0
+	for _, entry in SnapWorld do
+		if entry.distSq <= (if entry.group == "base" then baseSq else worldSq) and worldVisible(entry) then
+			local position = entry.position
+			local center, centerVisible = camera:WorldToScreenPoint(position)
+			if centerVisible then
+				-- One outlined box per object, in the object's own color.
+				if chamsLeft > 0 and #entry.poses > 0 then
+					chamsLeft -= 1
+					pcall(Chams.HighlightGroup, entry.poses, entry.color, CONFIG.ChamsFill, 1, CONFIG.ChamsThickness, CONFIG.ChamsMerge)
+				end
+				if labelsLeft > 0 and entry.distSq <= labelSq then
+					labelsLeft -= 1
+					local top = camera:WorldToScreenPoint(vector.create(position.x, position.y + entry.height, position.z))
+					drawText(top.x, top.y - size - 3, size, entry.color, entry.text)
+					if entry.sub ~= "" then
+						drawText(center.x, center.y + (center.y - top.y) + 2, size - 1, entry.color, entry.sub)
+					end
+				end
+			end
+		end
+	end
+
+	local itemDist = Flags.itemDist :: number
+	local itemSq = itemDist * itemDist
+	local pickupsOn = Flags.pickupsOn == true
+	local droppedOn = Flags.droppedOn == true
+	for _, entry in SnapGround do
+		if entry.distSq <= itemSq then
+			local visibleGroup = if entry.group == "pickups" then pickupsOn and Flags[entry.flag] == true else droppedOn
+			if visibleGroup then
+				local position = entry.position
+				local screen, visible = camera:WorldToScreenPoint(vector.create(position.x, position.y + CONFIG.GroundLift, position.z))
+				if visible then
+					drawText(screen.x, screen.y, size, entry.color, entry.text)
+				end
+			end
+		end
+	end
+end)
