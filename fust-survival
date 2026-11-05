@@ -2169,7 +2169,7 @@ end
 -- ===== Menu =====
 
 local ui: any = UI.new({
-	Title = "SEVERE | FUSTSURVIVAL",
+	Title = "SEVERE | FUST SURVIVAL",
 	Key = "RightShift",
 	Flags = Flags,
 	Width = 340,
