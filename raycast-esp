@@ -1,120 +1,162 @@
 --!strict
 --!optimize 2
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
+const Players = game:GetService("Players")
+const RunService = game:GetService("RunService")
 
-local CONFIG = table.freeze({
+const CONFIG = table.freeze({
 	MaxDistance = 500, -- studs: players, parts and terrain chunks farther than this are ignored
-	CacheInterval = 4, -- seconds between part cache rebuilds in instance mode (GetDescendants is expensive)
+	SliceBudget = 0.002, -- seconds of scan work before a scan task yields with task.wait()
+
 	UseWorldScan = true, -- read parts from the world primitive array; falls back to instance mode if verification fails
-	WorldScanInterval = 1.5, -- seconds between part cache rebuilds in world mode
+	WorldScanInterval = 1.5, -- seconds between part rescans in world mode, counted from the end of the previous one
+	WorldScanTimeout = 20, -- a world scan that never finishes (error) is retried after this many seconds
+	CacheInterval = 4, -- same for instance mode (GetDescendants is expensive)
+	RefreshPerTick = 150, -- unanchored boxes re-read per PostData tick so moving parts stay current (world mode)
 	MaxPrimitives = 300000,
 	MaxPartSize = 4096, -- parts larger than this on any axis are ignored (terrain-sized primitives)
 	CharacterPartMaxRadiusSq = 400, -- only parts smaller than this are tested for character ownership
-	LogicInterval = 0.03, -- seconds between visibility checks
 	MaxTransparency = 0.8, -- parts more transparent than this do not block the ray
+	MaxBoxCells = 8, -- parts whose bounds touch more grid cells than this are tested by every ray instead
+
+	LogicInterval = 0.03, -- seconds between visibility checks; projection runs every PostLocal tick
 	TextSize = 14,
 	NameOffset = vector.create(0, 2.5, 0), -- world-space offset of the label above the head
 	NamePixelOffset = 14, -- extra screen-space pixels upward, keeps the text off the body at long range
 	TeamCheck = true, -- hide players on the local player's team
 
 	UseTerrain = true,
-	TerrainInterval = 0.1, -- seconds between terrain checks per player (the expensive part)
-	TerrainScanInterval = 3, -- seconds between terrain rescans, counted from the end of the previous one
-	TerrainScanTimeout = 20, -- a scan that never finishes (error) is retried after this many seconds
-	SliceBudget = 0.002, -- seconds of scan work before a scan task yields with task.wait()
+	TerrainScanInterval = 3, -- seconds between clump directory rebuilds and between retries of missing chunks
+	DirectoryNodesPerTick = 64, -- clump nodes read per PostModel tick while the directory is built
+	ChunksPerTick = 3, -- new chunk meshes read per PostModel tick
 	MaxTerrainChunks = 600,
 	MaxMeshBytes = 4 * 1024 * 1024,
 })
 
--- Offsets from the user's dump. Entries marked "assumed" are not in the dump.
-local OFF = table.freeze({
+-- Terrain chain from the user's dump
+const OFF = table.freeze({
 	TerrainPrimitive = 0x178,
 	PrimitiveGeometry = 0x210,
 	GeometryChunkMap = 0xA0,
 	MapHead = 0x08,
 	MapCount = 0x10,
 	ClumpNext = 0x00,
-	ClumpStates = 0x24, -- assumed: 64 state bytes, one per chunk slot (0x24 .. 0x68)
+	ClumpKey = 0x10, -- three int32: the clump key x, y, z
+	ClumpStates = 0x24, -- 64 state bytes, one per chunk slot (confirmed); non-zero means the chunk is present
 	ClumpRecords = 0x68,
 	RecordSize = 0x10,
 	RecordMesh = 0x08,
 	MeshShape = 0x10,
 	ShapeIndices = 0x38,
-	ShapeTriangleCount = 0x40, -- from charm's ChunkMeshShape notes: triangle count, index count = count * 3
 	ShapeVertices = 0x58,
-	ShapeVerticesAlt = 0x20, -- charm's layout: pointer to tightly packed world-space float3 vertices
-	ShapeVertexStride = 0x70,
-	ShapeIndexStride = 0x78,
-	ShapeBounds = 0xA0, -- min at +0, max at +12
+	ShapeVertexStride = 0x70, -- u64
+	ShapeIndexStride = 0x78, -- u64; one u32 index is stored at every step of this stride
+	ShapeNodes = 0x80, -- kd-tree (bounding interval hierarchy) node vector: begin here, end at +8 (confirmed)
+	ShapeNodesEnd = 0x88,
+	KdNodeSize = 12, -- 3 x u32
+	ShapeExtents = 0xA0, -- min floats at +0, max floats at +12 (assumed)
 })
 
 -- Offsets from theo's dump (version-5a21b87bbc2641cf) plus instance_back from the shape dump
-local WORLD = table.freeze({
+const WORLD = table.freeze({
 	WorkspaceWorld = 1016,
-	WorldPrimitives = 672, -- assumed: pointer to an array of Primitive pointers
-	DataModelPrimitiveCount = 1040, -- assumed: element count of that array
+	WorldPrimitives = 672, -- vector of Primitive pointers: begin here
+	WorldPrimitivesEnd = 680, -- end pointer; count = (end - begin) / 8
 	BasePartPrimitive = 376,
 	PrimitiveRotation = 176, -- 9 floats; position follows right after at 212
 	PrimitivePosition = 212,
 	PrimitiveSize = 452,
+	PrimitiveFlags = 446,
+	FlagAnchored = 2, -- bit 1 of the primitive flags
 	PrimitiveInstance = 0x218, -- back pointer from a primitive to its part instance
 	BasePartTransparency = 280,
 })
 
-local VISIBLE: Color3 = Color3.fromRGB(0, 255, 0)
-local HIDDEN: Color3 = Color3.fromRGB(255, 0, 0)
+const VISIBLE: Color3 = Color3.fromRGB(0, 255, 0)
+const HIDDEN: Color3 = Color3.fromRGB(255, 0, 0)
+const BOUNDS_TOLERANCE: number = 48 -- stored chunk bounds can be tighter than the real surface by 16+ studs
+const CACHEABLE: { [string]: boolean } = { Part = true, MeshPart = true, UnionOperation = true }
 
-local CACHEABLE = table.freeze({ Part = true, MeshPart = true, UnionOperation = true })
+-- Terrain chunks are exactly one 32 stud cell each; parts are indexed in the same grid
+const CELL: number = 32
+const KEY_BIAS: number = 32768
+const BOX_SIZE: number = 64 -- 16 floats: position, right, up, look, half extents, radius squared
 
-type Box = {
-	pos: vector,
-	right: vector,
-	up: vector,
-	look: vector,
-	half: vector,
-	radiusSq: number,
+-- Offsets inside the single buffer read per primitive (relative to the rotation)
+const POS_AT: number = WORLD.PrimitivePosition - WORLD.PrimitiveRotation
+const FLAGS_AT: number = WORLD.PrimitiveFlags - WORLD.PrimitiveRotation
+const SIZE_AT: number = WORLD.PrimitiveSize - WORLD.PrimitiveRotation
+const INST_AT: number = WORLD.PrimitiveInstance - WORLD.PrimitiveRotation
+const PRIM_SPAN: number = INST_AT + 8
+
+type Pacer = () -> boolean
+
+type Grid = {
+	buf: buffer, -- BOX_SIZE bytes per box
+	count: number,
+	cells: { [number]: { number } }, -- cell key -> indices of the boxes touching that cell
+	always: { number }, -- boxes tested by every ray: big parts and parts that move
+	dynIndex: { number }, -- boxes that refreshBoxes re-reads
+	dynPrim: { number }, -- and their primitive addresses
+	stamp: buffer, -- per-ray stamp per box, so a box is only tested once per ray
 }
 
 type Chunk = {
-	shape: number,
-	tri: number,
+	nodes: number, -- kd-tree node count
+	tri: number, -- triangle count
+	tree: buffer, -- raw kd-tree nodes
+	tris: buffer, -- de-indexed triangles, 9 floats each
 	center: vector,
 	half: vector,
-	vb: buffer,
-	ib: buffer,
-	vBytes: number,
-	iBytes: number,
-	vStride: number,
-	iStride: number,
 }
 
-type Entry = { name: string, pos: vector, color: Color3 }
+type Target = { player: Player, name: string, head: vector }
+type Labels = { buf: buffer, names: { string }, count: number } -- 16 bytes per label: x, y, z, hidden flag
 
-local readf32, readu16, readu32 = buffer.readf32, buffer.readu16, buffer.readu32
+const readf32, readu8, readu32, readi32 = buffer.readf32, buffer.readu8, buffer.readu32, buffer.readi32
 
-local LocalPlayer = Players.LocalPlayer :: Player
-local boxes: { Box } = {}
-local chunks: { Chunk } = {}
-local chunkCache: { [number]: Chunk } = {} -- by shape address, reused between rescans
-local terrainResult: { [Player]: { time: number, blocked: boolean } } = {}
-local snapshot: { Entry } = {} -- written in PostLocal, read in Render
-local lastParts: number = 0
-local nextTerrain: number = 0
-local lastLogic: number = 0
-local terrainLayout: number = 0 -- index into VERTEX_LAYOUTS once one has been verified
+const LocalPlayer: Player = Players.LocalPlayer :: Player
+
+local grid: Grid = {
+	buf = buffer.create(0),
+	count = 0,
+	cells = {},
+	always = {},
+	dynIndex = {},
+	dynPrim = {},
+	stamp = buffer.create(0),
+} -- written by part scans, refreshed in PostData, read in PostLocal
+const chunkCache: { [number]: Chunk | number } = {} -- cell key -> loaded chunk, or the time to retry a missing one
+const chunkPending: { [number]: boolean } = {}
+local chunkQueue: { number } = {}
+local queueHead: number = 1
+local loadedChunks: number = 0
+local directory: { [number]: number } = {} -- clump key -> clump node address
+local walkActive: boolean = false
+local walkClump: number = 0
+local walkHead: number = 0
+local walkLeft: number = 0
+local walkDirectory: { [number]: number } = {}
+local targets: { Target } = {} -- written in PostData
+local labels: Labels = { buf = buffer.create(0), names = {}, count = 0 } -- written in PostLocal, drawn in Render
+const blocked: { [Player]: boolean } = {}
+
+local nextParts: number = 0
+local nextWalk: number = 0
+local lastOcclusion: number = 0
+local refreshCursor: number = 0
+local rayId: number = 0
 local worldState: "unknown" | "ok" | "failed" = "unknown"
 local worldColMajor: boolean = false -- detected during calibration
 
 local function getHead(player: Player): BasePart?
-	local character = player.Character
+	const character = player.Character
 	if not character then return nil end
 	return character:FindFirstChild("Head") :: BasePart?
 end
 
 local function getCameraPos(): vector?
-	local camera = workspace.CurrentCamera
+	const camera = workspace.CurrentCamera
 	if not camera then return nil end
 	return camera.CFrame.Position
 end
@@ -128,37 +170,160 @@ local function addressOf(inst: Instance): number?
 	return tonumber(inst.Data) or tonumber(inst.Data, 16)
 end
 
--- Yields once the current slice of work exceeds the budget; returns the start of the next slice
-local function pace(slice: number): number
-	if os.clock() - slice < CONFIG.SliceBudget then return slice end
-	task.wait()
-	return os.clock()
+-- Returns a function that yields with task.wait() once its slice exceeds the budget; true if it yielded
+local function newPacer(): Pacer
+	local start: number = os.clock()
+	return function(): boolean
+		if os.clock() - start < CONFIG.SliceBudget then return false end
+		task.wait()
+		start = os.clock()
+		return true
+	end
 end
 
 local function getCharacters(): { Instance }
-	local characters: { Instance } = {}
+	const characters: { Instance } = {}
 	for _, obj in Players:GetChildren() do
-		local character = (obj :: Player).Character
+		const character = (obj :: Player).Character
 		if character then characters[#characters + 1] = character end
 	end
 	return characters
 end
 
--- Instance mode: walks Workspace descendants; one synchronous pass, so nothing can go stale mid-scan
+-- Clips the ray interval [t0, t1] against one slab; a miss leaves t0 > t1
+local function clip(o: number, d: number, h: number, t0: number, t1: number): (number, number)
+	if math.abs(d) < 1e-6 then
+		if o < -h or o > h then return 1, 0 end
+		return t0, t1
+	end
+	local a: number = (-h - o) / d
+	local b: number = (h - o) / d
+	if a > b then a, b = b, a end
+	return math.max(t0, a), math.min(t1, b)
+end
+
+-- PARTS ---------------------------------------------------------------------------------------
+-- Boxes live in one buffer. Parts that stay put are indexed in a 32 stud grid, so a ray only tests the
+-- boxes in the cells it crosses; big parts and parts that move are tested by every ray.
+
+const scratch = buffer.create(BOX_SIZE)
+
+-- Packs three integer cell or clump coordinates into one number
+local function packKey(x: number, y: number, z: number): number
+	return (x + KEY_BIAS) * 4294967296 + (y + KEY_BIAS) * 65536 + (z + KEY_BIAS)
+end
+
+local function newGrid(): Grid
+	return {
+		buf = buffer.create(1024 * BOX_SIZE),
+		count = 0,
+		cells = {},
+		always = {},
+		dynIndex = {},
+		dynPrim = {},
+		stamp = buffer.create(0),
+	}
+end
+
+-- Stores the box prepared in scratch: in the cells its bounds touch, or in the always-test list
+local function commitBox(g: Grid, prim: number, dynamic: boolean)
+	const index: number = g.count
+	if (index + 1) * BOX_SIZE > buffer.len(g.buf) then
+		const bigger = buffer.create(buffer.len(g.buf) * 2)
+		buffer.copy(bigger, 0, g.buf)
+		g.buf = bigger
+	end
+	buffer.copy(g.buf, index * BOX_SIZE, scratch, 0, BOX_SIZE)
+	g.count = index + 1
+
+	-- Parts that move cannot live in cells fixed at scan time
+	if dynamic then
+		g.always[#g.always + 1] = index
+		g.dynIndex[#g.dynIndex + 1] = index
+		g.dynPrim[#g.dynPrim + 1] = prim
+		return
+	end
+
+	-- World bounds of the oriented box
+	const px, py, pz = readf32(scratch, 0), readf32(scratch, 4), readf32(scratch, 8)
+	const hx, hy, hz = readf32(scratch, 48), readf32(scratch, 52), readf32(scratch, 56)
+	const ex: number = math.abs(readf32(scratch, 12)) * hx + math.abs(readf32(scratch, 24)) * hy + math.abs(readf32(scratch, 36)) * hz
+	const ey: number = math.abs(readf32(scratch, 16)) * hx + math.abs(readf32(scratch, 28)) * hy + math.abs(readf32(scratch, 40)) * hz
+	const ez: number = math.abs(readf32(scratch, 20)) * hx + math.abs(readf32(scratch, 32)) * hy + math.abs(readf32(scratch, 44)) * hz
+	const x0, x1 = math.floor((px - ex) / CELL), math.floor((px + ex) / CELL)
+	const y0, y1 = math.floor((py - ey) / CELL), math.floor((py + ey) / CELL)
+	const z0, z1 = math.floor((pz - ez) / CELL), math.floor((pz + ez) / CELL)
+
+	-- A part spanning more than a handful of cells is tested by every ray instead of being copied into all of them
+	if (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1) > CONFIG.MaxBoxCells then
+		g.always[#g.always + 1] = index
+		return
+	end
+
+	for cx = x0, x1 do
+		for cy = y0, y1 do
+			for cz = z0, z1 do
+				const key: number = packKey(cx, cy, cz)
+				local list = g.cells[key]
+				if not list then
+					list = {}
+					g.cells[key] = list
+				end
+				list[#list + 1] = index
+			end
+		end
+	end
+end
+
+local function finishGrid(g: Grid)
+	g.stamp = buffer.create(g.count * 4)
+end
+
+local function put(offset: number, v: vector)
+	buffer.writef32(scratch, offset, v.x)
+	buffer.writef32(scratch, offset + 4, v.y)
+	buffer.writef32(scratch, offset + 8, v.z)
+end
+
+-- Prepares a box from instance properties (instance mode)
+local function writeScratch(pos: vector, right: vector, up: vector, look: vector, half: vector)
+	put(0, pos)
+	put(12, right)
+	put(24, up)
+	put(36, look)
+	put(48, half)
+	buffer.writef32(scratch, 60, vector.dot(half, half))
+end
+
+-- Copies a primitive's 3x3 rotation into right / up / look using the detected matrix layout
+local function copyAxes(dst: buffer, dstOffset: number, src: buffer, srcOffset: number)
+	if worldColMajor then
+		buffer.copy(dst, dstOffset, src, srcOffset, 36)
+		return
+	end
+	-- Row-major: right = column 0, up = column 1, look = column 2
+	for column = 0, 2 do
+		for row = 0, 2 do
+			buffer.writef32(dst, dstOffset + column * 12 + row * 4, readf32(src, srcOffset + (row * 3 + column) * 4))
+		end
+	end
+end
+
+-- Instance mode: walks Workspace descendants in one synchronous pass, so nothing can go stale mid-scan
 local function rebuildFromInstances(origin: vector, characters: { Instance })
-	local maxSq: number = CONFIG.MaxDistance * CONFIG.MaxDistance
-	local list: { Box } = {}
+	const maxSq: number = CONFIG.MaxDistance * CONFIG.MaxDistance
+	const g = newGrid()
 
 	for _, inst in workspace:GetDescendants() do
 		if not CACHEABLE[inst.ClassName] then continue end
-		local part = inst :: BasePart
+		const part = inst :: BasePart
 		if part.Transparency >= CONFIG.MaxTransparency then continue end
 
-		local offset: vector = part.Position - origin
+		const offset: vector = part.Position - origin
 		if vector.dot(offset, offset) > maxSq then continue end
 
-		local half: vector = part.Size * 0.5
-		local radiusSq: number = vector.dot(half, half)
+		const half: vector = part.Size * 0.5
+		const radiusSq: number = vector.dot(half, half)
 
 		-- Large parts cannot be character parts, so they skip the ancestry check
 		if radiusSq < CONFIG.CharacterPartMaxRadiusSq then
@@ -172,48 +337,44 @@ local function rebuildFromInstances(origin: vector, characters: { Instance })
 			if owned then continue end
 		end
 
-		list[#list + 1] = {
-			pos = part.Position,
-			right = part.RightVector,
-			up = part.UpVector,
-			look = part.LookVector,
-			half = half,
-			radiusSq = radiusSq,
-		}
+		writeScratch(part.Position, part.RightVector, part.UpVector, part.LookVector, half)
+		commitBox(g, 0, false)
 	end
 
-	boxes = list
+	finishGrid(g)
+	grid = g
 end
 
 -- Returns the world primitive array pointer and element count, or nil if the pointers look wrong
 local function loadPrimitiveList(): (number?, number)
-	local workspaceAddr = addressOf(workspace)
-	local gameAddr = addressOf(game)
-	if not workspaceAddr or not gameAddr then return nil, 0 end
+	const workspaceAddr = addressOf(workspace)
+	if not workspaceAddr then return nil, 0 end
 
-	local world = memory.readu64(workspaceAddr + WORLD.WorkspaceWorld)
+	const world: number = memory.readu64(workspaceAddr + WORLD.WorkspaceWorld)
 	if not validPtr(world) then return nil, 0 end
-	local array = memory.readu64(world + WORLD.WorldPrimitives)
-	local count = memory.readu32(gameAddr + WORLD.DataModelPrimitiveCount)
-	if not validPtr(array) or count < 1 or count > CONFIG.MaxPrimitives then return nil, 0 end
+	const array: number = memory.readu64(world + WORLD.WorldPrimitives)
+	const finish: number = memory.readu64(world + WORLD.WorldPrimitivesEnd)
+	if not validPtr(array) or finish <= array then return nil, 0 end
+	const count: number = (finish - array) // 8
+	if count < 1 or count > CONFIG.MaxPrimitives then return nil, 0 end
 	return array, count
 end
 
 -- Checks the offsets against the local HumanoidRootPart and detects the matrix layout.
 -- true = verified, false = offsets do not match, nil = no character yet, try again later
 local function calibrate(array: number, count: number): boolean?
-	local character = LocalPlayer.Character
+	const character = LocalPlayer.Character
 	if not character then return nil end
-	local root = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+	const root = character:FindFirstChild("HumanoidRootPart") :: BasePart?
 	if not root then return nil end
 
-	local rootAddr = addressOf(root)
+	const rootAddr = addressOf(root)
 	if not rootAddr then return false end
-	local prim = memory.readu64(rootAddr + WORLD.BasePartPrimitive)
+	const prim: number = memory.readu64(rootAddr + WORLD.BasePartPrimitive)
 	if not validPtr(prim) then return false end
 
 	-- The primitive must be listed in the world array
-	local list = memory.readbuffer(array, count * 8)
+	const list = memory.readbuffer(array, count * 8)
 	local found = false
 	for i = 0, count - 1 do
 		if readu32(list, i * 8) + readu32(list, i * 8 + 4) * 4294967296 == prim then
@@ -225,17 +386,17 @@ local function calibrate(array: number, count: number): boolean?
 
 	-- Back pointer, position and size must match the real instance
 	if memory.readu64(prim + WORLD.PrimitiveInstance) ~= rootAddr then return false end
-	local posDiff = memory.readvector(prim + WORLD.PrimitivePosition) - root.Position
+	const posDiff: vector = memory.readvector(prim + WORLD.PrimitivePosition) - root.Position
 	if vector.dot(posDiff, posDiff) > 25 then return false end
-	local sizeDiff = memory.readvector(prim + WORLD.PrimitiveSize) - root.Size
+	const sizeDiff: vector = memory.readvector(prim + WORLD.PrimitiveSize) - root.Size
 	if vector.dot(sizeDiff, sizeDiff) > 0.01 then return false end
 
 	-- Pick the matrix layout whose right/up axes match the real CFrame
-	local m = memory.readbuffer(prim + WORLD.PrimitiveRotation, 36)
-	local cf = root.CFrame
-	local rowScore = math.abs(vector.dot(vector.create(readf32(m, 0), readf32(m, 12), readf32(m, 24)), cf.RightVector))
+	const m = memory.readbuffer(prim + WORLD.PrimitiveRotation, 36)
+	const cf = root.CFrame
+	const rowScore: number = math.abs(vector.dot(vector.create(readf32(m, 0), readf32(m, 12), readf32(m, 24)), cf.RightVector))
 		+ math.abs(vector.dot(vector.create(readf32(m, 4), readf32(m, 16), readf32(m, 28)), cf.UpVector))
-	local colScore = math.abs(vector.dot(vector.create(readf32(m, 0), readf32(m, 4), readf32(m, 8)), cf.RightVector))
+	const colScore: number = math.abs(vector.dot(vector.create(readf32(m, 0), readf32(m, 4), readf32(m, 8)), cf.RightVector))
 		+ math.abs(vector.dot(vector.create(readf32(m, 12), readf32(m, 16), readf32(m, 20)), cf.UpVector))
 	if math.max(rowScore, colScore) < 1.8 then return false end
 
@@ -243,78 +404,75 @@ local function calibrate(array: number, count: number): boolean?
 	return true
 end
 
--- World mode: reads every primitive near the origin straight from memory, in one synchronous pass
-local function rebuildFromWorld(array: number, count: number, origin: vector, characters: { Instance })
-	-- Character primitives are excluded by address
-	local excluded: { [number]: boolean } = {}
+-- World mode: reads every primitive near the camera straight from memory. It builds into a new grid
+-- and swaps at the end, so yielding in between is safe. The camera is re-read after every yield.
+local function rebuildFromWorld(array: number, count: number, startOrigin: vector, characters: { Instance }, pace: Pacer)
+	-- Character primitives are excluded by address; this and the array snapshot happen before the first yield
+	const excluded: { [number]: boolean } = {}
 	for _, character in characters do
 		for _, inst in character:GetDescendants() do
 			if not CACHEABLE[inst.ClassName] then continue end
-			local addr = addressOf(inst)
+			const addr = addressOf(inst)
 			if addr then excluded[memory.readu64(addr + WORLD.BasePartPrimitive)] = true end
 		end
 	end
-	local terrain = workspace:FindFirstChild("Terrain")
-	local terrainAddr = terrain and addressOf(terrain)
+	const terrain = workspace:FindFirstChild("Terrain")
+	const terrainAddr = terrain and addressOf(terrain)
 	if terrainAddr then excluded[memory.readu64(terrainAddr + WORLD.BasePartPrimitive)] = true end
 
-	local list = memory.readbuffer(array, count * 8)
-	local maxSq: number = CONFIG.MaxDistance * CONFIG.MaxDistance
-	local maxSize: number = CONFIG.MaxPartSize
-	local colMajor = worldColMajor
-	local out: { Box } = {}
+	const list = memory.readbuffer(array, count * 8)
+	const maxSq: number = CONFIG.MaxDistance * CONFIG.MaxDistance
+	const maxSize: number = CONFIG.MaxPartSize
+	local origin: vector = startOrigin
+	const g = newGrid()
 
 	for i = 0, count - 1 do
-		local prim = readu32(list, i * 8) + readu32(list, i * 8 + 4) * 4294967296
+		if i % 128 == 0 and pace() then origin = getCameraPos() or origin end
+
+		const prim: number = readu32(list, i * 8) + readu32(list, i * 8 + 4) * 4294967296
 		if excluded[prim] or not validPtr(prim) then continue end
 
 		-- Distance test first; the comparison form also rejects NaN
-		local offset = memory.readvector(prim + WORLD.PrimitivePosition) - origin
+		const offset: vector = memory.readvector(prim + WORLD.PrimitivePosition) - origin
 		if not (vector.dot(offset, offset) <= maxSq) then continue end
 
-		local size = memory.readvector(prim + WORLD.PrimitiveSize)
-		if not (size.x <= maxSize and size.y <= maxSize and size.z <= maxSize) then continue end
+		-- One read gives rotation, position, flags, size and the instance pointer
+		const data = memory.readbuffer(prim + WORLD.PrimitiveRotation, PRIM_SPAN)
+		const sx, sy, sz = readf32(data, SIZE_AT), readf32(data, SIZE_AT + 4), readf32(data, SIZE_AT + 8)
+		if not (sx <= maxSize and sy <= maxSize and sz <= maxSize) then continue end
 
 		-- Transparency lives on the part instance
-		local inst = memory.readu64(prim + WORLD.PrimitiveInstance)
+		const inst: number = readu32(data, INST_AT) + readu32(data, INST_AT + 4) * 4294967296
 		if not validPtr(inst) or memory.readf32(inst + WORLD.BasePartTransparency) >= CONFIG.MaxTransparency then
 			continue
 		end
 
-		local m = memory.readbuffer(prim + WORLD.PrimitiveRotation, 36)
-		local right: vector, up: vector, look: vector
-		if colMajor then
-			right = vector.create(readf32(m, 0), readf32(m, 4), readf32(m, 8))
-			up = vector.create(readf32(m, 12), readf32(m, 16), readf32(m, 20))
-			look = vector.create(readf32(m, 24), readf32(m, 28), readf32(m, 32))
-		else
-			right = vector.create(readf32(m, 0), readf32(m, 12), readf32(m, 24))
-			up = vector.create(readf32(m, 4), readf32(m, 16), readf32(m, 28))
-			look = vector.create(readf32(m, 8), readf32(m, 20), readf32(m, 32))
-		end
+		buffer.copy(scratch, 0, data, POS_AT, 12)
+		copyAxes(scratch, 12, data, 0)
+		const hx, hy, hz = sx * 0.5, sy * 0.5, sz * 0.5
+		buffer.writef32(scratch, 48, hx)
+		buffer.writef32(scratch, 52, hy)
+		buffer.writef32(scratch, 56, hz)
+		buffer.writef32(scratch, 60, hx * hx + hy * hy + hz * hz)
 
-		local half: vector = size * 0.5
-		out[#out + 1] = {
-			pos = origin + offset,
-			right = right,
-			up = up,
-			look = look,
-			half = half,
-			radiusSq = vector.dot(half, half),
-		}
+		-- Anchored parts are never read again; only unanchored ones are refreshed
+		const anchored: boolean = (readu8(data, FLAGS_AT) // WORLD.FlagAnchored) % 2 == 1
+		commitBox(g, prim, not anchored)
 	end
 
-	boxes = out
+	finishGrid(g)
+	grid = g
 end
 
-local function rebuildCache(origin: vector)
-	local characters = getCharacters()
+-- Runs as a task: world mode when it is verified, instance mode otherwise
+local function runPartsRebuild(origin: vector)
+	const characters = getCharacters()
 
 	if CONFIG.UseWorldScan and worldState ~= "failed" then
-		local array, count = loadPrimitiveList()
+		const array, count = loadPrimitiveList()
 		if array then
 			if worldState == "unknown" then
-				local verdict = calibrate(array, count)
+				const verdict = calibrate(array, count)
 				if verdict == true then
 					worldState = "ok"
 				elseif verdict == false then
@@ -322,76 +480,94 @@ local function rebuildCache(origin: vector)
 				end
 			end
 			if worldState == "ok" then
-				rebuildFromWorld(array, count, origin, characters)
+				rebuildFromWorld(array, count, origin, characters, newPacer())
+				nextParts = os.clock() + CONFIG.WorldScanInterval
 				return
 			end
 		end
 	end
 
 	rebuildFromInstances(origin, characters)
+	nextParts = os.clock() + CONFIG.CacheInterval
 end
 
--- Clips the ray interval [t0, t1] against one slab; a miss leaves t0 > t1
-local function clip(o: number, d: number, h: number, t0: number, t1: number): (number, number)
-	if math.abs(d) < 1e-6 then
-		if o < -h or o > h then return 1, 0 end
-		return t0, t1
+-- Re-reads the unanchored boxes a few per tick. Rotation and position come in one read, so a part that
+-- only rotates in place is updated too. Anchored parts are skipped entirely.
+local function refreshBoxes()
+	if worldState ~= "ok" then return end
+	const g = grid
+	const n: number = #g.dynIndex
+	if n == 0 then return end
+
+	for _ = 1, math.min(CONFIG.RefreshPerTick, n) do
+		refreshCursor = refreshCursor % n + 1
+		const data = memory.readbuffer(g.dynPrim[refreshCursor] + WORLD.PrimitiveRotation, 48)
+
+		-- Freed primitives can hold garbage; the comparison form also rejects NaN
+		if not (math.abs(readf32(data, 36)) < 1e6 and math.abs(readf32(data, 40)) < 1e6 and math.abs(readf32(data, 44)) < 1e6) then
+			continue
+		end
+
+		const base: number = g.dynIndex[refreshCursor] * BOX_SIZE
+		buffer.copy(g.buf, base, data, 36, 12)
+		copyAxes(g.buf, base + 12, data, 0)
 	end
-	local a = (-h - o) / d
-	local b = (h - o) / d
-	if a > b then a, b = b, a end
-	return math.max(t0, a), math.min(t1, b)
 end
 
--- True if any cached part box lies between origin and target
-local function blockedByParts(origin: vector, seg: vector, len: number, dir: vector): boolean
-	for _, box in boxes do
-		-- Cheap prefilter: closest point of the segment to the box center
-		local t = math.clamp(vector.dot(box.pos - origin, dir), 0, len)
-		local diff = box.pos - (origin + dir * t)
-		if vector.dot(diff, diff) > box.radiusSq then continue end
+-- TERRAIN -------------------------------------------------------------------------------------
 
-		-- Slab test in the box's local space, ray parameter in [0, 1]
-		local rel = origin - box.pos
-		local t0, t1 = 0, 1
-		t0, t1 = clip(vector.dot(rel, box.right), vector.dot(seg, box.right), box.half.x, t0, t1)
-		t0, t1 = clip(vector.dot(rel, box.up), vector.dot(seg, box.up), box.half.y, t0, t1)
-		t0, t1 = clip(vector.dot(rel, box.look), vector.dot(seg, box.look), box.half.z, t0, t1)
-
-		-- t0 == 0 means the origin is inside the box, which is not treated as blocking
-		if t0 > 0 and t0 <= t1 then return true end
+-- Reads the kd-tree and returns it with the triangle count. Node = 3 x u32 (a bounding interval hierarchy):
+--   raw2 low 2 bits: axis 0..2 for an inner node, 3 for a leaf
+--   inner: raw2 >> 2 = left child index (right child = +1), raw0 = top of the left range, raw1 = bottom of the right range (floats)
+--   leaf:  raw2 >> 2 = triangle count (0..2), raw0 / raw1 = the triangle numbers (raw1 only if the count is 2)
+-- Every triangle sits in exactly one leaf, so the leaf counts add up to the triangle count.
+local function readTree(nodesPtr: number, nodes: number): (buffer, number)
+	const bytes: number = nodes * OFF.KdNodeSize
+	const data = memory.readbuffer(nodesPtr, bytes)
+	local count: number = 0
+	for p = 0, bytes - OFF.KdNodeSize, OFF.KdNodeSize do
+		const raw2: number = readu32(data, p + 8)
+		if raw2 % 4 == 3 then
+			const leafCount: number = raw2 // 4
+			-- A leaf holds at most two triangles; anything else means the layout is not what we expect
+			if leafCount > 2 then return data, 0 end
+			count += leafCount
+		end
 	end
-	return false
+	return data, count
 end
 
--- Stored chunk bounds can be tighter than the real surface by 16+ studs (charm notes), so compare loosely
-local BOUNDS_TOLERANCE: number = 48
+-- Reads one chunk mesh and de-indexes it into a flat triangle buffer (9 floats per triangle).
+-- The triangle count comes from the kd-tree, the vertex count from the largest index. Strides are u64 and
+-- the engine stores one u32 index at every step of the index stride. Vertices must be world-space and
+-- match the stored extents.
+local function readChunk(shape: number): Chunk?
+	const mn: vector = memory.readvector(shape + OFF.ShapeExtents)
+	const mx: vector = memory.readvector(shape + OFF.ShapeExtents + 12)
+	-- Comparison form also rejects NaN
+	if not (mx.x > mn.x and mx.y > mn.y and mx.z > mn.z) then return nil end
+	if mx.x - mn.x > 4096 or mx.y - mn.y > 4096 or mx.z - mn.z > 4096 then return nil end
 
--- Two known vertex layouts: this dump (pointer + stride fields) and the older fixed float3 one
-local VERTEX_LAYOUTS = table.freeze({
-	table.freeze({ ptr = OFF.ShapeVertices, strideField = OFF.ShapeVertexStride, stride = 0 }),
-	table.freeze({ ptr = OFF.ShapeVerticesAlt, strideField = 0, stride = 12 }),
-})
+	const nodesPtr: number = memory.readu64(shape + OFF.ShapeNodes)
+	const nodesEnd: number = memory.readu64(shape + OFF.ShapeNodesEnd)
+	if not validPtr(nodesPtr) or nodesEnd <= nodesPtr then return nil end
+	const nodes: number = (nodesEnd - nodesPtr) // OFF.KdNodeSize
+	if nodes > 400000 then return nil end
 
--- Reads one chunk with a given vertex layout; vertices must be world-space and match the stored bounds
-local function readChunk(
-	shape: number,
-	layout: { ptr: number, strideField: number, stride: number },
-	triCount: number,
-	mn: vector,
-	mx: vector
-): Chunk?
-	local vPtr = memory.readu64(shape + layout.ptr)
-	local iPtr = memory.readu64(shape + OFF.ShapeIndices)
+	const tree, triCount = readTree(nodesPtr, nodes)
+	if triCount < 1 then return nil end
+
+	const vPtr: number = memory.readu64(shape + OFF.ShapeVertices)
+	const iPtr: number = memory.readu64(shape + OFF.ShapeIndices)
 	if not validPtr(vPtr) or not validPtr(iPtr) then return nil end
 
-	local vStride = if layout.stride > 0 then layout.stride else memory.readu32(shape + layout.strideField)
-	local iStride = memory.readu32(shape + OFF.ShapeIndexStride)
-	if vStride < 12 or vStride > 64 or (iStride ~= 2 and iStride ~= 4) then return nil end
+	const vStride: number = memory.readu64(shape + OFF.ShapeVertexStride)
+	const iStride: number = memory.readu64(shape + OFF.ShapeIndexStride)
+	if vStride < 12 or vStride > 64 or iStride < 4 or iStride > 64 then return nil end
 
 	-- Cheap check on the first vertex before any bulk read
-	local tol = BOUNDS_TOLERANCE
-	local first = memory.readvector(vPtr)
+	const tol: number = BOUNDS_TOLERANCE
+	const first: vector = memory.readvector(vPtr)
 	if not (
 		first.x >= mn.x - tol and first.x <= mx.x + tol
 		and first.y >= mn.y - tol and first.y <= mx.y + tol
@@ -400,26 +576,31 @@ local function readChunk(
 		return nil
 	end
 
-	local iBytes = triCount * 3 * iStride
+	const indexCount: number = triCount * 3
+	const iBytes: number = (indexCount - 1) * iStride + 4
 	if iBytes > CONFIG.MaxMeshBytes then return nil end
-	local ib = memory.readbuffer(iPtr, iBytes)
+	const ib = memory.readbuffer(iPtr, iBytes)
 
-	-- The vertex count is derived from the largest index, so no vertex end pointer is needed
-	local read = if iStride == 4 then readu32 else readu16
-	local maxIndex = 0
-	for p = 0, iBytes - iStride, iStride do
-		local v = read(ib, p)
+	local maxIndex: number = 0
+	for k = 0, indexCount - 1 do
+		const v: number = readu32(ib, k * iStride)
 		if v > maxIndex then maxIndex = v end
 	end
-	local vBytes = (maxIndex + 1) * vStride
+	const vBytes: number = maxIndex * vStride + 12
 	if vBytes > CONFIG.MaxMeshBytes then return nil end
-	local vb = memory.readbuffer(vPtr, vBytes)
+	const vb = memory.readbuffer(vPtr, vBytes)
 
-	-- Tight bounds from the vertices, which also verify the layout
+	-- De-index: every triangle gets its three vertices copied next to each other, and the bounds come along
+	const tris = buffer.create(triCount * 36)
 	local loX, loY, loZ = math.huge, math.huge, math.huge
 	local hiX, hiY, hiZ = -math.huge, -math.huge, -math.huge
-	for p = 0, vBytes - vStride, vStride do
-		local x, y, z = readf32(vb, p), readf32(vb, p + 4), readf32(vb, p + 8)
+	for k = 0, indexCount - 1 do
+		const at: number = readu32(ib, k * iStride) * vStride
+		const x, y, z = readf32(vb, at), readf32(vb, at + 4), readf32(vb, at + 8)
+		const out: number = k * 12
+		buffer.writef32(tris, out, x)
+		buffer.writef32(tris, out + 4, y)
+		buffer.writef32(tris, out + 8, z)
 		if x < loX then loX = x end
 		if y < loY then loY = y end
 		if z < loZ then loZ = z end
@@ -427,6 +608,8 @@ local function readChunk(
 		if y > hiY then hiY = y end
 		if z > hiZ then hiZ = z end
 	end
+
+	-- The bounds of the triangles verify the layout
 	if not (
 		math.abs(loX - mn.x) <= tol and math.abs(loY - mn.y) <= tol and math.abs(loZ - mn.z) <= tol
 		and math.abs(hiX - mx.x) <= tol and math.abs(hiY - mx.y) <= tol and math.abs(hiZ - mx.z) <= tol
@@ -434,67 +617,170 @@ local function readChunk(
 		return nil
 	end
 
-	local lo, hi = vector.create(loX, loY, loZ), vector.create(hiX, hiY, hiZ)
+	const lo: vector = vector.create(loX, loY, loZ)
+	const hi: vector = vector.create(hiX, hiY, hiZ)
 	return {
-		shape = shape,
+		nodes = nodes,
 		tri = triCount,
+		tree = tree,
+		tris = tris,
 		center = (lo + hi) * 0.5,
 		half = (hi - lo) * 0.5,
-		vb = vb,
-		ib = ib,
-		vBytes = vBytes,
-		iBytes = iBytes,
-		vStride = vStride,
-		iStride = iStride,
 	}
 end
 
--- Loads one terrain chunk mesh into buffers; nil if it is out of range or fails sanity checks
-local function loadChunk(shape: number, origin: vector, maxSq: number): Chunk?
-	local mn = memory.readvector(shape + OFF.ShapeBounds)
-	local mx = memory.readvector(shape + OFF.ShapeBounds + 12)
-	-- Comparison form also rejects NaN
-	if not (mx.x > mn.x and mx.y > mn.y and mx.z > mn.z) then return nil end
-	if mx.x - mn.x > 4096 or mx.y - mn.y > 4096 or mx.z - mn.z > 4096 then return nil end
+-- Segment vs one triangle (Moller-Trumbore, double sided), ray parameter in (0, 1)
+local function hitsTriangle(tris: buffer, tri: number, ox: number, oy: number, oz: number, dx: number, dy: number, dz: number): boolean
+	const p: number = tri * 36
+	const ax, ay, az = readf32(tris, p), readf32(tris, p + 4), readf32(tris, p + 8)
+	const e1x, e1y, e1z = readf32(tris, p + 12) - ax, readf32(tris, p + 16) - ay, readf32(tris, p + 20) - az
+	const e2x, e2y, e2z = readf32(tris, p + 24) - ax, readf32(tris, p + 28) - ay, readf32(tris, p + 32) - az
 
-	local dx = math.max(mn.x - origin.x, 0, origin.x - mx.x)
-	local dy = math.max(mn.y - origin.y, 0, origin.y - mx.y)
-	local dz = math.max(mn.z - origin.z, 0, origin.z - mx.z)
-	if dx * dx + dy * dy + dz * dz > maxSq then return nil end
+	const px = dy * e2z - dz * e2y
+	const py = dz * e2x - dx * e2z
+	const pz = dx * e2y - dy * e2x
+	const det = e1x * px + e1y * py + e1z * pz
+	if det > -1e-9 and det < 1e-9 then return false end
 
-	local triCount = memory.readu32(shape + OFF.ShapeTriangleCount)
-	if triCount < 1 or triCount > 200000 then return nil end
+	const inv = 1 / det
+	const tx, ty, tz = ox - ax, oy - ay, oz - az
+	const u = (tx * px + ty * py + tz * pz) * inv
+	if u < 0 or u > 1 then return false end
 
-	local cached = chunkCache[shape]
-	if cached and cached.tri == triCount then return cached end
+	const qx = ty * e1z - tz * e1y
+	const qy = tz * e1x - tx * e1z
+	const qz = tx * e1y - ty * e1x
+	const v = (dx * qx + dy * qy + dz * qz) * inv
+	if v < 0 or u + v > 1 then return false end
 
-	if terrainLayout ~= 0 then
-		return readChunk(shape, VERTEX_LAYOUTS[terrainLayout], triCount, mn, mx)
-	end
-	for i, layout in VERTEX_LAYOUTS do
-		local chunk = readChunk(shape, layout, triCount, mn, mx)
-		if chunk then
-			terrainLayout = i
-			return chunk
-		end
-	end
-	return nil
+	const t = (e2x * qx + e2y * qy + e2z * qz) * inv
+	return t > 1e-4 and t < 1
 end
 
--- Walks the clump list and reloads nearby chunk meshes; runs in a task and yields between chunks
-local function scanTerrain(origin: vector)
-	local terrain = workspace:FindFirstChild("Terrain")
+-- Traversal stack, reused between rays (rays are only cast from PostLocal)
+const stackNode: { number } = {}
+const stackT0: { number } = {}
+const stackT1: { number } = {}
+
+-- Segment vs the kd-tree of one chunk; [tStart, tEnd] is the part of the segment inside the chunk bounds.
+-- A segment only needs one hit, so children are simply pushed with their clipped intervals.
+local function segmentHitsChunk(chunk: Chunk, o: vector, seg: vector, tStart: number, tEnd: number): boolean
+	const tree, tris, nodeCount, triCount = chunk.tree, chunk.tris, chunk.nodes, chunk.tri
+	const ox, oy, oz = o.x, o.y, o.z
+	const dx, dy, dz = seg.x, seg.y, seg.z
+	-- A corrupt tree could loop forever, so the number of visited nodes is capped
+	local budget: number = nodeCount * 2 + 16
+	local sp: number = 1
+	stackNode[1], stackT0[1], stackT1[1] = 0, tStart, tEnd
+
+	while sp > 0 do
+		budget -= 1
+		if budget < 0 then return false end
+
+		const node, t0, t1 = stackNode[sp], stackT0[sp], stackT1[sp]
+		sp -= 1
+		const p: number = node * OFF.KdNodeSize
+		const raw2: number = readu32(tree, p + 8)
+		const kind: number = raw2 % 4
+
+		if kind == 3 then
+			-- Leaf: up to two triangle numbers
+			const count: number = raw2 // 4
+			if count >= 1 then
+				const first: number = readu32(tree, p)
+				if first < triCount and hitsTriangle(tris, first, ox, oy, oz, dx, dy, dz) then return true end
+				if count == 2 then
+					const second: number = readu32(tree, p + 4)
+					if second < triCount and hitsTriangle(tris, second, ox, oy, oz, dx, dy, dz) then return true end
+				end
+			end
+		else
+			const left: number = raw2 // 4
+			if left + 1 >= nodeCount then continue end
+
+			const leftMax: number = readf32(tree, p)
+			const rightMin: number = readf32(tree, p + 4)
+			const origin: number = if kind == 0 then ox elseif kind == 1 then oy else oz
+			const dir: number = if kind == 0 then dx elseif kind == 1 then dy else dz
+
+			if math.abs(dir) < 1e-9 then
+				-- Parallel to the split planes: take the side(s) that contain the origin
+				if origin <= leftMax then
+					sp += 1
+					stackNode[sp], stackT0[sp], stackT1[sp] = left, t0, t1
+				end
+				if origin >= rightMin then
+					sp += 1
+					stackNode[sp], stackT0[sp], stackT1[sp] = left + 1, t0, t1
+				end
+			else
+				const tl: number = (leftMax - origin) / dir
+				const tr: number = (rightMin - origin) / dir
+				if dir > 0 then
+					-- Left range is at t <= tl, right range at t >= tr
+					if t0 <= tl then
+						sp += 1
+						stackNode[sp], stackT0[sp], stackT1[sp] = left, t0, math.min(t1, tl)
+					end
+					if tr <= t1 then
+						sp += 1
+						stackNode[sp], stackT0[sp], stackT1[sp] = left + 1, math.max(t0, tr), t1
+					end
+				else
+					-- Moving down the axis: right range is at t <= tr, left range at t >= tl
+					if t0 <= tr then
+						sp += 1
+						stackNode[sp], stackT0[sp], stackT1[sp] = left + 1, t0, math.min(t1, tr)
+					end
+					if tl <= t1 then
+						sp += 1
+						stackNode[sp], stackT0[sp], stackT1[sp] = left, math.max(t0, tl), t1
+					end
+				end
+			end
+		end
+	end
+	return false
+end
+
+-- Segment vs one loaded chunk; only the part of the segment inside the chunk bounds goes into the tree
+local function chunkBlocks(chunk: Chunk, o: vector, seg: vector): boolean
+	const rel: vector = o - chunk.center
+	local t0, t1 = 0, 1
+	t0, t1 = clip(rel.x, seg.x, chunk.half.x + 0.01, t0, t1)
+	t0, t1 = clip(rel.y, seg.y, chunk.half.y + 0.01, t0, t1)
+	t0, t1 = clip(rel.z, seg.z, chunk.half.z + 0.01, t0, t1)
+	if t0 > t1 then return false end
+	return segmentHitsChunk(chunk, o, seg, t0, t1)
+end
+
+-- Queues a cell's chunk for loading. Whether the clump exists is pure arithmetic and a table lookup;
+-- the slot check and the mesh read happen later, a few per tick, in loadChunks.
+local function requestChunk(key: number, cx: number, cy: number, cz: number, now: number)
+	if chunkPending[key] then return end
+	if directory[packKey(cx // 4, cy // 4, cz // 4)] == nil then
+		chunkCache[key] = now + CONFIG.TerrainScanInterval
+		return
+	end
+	chunkPending[key] = true
+	chunkQueue[#chunkQueue + 1] = key
+end
+
+-- Starts a walk over the clump list; the walk then advances a few nodes per tick
+local function beginWalk()
+	nextWalk = os.clock() + CONFIG.TerrainScanInterval
+	const terrain = workspace:FindFirstChild("Terrain")
 	if not terrain then return end
-	local base = addressOf(terrain)
+	const base = addressOf(terrain)
 	if not base then return end
 
-	local primitive = memory.readu64(base + OFF.TerrainPrimitive)
+	const primitive: number = memory.readu64(base + OFF.TerrainPrimitive)
 	if not validPtr(primitive) then return end
-	local geometry = memory.readu64(primitive + OFF.PrimitiveGeometry)
+	const geometry: number = memory.readu64(primitive + OFF.PrimitiveGeometry)
 	if not validPtr(geometry) then return end
 
-	local map = geometry + OFF.GeometryChunkMap
-	local count = memory.readu64(map + OFF.MapCount)
+	local map: number = geometry + OFF.GeometryChunkMap
+	local count: number = memory.readu64(map + OFF.MapCount)
 	if count < 1 or count > 1e6 then
 		-- chunk_map may be stored by pointer instead of inline
 		map = memory.readu64(map)
@@ -503,187 +789,304 @@ local function scanTerrain(origin: vector)
 		if count < 1 or count > 1e6 then return end
 	end
 
-	local head = memory.readu64(map + OFF.MapHead)
+	const head: number = memory.readu64(map + OFF.MapHead)
 	if not validPtr(head) then return end
-	local clump = memory.readu64(head + OFF.ClumpNext)
 
-	local maxSq = CONFIG.MaxDistance * CONFIG.MaxDistance
-	local list: { Chunk } = {}
-	local cache: { [number]: Chunk } = {}
-	local slice = os.clock()
+	walkActive = true
+	walkClump = memory.readu64(head + OFF.ClumpNext)
+	walkHead = head
+	walkLeft = count
+	walkDirectory = {}
+end
 
-	-- The list may be circular (ends at head) or null-terminated
-	while count > 0 and validPtr(clump) and clump ~= head and #list < CONFIG.MaxTerrainChunks do
-		local states = memory.readbuffer(clump + OFF.ClumpStates, 64)
-		for slot = 0, 63 do
-			if buffer.readu8(states, slot) == 0 then continue end
-			local mesh = memory.readu64(clump + OFF.ClumpRecords + slot * OFF.RecordSize + OFF.RecordMesh)
-			if not validPtr(mesh) then continue end
-			local shape = memory.readu64(mesh + OFF.MeshShape)
-			if not validPtr(shape) then continue end
+-- Reads DirectoryNodesPerTick clump nodes into the directory under construction. The finished directory
+-- replaces the old one in a single step.
+local function stepWalk()
+	for _ = 1, CONFIG.DirectoryNodesPerTick do
+		-- The list may be circular (ends at head) or null-terminated
+		if walkLeft <= 0 or not validPtr(walkClump) or walkClump == walkHead then
+			directory = walkDirectory
+			walkActive = false
+			nextWalk = os.clock() + CONFIG.TerrainScanInterval
+			return
+		end
 
-			local chunk = loadChunk(shape, origin, maxSq)
-			if chunk then
-				list[#list + 1] = chunk
-				cache[shape] = chunk
+		-- One read: the next pointer and the clump key
+		const data = memory.readbuffer(walkClump, OFF.ClumpKey + 12)
+		const x, y, z = readi32(data, OFF.ClumpKey), readi32(data, OFF.ClumpKey + 4), readi32(data, OFF.ClumpKey + 8)
+		if math.abs(x) < KEY_BIAS and math.abs(y) < KEY_BIAS and math.abs(z) < KEY_BIAS then
+			walkDirectory[packKey(x, y, z)] = walkClump
+		end
+
+		walkLeft -= 1
+		walkClump = readu32(data, OFF.ClumpNext) + readu32(data, OFF.ClumpNext + 4) * 4294967296
+	end
+end
+
+-- Loads queued chunks: at most ChunksPerTick meshes are read per call. Slots that turn out to be empty are cheap
+-- and do not count against that limit.
+local function loadChunks(now: number)
+	local meshes: number = CONFIG.ChunksPerTick
+	for _ = 1, 64 do
+		if queueHead > #chunkQueue then
+			if queueHead > 1 then
+				chunkQueue = {}
+				queueHead = 1
 			end
-			slice = pace(slice)
+			return
+		end
+		if meshes <= 0 then return end
+
+		const key: number = chunkQueue[queueHead]
+		queueHead += 1
+		chunkPending[key] = nil
+
+		const cx: number = key // 4294967296 - KEY_BIAS
+		const cy: number = (key // 65536) % 65536 - KEY_BIAS
+		const cz: number = key % 65536 - KEY_BIAS
+
+		local chunk: Chunk? = nil
+		const node = directory[packKey(cx // 4, cy // 4, cz // 4)]
+		if node and loadedChunks < CONFIG.MaxTerrainChunks then
+			-- Slot inside the clump, z fastest
+			const slot: number = (cx % 4) * 16 + (cy % 4) * 4 + (cz % 4)
+			if memory.readu8(node + OFF.ClumpStates + slot) ~= 0 then
+				const mesh: number = memory.readu64(node + OFF.ClumpRecords + slot * OFF.RecordSize + OFF.RecordMesh)
+				if validPtr(mesh) then
+					const shape: number = memory.readu64(mesh + OFF.MeshShape)
+					if validPtr(shape) then
+						meshes -= 1
+						chunk = readChunk(shape)
+					end
+				end
+			end
 		end
 
-		count -= 1
-		clump = memory.readu64(clump + OFF.ClumpNext)
-	end
-
-	chunks = list
-	chunkCache = cache
-end
-
--- Segment vs triangle mesh (Moller-Trumbore, double sided), ray parameter in (0, 1)
-local function segmentHitsChunk(chunk: Chunk, o: vector, seg: vector): boolean
-	local vb, ib, vs = chunk.vb, chunk.ib, chunk.vStride
-	local wide = chunk.iStride == 4
-	local maxA = chunk.vBytes - 12
-	local ox, oy, oz = o.x, o.y, o.z
-	local dx, dy, dz = seg.x, seg.y, seg.z
-	local step = chunk.iStride
-
-	for p = 0, chunk.iBytes - step * 3, step * 3 do
-		local a, b, c
-		if wide then
-			a, b, c = readu32(ib, p) * vs, readu32(ib, p + 4) * vs, readu32(ib, p + 8) * vs
+		if chunk then
+			chunkCache[key] = chunk
+			loadedChunks += 1
 		else
-			a, b, c = readu16(ib, p) * vs, readu16(ib, p + 2) * vs, readu16(ib, p + 4) * vs
+			chunkCache[key] = now + CONFIG.TerrainScanInterval
 		end
-		if a > maxA or b > maxA or c > maxA then continue end
-
-		local ax, ay, az = readf32(vb, a), readf32(vb, a + 4), readf32(vb, a + 8)
-		local e1x, e1y, e1z = readf32(vb, b) - ax, readf32(vb, b + 4) - ay, readf32(vb, b + 8) - az
-		local e2x, e2y, e2z = readf32(vb, c) - ax, readf32(vb, c + 4) - ay, readf32(vb, c + 8) - az
-
-		local px = dy * e2z - dz * e2y
-		local py = dz * e2x - dx * e2z
-		local pz = dx * e2y - dy * e2x
-		local det = e1x * px + e1y * py + e1z * pz
-		if det > -1e-9 and det < 1e-9 then continue end
-
-		local inv = 1 / det
-		local tx, ty, tz = ox - ax, oy - ay, oz - az
-		local u = (tx * px + ty * py + tz * pz) * inv
-		if u < 0 or u > 1 then continue end
-
-		local qx = ty * e1z - tz * e1y
-		local qy = tz * e1x - tx * e1z
-		local qz = tx * e1y - ty * e1x
-		local v = (dx * qx + dy * qy + dz * qz) * inv
-		if v < 0 or u + v > 1 then continue end
-
-		local t = (e2x * qx + e2y * qy + e2z * qz) * inv
-		if t > 1e-4 and t < 1 then return true end
 	end
+end
+
+-- OCCLUSION -----------------------------------------------------------------------------------
+
+-- True if the box blocks the segment (given with its unit direction and length)
+local function boxBlocks(g: Grid, index: number, ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, ux: number, uy: number, uz: number, len: number): boolean
+	const buf = g.buf
+	const p: number = index * BOX_SIZE
+	const bx, by, bz = readf32(buf, p), readf32(buf, p + 4), readf32(buf, p + 8)
+
+	-- Cheap prefilter: closest point of the segment to the box center
+	const t: number = math.clamp((bx - ox) * ux + (by - oy) * uy + (bz - oz) * uz, 0, len)
+	const qx, qy, qz = bx - (ox + ux * t), by - (oy + uy * t), bz - (oz + uz * t)
+	if qx * qx + qy * qy + qz * qz > readf32(buf, p + 60) then return false end
+
+	-- Slab test in the box's local space, ray parameter in [0, 1]
+	const rx, ry, rz = readf32(buf, p + 12), readf32(buf, p + 16), readf32(buf, p + 20)
+	const upx, upy, upz = readf32(buf, p + 24), readf32(buf, p + 28), readf32(buf, p + 32)
+	const lx, ly, lz = readf32(buf, p + 36), readf32(buf, p + 40), readf32(buf, p + 44)
+	const relx, rely, relz = ox - bx, oy - by, oz - bz
+	local t0, t1 = 0, 1
+	t0, t1 = clip(relx * rx + rely * ry + relz * rz, dx * rx + dy * ry + dz * rz, readf32(buf, p + 48), t0, t1)
+	t0, t1 = clip(relx * upx + rely * upy + relz * upz, dx * upx + dy * upy + dz * upz, readf32(buf, p + 52), t0, t1)
+	t0, t1 = clip(relx * lx + rely * ly + relz * lz, dx * lx + dy * ly + dz * lz, readf32(buf, p + 56), t0, t1)
+
+	-- t0 == 0 means the origin is inside the box, which is not treated as blocking
+	return t0 > 0 and t0 <= t1
+end
+
+-- Casts a segment through the shared 32 stud grid (3D DDA). Only the boxes listed in the crossed cells, the
+-- always-test list and the terrain chunk of each crossed cell are tested.
+local function segmentBlocked(o: vector, seg: vector, now: number): boolean
+	const len: number = vector.magnitude(seg)
+	if len < 1e-4 then return false end
+
+	const g = grid
+	rayId += 1
+	const id: number = rayId
+	const ox, oy, oz = o.x, o.y, o.z
+	const dx, dy, dz = seg.x, seg.y, seg.z
+	const ux, uy, uz = dx / len, dy / len, dz / len
+
+	for _, index in g.always do
+		if boxBlocks(g, index, ox, oy, oz, dx, dy, dz, ux, uy, uz, len) then return true end
+	end
+
+	-- Cell walk; the segment parameter runs from 0 to 1
+	local cx: number = math.floor(ox / CELL)
+	local cy: number = math.floor(oy / CELL)
+	local cz: number = math.floor(oz / CELL)
+	const stepX: number = if dx > 0 then 1 else -1
+	const stepY: number = if dy > 0 then 1 else -1
+	const stepZ: number = if dz > 0 then 1 else -1
+	const tDeltaX: number = if dx ~= 0 then CELL / math.abs(dx) else math.huge
+	const tDeltaY: number = if dy ~= 0 then CELL / math.abs(dy) else math.huge
+	const tDeltaZ: number = if dz ~= 0 then CELL / math.abs(dz) else math.huge
+	local tMaxX: number = if dx ~= 0 then ((if dx > 0 then cx + 1 else cx) * CELL - ox) / dx else math.huge
+	local tMaxY: number = if dy ~= 0 then ((if dy > 0 then cy + 1 else cy) * CELL - oy) / dy else math.huge
+	local tMaxZ: number = if dz ~= 0 then ((if dz > 0 then cz + 1 else cz) * CELL - oz) / dz else math.huge
+
+	-- A segment is at most a few hundred cells long; the cap only protects against bad numbers
+	for _ = 1, 1024 do
+		const key: number = packKey(cx, cy, cz)
+
+		const list = g.cells[key]
+		if list then
+			for _, index in list do
+				if readu32(g.stamp, index * 4) ~= id then
+					buffer.writeu32(g.stamp, index * 4, id)
+					if boxBlocks(g, index, ox, oy, oz, dx, dy, dz, ux, uy, uz, len) then return true end
+				end
+			end
+		end
+
+		if CONFIG.UseTerrain then
+			const entry = chunkCache[key]
+			if entry == nil then
+				requestChunk(key, cx, cy, cz, now)
+			elseif type(entry) == "number" then
+				if now >= entry then requestChunk(key, cx, cy, cz, now) end
+			elseif chunkBlocks(entry, o, seg) then
+				return true
+			end
+		end
+
+		-- Step into the next cell, or stop when it lies beyond the end of the segment
+		if tMaxX < tMaxY and tMaxX < tMaxZ then
+			if tMaxX > 1 then break end
+			cx += stepX
+			tMaxX += tDeltaX
+		elseif tMaxY < tMaxZ then
+			if tMaxY > 1 then break end
+			cy += stepY
+			tMaxY += tDeltaY
+		else
+			if tMaxZ > 1 then break end
+			cz += stepZ
+			tMaxZ += tDeltaZ
+		end
+	end
+
 	return false
 end
 
-local function blockedByTerrain(origin: vector, seg: vector): boolean
-	for _, chunk in chunks do
-		-- Only chunks whose bounds the segment crosses are tested triangle by triangle
-		local rel = origin - chunk.center
-		local t0, t1 = 0, 1
-		t0, t1 = clip(rel.x, seg.x, chunk.half.x, t0, t1)
-		t0, t1 = clip(rel.y, seg.y, chunk.half.y, t0, t1)
-		t0, t1 = clip(rel.z, seg.z, chunk.half.z, t0, t1)
-		if t0 > t1 then continue end
+-- EVENTS --------------------------------------------------------------------------------------
+-- Model: schedules the part scans and advances the terrain directory and chunk loading. Data: position
+-- snapshots and moving-part refresh. Local: visibility checks and projection. Render: only draws.
 
-		if segmentHitsChunk(chunk, origin, seg) then return true end
-	end
-	return false
-end
-
-local function runTerrainScan(origin: vector)
-	scanTerrain(origin)
-	nextTerrain = os.clock() + CONFIG.TerrainScanInterval
-end
-
--- Parts are rebuilt inline; the terrain scan runs as a finite task that yields between chunks
 RunService.PostModel:Connect(function()
-	local origin = getCameraPos()
+	const now: number = os.clock()
+	const origin = getCameraPos()
 	if not origin then return end
-	local now = os.clock()
 
-	local interval: number = if worldState == "ok" then CONFIG.WorldScanInterval else CONFIG.CacheInterval
-	if now - lastParts >= interval then
-		lastParts = now
-		rebuildCache(origin)
+	-- nextParts is pushed far ahead while a scan runs, so scans never pile up or get stuck
+	if now >= nextParts then
+		nextParts = now + CONFIG.WorldScanTimeout
+		task.spawn(runPartsRebuild, origin)
 	end
 
-	-- nextTerrain is pushed far ahead while a scan runs, so scans never pile up or get stuck
-	if CONFIG.UseTerrain and now >= nextTerrain then
-		nextTerrain = now + CONFIG.TerrainScanTimeout
-		task.spawn(runTerrainScan, origin)
+	if CONFIG.UseTerrain then
+		if walkActive then
+			stepWalk()
+		elseif now >= nextWalk then
+			beginWalk()
+		end
+		loadChunks(now)
 	end
 end)
 
-RunService.PostLocal:Connect(function()
-	local now = os.clock()
-	if now - lastLogic < CONFIG.LogicInterval then return end
-	lastLogic = now
+RunService.PostData:Connect(function()
+	refreshBoxes()
 
-	local origin = getCameraPos()
+	const origin = getCameraPos()
 	if not origin then
-		snapshot = {}
+		targets = {}
 		return
 	end
 
-	local maxSq = CONFIG.MaxDistance * CONFIG.MaxDistance
-	local list: { Entry } = {}
-	local myTeam = if CONFIG.TeamCheck then LocalPlayer.Team else nil
+	const maxSq: number = CONFIG.MaxDistance * CONFIG.MaxDistance
+	const myTeam = if CONFIG.TeamCheck then LocalPlayer.Team else nil
+	const list: { Target } = {}
 
 	for _, obj in Players:GetChildren() do
-		local player = obj :: Player
+		const player = obj :: Player
 		if player == LocalPlayer then continue end
 		if myTeam and player.Team == myTeam then continue end
 
-		local head = getHead(player)
+		const head = getHead(player)
 		if not head then continue end
 
-		local pos = head.Position
-		local seg = pos - origin
-		local lenSq = vector.dot(seg, seg)
-		if lenSq > maxSq then continue end
+		const pos: vector = head.Position
+		const offset: vector = pos - origin
+		if not (vector.dot(offset, offset) <= maxSq) then continue end
 
-		local blocked = false
-		if lenSq > 1e-8 then
-			local len = math.sqrt(lenSq)
-			blocked = blockedByParts(origin, seg, len, seg / len)
-
-			if not blocked and CONFIG.UseTerrain then
-				local cached = terrainResult[player]
-				if not cached or now - cached.time >= CONFIG.TerrainInterval then
-					cached = { time = now, blocked = blockedByTerrain(origin, seg) }
-					terrainResult[player] = cached
-				end
-				blocked = cached.blocked
-			end
-		end
-
-		list[#list + 1] = {
-			name = player.Name,
-			pos = pos + CONFIG.NameOffset,
-			color = if blocked then HIDDEN else VISIBLE,
-		}
+		list[#list + 1] = { player = player, name = player.Name, head = pos }
 	end
 
-	snapshot = list
+	targets = list
+end)
+
+RunService.PostLocal:Connect(function()
+	const camera = workspace.CurrentCamera
+	if not camera then
+		labels = { buf = buffer.create(0), names = {}, count = 0 }
+		return
+	end
+
+	const list = targets
+	const now: number = os.clock()
+
+	-- Visibility checks run on their own, slower timer
+	if now - lastOcclusion >= CONFIG.LogicInterval then
+		lastOcclusion = now
+		const origin: vector = camera.CFrame.Position
+		const alive: { [Player]: boolean } = {}
+
+		for _, target in list do
+			alive[target.player] = true
+			blocked[target.player] = segmentBlocked(origin, target.head - origin, now)
+		end
+
+		-- Results of players that left or are filtered out are dropped
+		for player in blocked do
+			if not alive[player] then blocked[player] = nil end
+		end
+	end
+
+	-- Projection runs every tick so labels do not trail behind
+	const buf = buffer.create(#list * 16)
+	const names: { string } = {}
+	local count: number = 0
+	for _, target in list do
+		const screen, onScreen = camera:WorldToScreenPoint(target.head + CONFIG.NameOffset)
+		if onScreen then
+			const at: number = count * 16
+			buffer.writef32(buf, at, screen.x)
+			buffer.writef32(buf, at + 4, screen.y - CONFIG.NamePixelOffset)
+			buffer.writef32(buf, at + 8, screen.z)
+			buffer.writeu32(buf, at + 12, if blocked[target.player] then 1 else 0)
+			count += 1
+			names[count] = target.name
+		end
+	end
+	labels = { buf = buf, names = names, count = count }
 end)
 
 RunService.Render:Connect(function()
-	local camera = workspace.CurrentCamera
-	if not camera then return end
-
-	for _, entry in snapshot do
-		local screen, onScreen = camera:WorldToScreenPoint(entry.pos)
-		if onScreen then
-			local labelPos = vector.create(screen.x, screen.y - CONFIG.NamePixelOffset, screen.z)
-			DrawingImmediate.OutlinedText(labelPos, CONFIG.TextSize, entry.color, 1, entry.name, true, "Tamzen")
-		end
+	const set = labels
+	for i = 0, set.count - 1 do
+		const at: number = i * 16
+		DrawingImmediate.OutlinedText(
+			vector.create(readf32(set.buf, at), readf32(set.buf, at + 4), readf32(set.buf, at + 8)),
+			CONFIG.TextSize,
+			if readu32(set.buf, at + 12) == 1 then HIDDEN else VISIBLE,
+			1,
+			set.names[i + 1],
+			true,
+			"Tamzen"
+		)
 	end
 end)
