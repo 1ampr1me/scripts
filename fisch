@@ -1,0 +1,3373 @@
+--!strict
+--!optimize 2
+
+-- Fisch for Severe: auto cast, shake and reel with an info overlay. Menu: IAMPR1MEUI.
+
+local Players = game:GetService("Players")
+local RunService: any = game:GetService("RunService")
+local G: any = _G
+
+-- Offsets dump URLs: the first is the one used by the official modules, the second is the fallback
+local OFFSETS_URLS = table.freeze({ "https://offsets.imtheo.lol/Offsets.hpp", "https://offsets.imtheo.lol/offsets.hpp" })
+
+-- Virtual-key codes used by the macro
+local VK = table.freeze({ Enter = 0x0D, Backslash = 0xDC, W = 0x57, T = 0x54 })
+
+local CAST_FULL = 97.0 -- cast power (%) at which a perfect cast is released
+local CAST_TIMEOUT = 2.5 -- max seconds to hold the cast before releasing anyway
+local POST_CAST_S = 0.15 -- pause after releasing a cast before waiting for the bite
+local POST_CATCH_S = 0.4 -- pause after a finished reel before the next cast
+local SHAKE_MISS_S = 25.0 -- seconds without any shake prompt before the rod is re-equipped
+local SHAKE_LOST_S = 45.0 -- seconds in SHAKE (prompt seen, no reel) after which the rod is re-equipped
+local REEL_GONE_S = 0.25 -- seconds the reel UI must stay gone to end a reel
+local CATCH_PCT = 97.0 -- reel progress (%) counted as a catch
+local INFO_EVERY = 0.25 -- seconds between info text rebuilds
+local REEL_PART_GRACE_S = 0.6 -- seconds a missing fish or playerbar is tolerated before the reel counts as over
+local STREAK_WAIT_S = 4.0 -- seconds to wait for the game streak to move after a reel that started above 0 (then progress decides)
+local STREAK_ZERO_WAIT_S = 2.5 -- same, for a reel that started at streak 0 (the value may stay hidden, progress decides)
+local STUCK_RESYNC_S = 0.21 -- seconds the bar may drift the wrong way before the mouse state is re-sent
+local REEL_ATTR_EVERY = 0.1 -- seconds between reads of the character reel attributes
+
+if type(G.FischKill) == "function" then
+	G.FischKill()
+end
+
+local vec = vector.create
+
+-- ───────────────────────── Library ─────────────────────────
+
+-- IAMPR1MEUI is embedded below (menu library, no files or links needed).
+local Lib: any = (function(): any
+-- IAMPR1MEUI: immediate-mode menu library for Severe (DrawingImmediate).
+-- Look and behaviour menu: dark rounded panel, tab bar, toggle pills, action buttons,
+-- sliders, collapsible lists (rows or two-column chips), drag by the title bar, hotkeys.
+--
+--   local ui = UI.new({ Title = "MY SCRIPT", Key = "RightShift", Flags = flagsTable, Mute = function() return false end })
+--   local tab = ui:tab("Main")
+--   tab:toggle({ Name = "Enabled", Flag = "enabled", Default = true, Key = "F1", OnChange = function(value) end })
+--   tab:slider({ Name = "RANGE", Flag = "range", Min = 0, Max = 100, Default = 50, Suffix = " st" })
+--   tab:action({ Name = "Do it", Button = "Go", Callback = function() end })
+--   tab:section({ Title = "LIST", Divider = true })
+--   tab:dropdown({ Name = "Targets", All = "All targets", Items = { { Name = "A", Flag = "a", Default = true } } })
+--   tab:note({ Lines = { "dim text" } })
+--   -- PostLocal: ui:update()   input sampling, drag, hotkeys, queued callbacks (memory calls are fine here)
+--   -- Render:    ui:render()   drawing and hit-testing only, no input or API calls
+--
+-- Values live in ui.Flags (or in the Store table of a control). OnChange / Callback run inside ui:update(),
+-- never in Render. Get / Set of a toggle and Show of any control run inside Render: plain Lua only.
+-- Mute (optional function): while it returns true the mouse is ignored (the script itself holds the button).
+
+local UI: any = {}
+UI.__index = UI
+
+
+local vec = vector.create
+local floor = math.floor
+
+-- Menu colors
+local THEME = table.freeze({
+	Bg = Color3.fromRGB(15, 15, 17),
+	Divider = Color3.fromRGB(26, 26, 30),
+	TextMain = Color3.fromRGB(255, 255, 255),
+	TextRow = Color3.fromRGB(166, 166, 172),
+	TextOff = Color3.fromRGB(94, 94, 101),
+	TextDim = Color3.fromRGB(72, 72, 78),
+	Chip = Color3.fromRGB(23, 23, 26),
+	Track = Color3.fromRGB(26, 26, 30),
+	PillBg = Color3.fromRGB(28, 28, 32),
+	PillLine = Color3.fromRGB(60, 60, 66),
+	PillBgOff = Color3.fromRGB(20, 20, 23),
+	PillLineOff = Color3.fromRGB(38, 38, 43),
+	Knob = Color3.fromRGB(245, 245, 247),
+	KnobOff = Color3.fromRGB(96, 96, 104),
+	White = Color3.new(1, 1, 1),
+})
+UI.Theme = THEME
+local T = THEME
+
+local HEADER_H = 38 -- title bar (drag handle)
+local TAB_H = 26
+local ROW_H = 28 -- normal row
+local DROP_ROW_H = 24 -- row inside a list
+local DROP_GAP = 1
+local SLIDER_ROW_H = 56
+local CHIP_H = 22
+local CHIP_GAP = 4
+local DROP_TOP_GAP = 6 -- space between a list header and its content
+local KEY_POLL = 0.03 -- seconds between key reads
+
+local EMPTY_KEYS: { any } = {}
+table.freeze(EMPTY_KEYS)
+
+-- Key names accepted by Key options (virtual-key codes); letters, digits and F1-F12 are added below
+local KEY_CODES: { [string]: number } = {
+	RightShift = 0xA1,
+	LeftShift = 0xA0,
+	RightControl = 0xA3,
+	LeftControl = 0xA2,
+	RightAlt = 0xA5,
+	LeftAlt = 0xA4,
+	Return = 0x0D,
+	Enter = 0x0D,
+	Space = 0x20,
+	Tab = 0x09,
+	Escape = 0x1B,
+	Insert = 0x2D,
+	Delete = 0x2E,
+	Home = 0x24,
+	End = 0x23,
+	PageUp = 0x21,
+	PageDown = 0x22,
+}
+for i = 0, 25 do
+	KEY_CODES[string.char(65 + i)] = 65 + i
+end
+for i = 0, 9 do
+	KEY_CODES[tostring(i)] = 48 + i
+end
+for i = 1, 12 do
+	KEY_CODES["F" .. i] = 0x6F + i
+end
+table.freeze(KEY_CODES)
+
+-- ───────────────────────── Helpers ─────────────────────────
+
+-- True if a key spec (name, virtual-key code or a list of them) is in the pressed keys.
+local function keyDown(keys: { any }, spec: any): boolean
+	if type(spec) == "table" then
+		for _, one in spec do
+			if table.find(keys, one) ~= nil then
+				return true
+			end
+			local code = if type(one) == "string" then KEY_CODES[one] else nil
+			if code ~= nil and table.find(keys, code) ~= nil then
+				return true
+			end
+		end
+		return false
+	end
+	if table.find(keys, spec) ~= nil then
+		return true
+	end
+	local code = if type(spec) == "string" then KEY_CODES[spec] else nil
+	return code ~= nil and table.find(keys, code) ~= nil
+end
+
+-- Text shown for a key spec.
+local function keyLabel(spec: any): string
+	if type(spec) == "table" then
+		for _, one in spec do
+			if type(one) == "string" then
+				return one
+			end
+		end
+		return "?"
+	end
+	if type(spec) == "number" then
+		return string.format("0x%02X", spec)
+	end
+	if spec == "RightShift" then
+		return "RShift"
+	elseif spec == "LeftShift" then
+		return "LShift"
+	end
+	return tostring(spec)
+end
+
+-- True if the point is inside the rectangle.
+local function inRect(px: number, py: number, x: number, y: number, w: number, h: number): boolean
+	return px >= x and px <= x + w and py >= y and py <= y + h
+end
+
+-- Cuts a label to maxLen characters.
+local function shortLabel(s: string, maxLen: number): string
+	if #s > maxLen then
+		return string.sub(s, 1, maxLen - 1) .. "."
+	end
+	return s
+end
+
+-- Queues a callback; it runs in the next ui:update() (PostLocal), not in Render.
+local function push(ui: any, fn: any, a: any, b: any): ()
+	local n = ui.QN + 1
+	ui.QN = n
+	ui.QFn[n] = fn
+	ui.QA[n] = a
+	ui.QB[n] = b
+end
+
+-- ───────────────────────── Drawing primitives ─────────────────────────
+
+-- Immediate mode has no rounding: corners are built from rectangles (small radii) or circles (large ones).
+local function RoundRect(x: number, y: number, w: number, h: number, r: number, color: Color3): ()
+	if r <= 3 then
+		DrawingImmediate.FilledRectangle(vec(x + 1, y, 0), vec(w - 2, h, 0), color, 1)
+		DrawingImmediate.FilledRectangle(vec(x, y + 1, 0), vec(w, h - 2, 0), color, 1)
+		return
+	end
+	if r <= 6 then
+		local i1 = floor(r * 0.6 + 0.5)
+		local i2 = math.max(1, floor(r * 0.25 + 0.5))
+		local t = floor(r * 0.6)
+		DrawingImmediate.FilledRectangle(vec(x + i1, y, 0), vec(w - 2 * i1, h, 0), color, 1)
+		DrawingImmediate.FilledRectangle(vec(x + i2, y + 1, 0), vec(w - 2 * i2, h - 2, 0), color, 1)
+		DrawingImmediate.FilledRectangle(vec(x, y + t, 0), vec(w, h - 2 * t, 0), color, 1)
+		return
+	end
+	DrawingImmediate.FilledRectangle(vec(x + r, y, 0), vec(w - 2 * r, h, 0), color, 1)
+	DrawingImmediate.FilledRectangle(vec(x, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
+	DrawingImmediate.FilledRectangle(vec(x + w - r, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
+	DrawingImmediate.FilledCircle(vec(x + r, y + r, 0), r, color, 1)
+	DrawingImmediate.FilledCircle(vec(x + w - r, y + r, 0), r, color, 1)
+	DrawingImmediate.FilledCircle(vec(x + r, y + h - r, 0), r, color, 1)
+	DrawingImmediate.FilledCircle(vec(x + w - r, y + h - r, 0), r, color, 1)
+end
+
+-- Toggle pill with a 1px outline and a square knob (right = on, left = off).
+local function DrawPill(x: number, y: number, w: number, h: number, on: boolean): ()
+	RoundRect(x, y, w, h, 5, if on then T.PillLine else T.PillLineOff)
+	RoundRect(x + 1, y + 1, w - 2, h - 2, 4, if on then T.PillBg else T.PillBgOff)
+	local knob = 10
+	local kx = if on then (x + w - knob - 4) else (x + 4)
+	RoundRect(kx, y + (h - knob) / 2, knob, knob, 3, if on then T.Knob else T.KnobOff)
+end
+
+-- One toggle row (optional color swatch). Returns true if the row was clicked.
+local function DrawToggleRow(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	enabled: boolean,
+	clicked: boolean,
+	mp: vector,
+	swatch: Color3?
+): boolean
+	local labelX = x + 10
+	if swatch then
+		DrawingImmediate.FilledRectangle(vec(x + 10, y + h / 2 - 3, 0), vec(6, 6, 0), swatch, 1)
+		labelX = x + 22
+	end
+	DrawingImmediate.Text(vec(labelX, y + h / 2 - 6, 0), 13, if enabled then T.TextRow else T.TextOff, 1, label, false)
+	DrawPill(x + w - 32 - 10, y + (h - 18) / 2, 32, 18, enabled)
+	return clicked and inRect(mp.x, mp.y, x, y, w, h)
+end
+
+-- A row with a small button on the right. Returns true if the button was clicked.
+local function DrawActionRow(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	btnText: string,
+	clicked: boolean,
+	mp: vector
+): boolean
+	DrawingImmediate.Text(vec(x + 10, y + h / 2 - 6, 0), 13, T.TextRow, 1, label, false)
+	local bw = 64
+	local bh = 18
+	local bx = x + w - bw - 10
+	local by = y + (h - bh) / 2
+	local hover = inRect(mp.x, mp.y, bx, by, bw, bh)
+	RoundRect(bx, by, bw, bh, 5, T.PillLine)
+	RoundRect(bx + 1, by + 1, bw - 2, bh - 2, 4, if hover then T.PillLine else T.PillBg)
+	DrawingImmediate.Text(vec(bx + bw / 2, by + 3, 0), 12, T.TextMain, 1, btnText, true)
+	return clicked and hover
+end
+
+-- A compact chip; `on` = nil hides the on/off indicator. Returns true if it was clicked.
+local function DrawChip(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	on: boolean?,
+	clicked: boolean,
+	mp: vector
+): boolean
+	local hover = inRect(mp.x, mp.y, x, y, w, h)
+	RoundRect(x, y, w, h, 5, if hover then T.PillLine else T.Chip)
+	local labelX = x + 10
+	if on ~= nil then
+		DrawingImmediate.FilledRectangle(vec(x + 8, y + h / 2 - 3, 0), vec(6, 6, 0), if on then T.Knob else T.PillLineOff, 1)
+		labelX = x + 20
+	end
+	DrawingImmediate.Text(vec(labelX, y + h / 2 - 6, 0), 11, if on == false then T.TextOff else T.TextRow, 1, label, false)
+	return clicked and hover
+end
+
+-- Collapsible list header (label, counter, arrow). Returns true if clicked.
+local function DrawDropdownHeader(
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	label: string,
+	countText: string,
+	open: boolean,
+	clicked: boolean,
+	mp: vector
+): boolean
+	local hover = inRect(mp.x, mp.y, x, y, w, h)
+	if hover or open then
+		RoundRect(x, y, w, h, 6, T.Chip)
+	end
+	DrawingImmediate.Text(vec(x + 10, y + h / 2 - 6, 0), 13, T.TextMain, 1, label, false)
+	DrawingImmediate.Text(vec(x + w - 46, y + h / 2 - 6, 0), 12, T.TextDim, 1, countText, true)
+	local cx = x + w - 16
+	local cy = y + h / 2
+	if open then
+		DrawingImmediate.FilledTriangle(vec(cx - 5, cy - 3, 0), vec(cx + 5, cy - 3, 0), vec(cx, cy + 3, 0), T.Knob, 1)
+	else
+		DrawingImmediate.FilledTriangle(vec(cx - 3, cy - 5, 0), vec(cx - 3, cy + 5, 0), vec(cx + 3, cy, 0), T.Knob, 1)
+	end
+	return clicked and hover
+end
+
+-- Slider row; returns the new value and keeps dragging while the button is held.
+local function DrawSliderRow(ui: any, el: any, x: number, y: number, w: number, value: number, clicked: boolean, ldown: boolean, mp: vector): number
+	local minV: number = el.Min
+	local maxV: number = el.Max
+	local step: number = el.Step
+	DrawingImmediate.Text(vec(x + 10, y + 9, 0), 11, T.TextDim, 1, el.Name, false)
+	RoundRect(x + w - 55, y + 9, 45, 14, 4, T.Chip)
+	DrawingImmediate.Text(vec(x + w - 32.5, y + 10, 0), 11, T.TextMain, 1, tostring(floor(value)) .. el.Suffix, true)
+
+	local tX = x + 10
+	local tW = w - 20
+	local tC = y + 43 -- vertical center of the track
+
+	if clicked and inRect(mp.x, mp.y, tX - 6, tC - 10, tW + 12, 20) then
+		ui.SliderActive = el
+	end
+	if not ldown then
+		ui.SliderActive = nil
+	end
+	if ui.SliderActive == el then
+		local rel = math.clamp((mp.x - tX) / tW, 0, 1)
+		value = floor((minV + rel * (maxV - minV)) / step + 0.5) * step
+		value = math.clamp(value, minV, maxV)
+	end
+
+	RoundRect(tX, tC - 2, tW, 4, 2, T.Track)
+	local frac = math.clamp((value - minV) / (maxV - minV), 0, 1)
+	RoundRect(tX + floor(tW * frac) - 5, tC - 5, 10, 10, 3, T.Knob)
+	return value
+end
+
+-- Dim small label text.
+local function DrawLabel(x: number, y: number, text: string): ()
+	DrawingImmediate.Text(vec(x + 18, y, 0), 11, T.TextDim, 1, text, false)
+end
+
+-- ───────────────────────── Controls ─────────────────────────
+
+-- Reads the current value of a control.
+local function getValue(ui: any, el: any): any
+	if el.Get ~= nil then
+		return el.Get()
+	end
+	local store = el.Store or ui.Flags
+	return store[el.Flag]
+end
+
+-- Stores a new value and queues OnChange.
+local function setValue(ui: any, el: any, value: any): ()
+	if el.Set ~= nil then
+		el.Set(value)
+	else
+		local store = el.Store or ui.Flags
+		store[el.Flag] = value
+	end
+	if el.OnChange ~= nil then
+		push(ui, el.OnChange, value, el.Flag)
+	end
+end
+
+-- Draws a toggle row and returns the y of the next control.
+local function drawToggle(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	local on = getValue(ui, el) == true
+	if DrawToggleRow(ux + 8, yo, uw - 16, ROW_H, el.Label, on, clicked, mp, el.Swatch) then
+		setValue(ui, el, not on)
+	end
+	return yo + ROW_H + el.Gap
+end
+
+-- Draws an action row and returns the y of the next control.
+local function drawAction(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	if DrawActionRow(ux + 8, yo, uw - 16, ROW_H, el.Label, el.Button, clicked, mp) and el.Callback ~= nil then
+		push(ui, el.Callback, nil, nil)
+	end
+	return yo + ROW_H + el.Gap
+end
+
+-- Requests the game-input block state; it is applied in ui:update() (never from Render).
+local function setBlock(ui: any, state: boolean): ()
+	ui.BlockWant = state
+end
+
+-- Leaves the text field and gives the keyboard back to the game.
+local function blur(ui: any): ()
+	if ui.Focus ~= nil then
+		ui.Focus = nil
+		setBlock(ui, false)
+	end
+end
+
+-- Focuses a text field and blocks game input while typing.
+local function focus(ui: any, el: any): ()
+	ui.Focus = el
+	ui.FocusAt = os.clock()
+	ui.TypeDown = {}
+	ui.BackDown = false
+	ui.EnterDown = true
+	ui.EscDown = true
+	setBlock(ui, true)
+end
+
+-- Text field row: click to type, Enter submits, Esc or a click elsewhere leaves it.
+local function drawInput(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	local store = el.Store or ui.Flags
+	local text: string = if type(store[el.Flag]) == "string" then store[el.Flag] else ""
+	local focused = ui.Focus == el
+	local bx = ux + 18
+	local by = yo + 2
+	local bw = uw - 36
+	local bh = ROW_H - 4
+	local hover = inRect(mp.x, mp.y, bx, by, bw, bh)
+	if clicked then
+		if hover and not focused then
+			focus(ui, el)
+			focused = true
+		elseif not hover and focused then
+			blur(ui)
+			focused = false
+		end
+	end
+	if focused then
+		ui.FocusAt = os.clock()
+	end
+	RoundRect(bx, by, bw, bh, 5, if focused then T.PillLine else T.PillLineOff)
+	RoundRect(bx + 1, by + 1, bw - 2, bh - 2, 4, T.PillBg)
+	local shown = text
+	local color = T.TextMain
+	if text == "" and not focused then
+		shown = el.Placeholder or ""
+		color = T.TextOff
+	end
+	if #shown > 34 then
+		shown = string.sub(shown, -34)
+	end
+	if focused and math.floor(os.clock() * 2) % 2 == 0 then
+		shown ..= "|"
+	end
+	DrawingImmediate.Text(vec(bx + 8, by + 4, 0), 13, color, 1, shown, false)
+	return yo + ROW_H + el.Gap
+end
+
+-- Draws a slider row and returns the y of the next control.
+local function drawSlider(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	local value: number = getValue(ui, el)
+	local nextValue = DrawSliderRow(ui, el, ux + 8, yo, uw - 16, value, clicked, ui.Input.down, mp)
+	if nextValue ~= value then
+		setValue(ui, el, nextValue)
+	end
+	return yo + SLIDER_ROW_H + 9 + el.Gap
+end
+
+-- Draws a section heading and returns the y of the next control.
+local function drawSection(ui: any, el: any, ux: number, yo: number, uw: number): number
+	if el.Divider then
+		DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
+		DrawLabel(ux, yo + 12, el.Title)
+		return yo + 30
+	end
+	DrawLabel(ux, yo + 2, el.Title)
+	return yo + 20
+end
+
+-- Draws dim text lines (a snapshot of el.Lines) and returns the y of the next control.
+local function drawNote(ui: any, el: any, ux: number, yo: number): number
+	yo += el.Before
+	local lines: { string } = el.Lines
+	for i, line in lines do
+		DrawLabel(ux, yo + (i - 1) * 14, line)
+	end
+	return yo + #lines * 14 + 6
+end
+
+-- Open state of a list: one open list per accordion id, or one flag per list.
+local function isOpen(ui: any, el: any): boolean
+	if el.Accordion ~= nil then
+		return ui.Accordion[el.Accordion] == el
+	end
+	return ui.Open[el] == true
+end
+
+-- Opens or closes a list.
+local function toggleOpen(ui: any, el: any): ()
+	local open = isOpen(ui, el)
+	if el.Accordion ~= nil then
+		ui.Accordion[el.Accordion] = if open then nil else el
+	else
+		ui.Open[el] = not open
+	end
+end
+
+-- Draws a collapsible list (rows or chips) and returns the y of the next control.
+local function drawDropdown(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	local items: { any } = el.Items
+	local store = el.Store or ui.Flags
+	local chips = el.Layout == "chips"
+	local size = #items
+
+	-- Counter: on / total for flag items, the item count for plain action chips
+	local flagged = false
+	local onCount = 0
+	for _, item in items do
+		if item.Flag ~= nil then
+			flagged = true
+			if store[item.Flag] == true then
+				onCount += 1
+			end
+		end
+	end
+	local countText = if flagged then `{onCount}/{size}` else tostring(size)
+
+	local open = isOpen(ui, el)
+	if DrawDropdownHeader(ux + 8, yo, uw - 16, ROW_H, el.Name, countText, open, clicked, mp) then
+		toggleOpen(ui, el)
+	end
+	yo += ROW_H
+	if not open then
+		return yo + el.Gap
+	end
+	yo += DROP_TOP_GAP
+
+	-- "All" row switches every flag item at once
+	if el.All ~= nil and flagged then
+		local allOn = onCount == size
+		if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, el.All, allOn, clicked, mp, T.White) then
+			for _, item in items do
+				store[item.Flag] = not allOn
+			end
+			if el.OnChange ~= nil then
+				push(ui, el.OnChange, nil, not allOn)
+			end
+		end
+		yo += DROP_ROW_H + DROP_GAP + (if chips then 2 else 0)
+	end
+
+	if chips then
+		local cw = (uw - 32 - CHIP_GAP) / 2
+		for i, item in items do
+			local col = (i - 1) % 2
+			local row = floor((i - 1) / 2)
+			local cx = ux + 16 + col * (cw + CHIP_GAP)
+			local cy = yo + row * (CHIP_H + CHIP_GAP)
+			local label = shortLabel(item.Name, el.MaxLabel)
+			if item.Flag ~= nil then
+				local on = store[item.Flag] == true
+				if DrawChip(cx, cy, cw, CHIP_H, label, on, clicked, mp) then
+					store[item.Flag] = not on
+					if el.OnChange ~= nil then
+						push(ui, el.OnChange, item.Flag, not on)
+					end
+				end
+			elseif DrawChip(cx, cy, cw, CHIP_H, label, nil, clicked, mp) and item.Callback ~= nil then
+				push(ui, item.Callback, item, nil)
+			end
+		end
+		yo += floor((size + 1) / 2) * (CHIP_H + CHIP_GAP) + 4
+	else
+		for _, item in items do
+			local on = store[item.Flag] == true
+			if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, item.Name, on, clicked, mp, item.Swatch) then
+				store[item.Flag] = not on
+				if el.OnChange ~= nil then
+					push(ui, el.OnChange, item.Flag, not on)
+				end
+			end
+			yo += DROP_ROW_H + DROP_GAP
+		end
+		yo += 4
+	end
+	return yo + el.Gap
+end
+
+-- Draws one control and returns the y of the next one.
+local function drawElement(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
+	if el.Show ~= nil and not el.Show() then
+		return yo
+	end
+	local kind = el.Kind
+	if kind == "toggle" then
+		return drawToggle(ui, el, ux, yo, uw, clicked, mp)
+	elseif kind == "action" then
+		return drawAction(ui, el, ux, yo, uw, clicked, mp)
+	elseif kind == "slider" then
+		return drawSlider(ui, el, ux, yo, uw, clicked, mp)
+	elseif kind == "input" then
+		return drawInput(ui, el, ux, yo, uw, clicked, mp)
+	elseif kind == "dropdown" then
+		return drawDropdown(ui, el, ux, yo, uw, clicked, mp)
+	elseif kind == "section" then
+		return drawSection(ui, el, ux, yo, uw)
+	end
+	return drawNote(ui, el, ux, yo)
+end
+
+-- ───────────────────────── Tabs ─────────────────────────
+
+local Tab: any = {}
+Tab.__index = Tab
+
+-- Registers a control: defaults, hotkey, label.
+function Tab:_add(kind: string, o: any): any
+	local ui = self.Ui
+	o.Kind = kind
+	o.Gap = o.Gap or 0
+	local name: string? = o.Name
+	if name ~= nil then
+		o.Label = if o.Key ~= nil then `{name} [{o.KeyLabel or keyLabel(o.Key)}]` else name
+	end
+	local store = o.Store or ui.Flags
+	if o.Flag ~= nil and store[o.Flag] == nil then
+		if kind == "slider" then
+			store[o.Flag] = o.Default or o.Min
+		elseif kind == "input" then
+			store[o.Flag] = o.Default or ""
+		else
+			store[o.Flag] = o.Default == true
+		end
+	end
+	if o.Items ~= nil then
+		for _, item in o.Items do
+			if item.Flag ~= nil and store[item.Flag] == nil then
+				store[item.Flag] = item.Default == true
+			end
+		end
+	end
+	if o.Key ~= nil then
+		o.KeyWasDown = false
+		table.insert(ui.Hotkeys, o)
+	end
+	table.insert(self.Elements, o)
+	return o
+end
+
+-- Toggle: Name, Flag (or Get / Set), Default, Key, KeyLabel, Swatch, Gap, Store, OnChange(value, flag).
+function Tab:toggle(o: any): any
+	return self:_add("toggle", o)
+end
+
+-- Button row: Name, Button (text), Callback(), Key, KeyLabel, Gap.
+function Tab:action(o: any): any
+	o.Button = o.Button or "Run"
+	return self:_add("action", o)
+end
+
+-- Text field: Name (placeholder), Flag (string), Default, MaxLen (48), Gap, OnSubmit(text).
+function Tab:input(o: any): any
+	o.Placeholder = o.Placeholder or o.Name or ""
+	return self:_add("input", o)
+end
+
+-- Slider: Name, Flag, Min, Max, Default, Step (10), Suffix, Gap, OnChange(value, flag).
+function Tab:slider(o: any): any
+	o.Step = o.Step or 10
+	o.Suffix = o.Suffix or ""
+	return self:_add("slider", o)
+end
+
+-- Small heading: Title, Divider (line above it).
+function Tab:section(o: any): any
+	return self:_add("section", o)
+end
+
+-- Dim text lines: Lines (replace the whole table to update it), Before (space above, 0).
+function Tab:note(o: any): any
+	o.Before = o.Before or 0
+	return self:_add("note", o)
+end
+
+-- Collapsible list: Name, Items, All (text of the all-row), Layout ("rows" or "chips"), Accordion (id: only one list
+-- of that id stays open), Store, Gap, MaxLabel, OnChange(flag, value) (flag = nil for the all-row).
+-- Items: { Name, Flag, Swatch, Default } for switches, { Name, Callback } for plain chips.
+function Tab:dropdown(o: any): any
+	o.MaxLabel = o.MaxLabel or 19
+	return self:_add("dropdown", o)
+end
+
+-- ───────────────────────── Window ─────────────────────────
+
+-- Options: Title, Key (menu key, "RightShift"), KeyLabel, Flags (table that holds the values), X, Y, Width (290),
+-- Mute (function -> boolean, ignore the mouse while true), Stat = { Label, Value = function() -> string } (left footer text).
+function UI.new(opts: any): any
+	local self = setmetatable({
+		Title = opts.Title or "MENU",
+		Flags = opts.Flags or {},
+		Tabs = {},
+		TabIndex = 1,
+		X = opts.X or 200,
+		Y = opts.Y or 100,
+		Width = opts.Width or 290,
+		PanelH = 320, -- measured by the last drawn frame
+		Visible = true,
+		MenuKey = opts.Key or "RightShift",
+		MenuKeyLabel = opts.KeyLabel or keyLabel(opts.Key or "RightShift"),
+		Stat = opts.Stat,
+		Mute = opts.Mute,
+		Alive = true,
+		Active = false,
+		Dragging = false,
+		DragDX = 0,
+		DragDY = 0,
+		SliderActive = nil,
+		Open = {},
+		Accordion = {},
+		Hotkeys = {},
+		MenuKeyWasDown = false,
+		Input = { mx = 0, my = 0, down = false, pressed = false },
+		Focus = nil,
+		FocusAt = 0,
+		TypeDown = {},
+		BackDown = false,
+		BackAt = 0,
+		EnterDown = true,
+		EscDown = true,
+		BlockWant = false,
+		BlockOn = false,
+		ViewW = 0,
+		ViewH = 0,
+		ViewAt = -math.huge,
+		KeysAt = -math.huge,
+		QN = 0,
+		QFn = {},
+		QA = {},
+		QB = {},
+	}, UI)
+	return self
+end
+
+-- Adds a tab.
+function UI:tab(name: string): any
+	local tab = setmetatable({ Name = name, Ui = self, Elements = {} }, Tab)
+	table.insert(self.Tabs, tab)
+	return tab
+end
+
+-- Stops drawing and input (call it from the script's cleanup).
+function UI:destroy(): ()
+	self.Alive = false
+	self.Focus = nil
+	self.BlockWant = false
+	if self.BlockOn then
+		self.BlockOn = false
+		block_roblox_window(false)
+	end
+end
+
+-- Keys that type a character into a focused text field: { id, ch, specs }.
+local TYPE_KEYS: { any } = {}
+do
+	local digitNames = { "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine" }
+	for i = 0, 9 do
+		table.insert(TYPE_KEYS, { id = "d" .. i, ch = tostring(i), specs = { 48 + i, 96 + i, tostring(i), digitNames[i + 1] } })
+	end
+	table.insert(TYPE_KEYS, { id = "minus", ch = "-", specs = { 0xBD, 0x6D, "Minus", "OemMinus", "Subtract", "Dash", "Hyphen", "-" } })
+	table.insert(TYPE_KEYS, { id = "minusL", ch = "-", specs = { 0x4C, "L" } })
+	table.insert(TYPE_KEYS, { id = "dot", ch = ".", specs = { 0xBE, 0x6E, "Period", "OemPeriod", "Decimal", "." } })
+	table.insert(TYPE_KEYS, { id = "comma", ch = ",", specs = { 0xBC, "Comma", "OemComma", "," } })
+	table.insert(TYPE_KEYS, { id = "space", ch = " ", specs = { 0x20, "Space" } })
+end
+table.freeze(TYPE_KEYS)
+local KEYS_BACK: { any } = table.freeze({ 0x08, "Backspace" })
+local KEYS_ENTER: { any } = table.freeze({ 0x0D, "Return", "Enter" })
+local KEYS_ESC: { any } = table.freeze({ 0x1B, "Escape" })
+
+-- Reads typed characters, Backspace (with repeat), Enter and Esc for the focused text field.
+local function typeKeys(ui: any, keys: { any }, now: number): ()
+	local el = ui.Focus
+	local store = el.Store or ui.Flags
+	local text: string = if type(store[el.Flag]) == "string" then store[el.Flag] else ""
+	local changed = false
+	for _, k in TYPE_KEYS do
+		local pressed = keyDown(keys, k.specs)
+		if pressed and ui.TypeDown[k.id] ~= true and #text < (el.MaxLen or 48) then
+			text ..= k.ch
+			changed = true
+		end
+		ui.TypeDown[k.id] = pressed
+	end
+	if keyDown(keys, KEYS_BACK) then
+		if not ui.BackDown then
+			ui.BackDown = true
+			ui.BackAt = now + 0.4
+			text = string.sub(text, 1, -2)
+			changed = true
+		elseif now >= ui.BackAt then
+			ui.BackAt = now + 0.05
+			text = string.sub(text, 1, -2)
+			changed = true
+		end
+	else
+		ui.BackDown = false
+	end
+	if changed then
+		store[el.Flag] = text
+	end
+	local enter = keyDown(keys, KEYS_ENTER)
+	if enter and not ui.EnterDown then
+		if el.OnSubmit ~= nil then
+			push(ui, el.OnSubmit, text, nil)
+		end
+		blur(ui)
+	end
+	ui.EnterDown = enter
+	local esc = keyDown(keys, KEYS_ESC)
+	if esc and not ui.EscDown then
+		blur(ui)
+	end
+	ui.EscDown = esc
+end
+
+-- Hotkey pressed: flips a toggle or runs an action.
+local function fireHotkey(ui: any, el: any): ()
+	if el.Kind == "toggle" then
+		setValue(ui, el, getValue(ui, el) ~= true)
+	elseif el.Callback ~= nil then
+		push(ui, el.Callback, nil, nil)
+	end
+end
+
+-- Samples the mouse once per update, latches new presses for Render and moves the window while dragging.
+local function sampleMouse(ui: any, active: boolean): ()
+	local input = ui.Input
+	local mouse = getmouseposition()
+	local mx: number = mouse.x
+	local my: number = mouse.y
+	local ldown: boolean = active and isleftpressed()
+	if ldown and ui.Mute ~= nil and ui.Mute() then
+		ldown = false
+	end
+	local pressed = ldown and not input.down
+	input.down = ldown
+	input.mx = mx
+	input.my = my
+	if pressed then
+		input.pressed = true
+	end
+	if not ldown then
+		ui.Dragging = false
+		return
+	end
+	local uw: number = ui.Width
+	if not ui.Dragging then
+		if pressed and ui.Visible and ui.SliderActive == nil and inRect(mx, my, ui.X, ui.Y, uw - 28, HEADER_H) then
+			ui.Dragging = true
+			ui.DragDX = mx - ui.X
+			ui.DragDY = my - ui.Y
+		end
+	else
+		ui.X = math.clamp(mx - ui.DragDX, 0, math.max(0, ui.ViewW - uw))
+		ui.Y = math.clamp(my - ui.DragDY, 0, math.max(0, ui.ViewH - ui.PanelH))
+	end
+end
+
+-- PostLocal: reads input (mouse, menu key, hotkeys), refreshes the viewport, runs queued callbacks.
+function UI:update(): ()
+	if not self.Alive then
+		return
+	end
+	local now = os.clock()
+	local active = isrbxactive()
+	if self.Focus ~= nil and (not self.Visible or now - self.FocusAt > 0.4) then
+		blur(self)
+	end
+
+	self.Active = active
+
+	if now - self.ViewAt >= 1 then
+		self.ViewAt = now
+		local cam = workspace.CurrentCamera
+		if cam ~= nil then
+			local vp = cam.ViewportSize
+			self.ViewW = vp.x
+			self.ViewH = vp.y
+		end
+	end
+
+	sampleMouse(self, active)
+
+	-- Keys are read only while Roblox is the active window
+	if now - self.KeysAt >= KEY_POLL then
+		self.KeysAt = now
+		local keys: { any } = if active then getpressedkeys() else EMPTY_KEYS
+		local menuDown = keyDown(keys, self.MenuKey)
+		if menuDown and not self.MenuKeyWasDown then
+			self.Visible = not self.Visible
+		end
+		self.MenuKeyWasDown = menuDown
+		if self.Focus ~= nil then
+			typeKeys(self, keys, now)
+		end
+		for _, el in self.Hotkeys do
+			local pressed = keyDown(keys, el.Key)
+			if pressed and not el.KeyWasDown then
+				fireHotkey(self, el)
+			end
+			el.KeyWasDown = pressed
+		end
+	end
+
+	-- Callbacks queued by Render and by hotkeys; ones queued while running wait for the next update
+	local n = self.QN
+	if n > 0 then
+		local fns, qa, qb = self.QFn, self.QA, self.QB
+		local runFn: { any } = table.move(fns, 1, n, 1, {})
+		local runA: { any } = table.move(qa, 1, n, 1, {})
+		local runB: { any } = table.move(qb, 1, n, 1, {})
+		-- Shift the queue first so a failing callback is not re-run on every update
+		local total = self.QN
+		for i = n + 1, total do
+			fns[i - n] = fns[i]
+			qa[i - n] = qa[i]
+			qb[i - n] = qb[i]
+		end
+		for i = total - n + 1, total do
+			fns[i] = nil
+			qa[i] = nil
+			qb[i] = nil
+		end
+		self.QN = total - n
+		for i = 1, n do
+			runFn[i](runA[i], runB[i])
+		end
+	end
+
+	-- Game input block follows the text field focus (requested by Render, applied here)
+	if self.BlockWant ~= self.BlockOn and self.Alive then
+		self.BlockOn = self.BlockWant
+		block_roblox_window(self.BlockOn)
+	end
+end
+
+-- Render: draws the menu and hit-tests the latched click (state changes only, no input or API calls).
+function UI:render(): ()
+	if not self.Alive then
+		return
+	end
+	local input = self.Input
+	local clicked: boolean = input.pressed
+	input.pressed = false
+	if not self.Visible then
+		return
+	end
+	local mx: number = input.mx
+	local my: number = input.my
+	local mp: vector = vec(mx, my, 0)
+	local uw: number = self.Width
+
+	local ux: number = self.X
+	local uy: number = self.Y
+	RoundRect(ux, uy, uw, self.PanelH, 10, T.Bg)
+
+	DrawingImmediate.FilledRectangle(vec(ux + 18, uy + 18, 0), vec(6, 6, 0), T.White, 1)
+	DrawingImmediate.Text(vec(ux + 30, uy + 14, 0), 13, T.TextMain, 1, self.Title, false)
+	DrawingImmediate.Text(vec(ux + 31, uy + 14, 0), 13, T.TextMain, 1, self.Title, false) -- second pass = bolder title
+	DrawingImmediate.Text(vec(ux + uw - 26, uy + 13, 0), 14, T.TextDim, 1, "x", false)
+	if clicked and inRect(mx, my, ux + uw - 28, uy, 28, HEADER_H) then
+		self.Visible = false
+		return
+	end
+
+	-- Tab bar
+	local tabs: { any } = self.Tabs
+	local count = #tabs
+	if count == 0 then
+		return
+	end
+	local gap = 4
+	local tabsW = uw - 16
+	local tabW = (tabsW - gap * (count - 1)) / count
+	for i, tab in tabs do
+		local tx = ux + 8 + (i - 1) * (tabW + gap)
+		local ty = uy + HEADER_H
+		local active = self.TabIndex == i
+		local hover = inRect(mx, my, tx, ty, tabW, TAB_H)
+		if active or hover then
+			RoundRect(tx, ty, tabW, TAB_H, 6, T.Chip)
+		end
+		DrawingImmediate.Text(vec(tx + tabW / 2, ty + TAB_H / 2 - 6, 0), 12, if active then T.TextMain else T.TextOff, 1, tab.Name, true)
+		if clicked and hover then
+			self.TabIndex = i
+		end
+	end
+
+	-- Controls of the open tab
+	local yo: number = uy + HEADER_H + TAB_H + 8
+	local tab = tabs[self.TabIndex]
+	for _, el in tab.Elements do
+		yo = drawElement(self, el, ux, yo, uw, clicked, mp)
+	end
+	yo += 6
+
+	-- Footer: optional status text on the left, the menu key on the right
+	DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
+	local stat = self.Stat
+	if stat ~= nil then
+		DrawingImmediate.Text(vec(ux + 18, yo + 11, 0), 11, T.TextDim, 1, stat.Label, false)
+		DrawingImmediate.Text(vec(ux + 62, yo + 11, 0), 11, T.TextRow, 1, stat.Value(), false)
+	end
+	DrawingImmediate.Text(vec(ux + 114, yo + 11, 0), 11, T.TextDim, 1, "Hide menu:", false)
+	DrawingImmediate.Text(vec(ux + 188, yo + 11, 0), 11, T.TextMain, 1, self.MenuKeyLabel, false)
+	self.PanelH = yo + 32 - uy
+end
+
+return UI
+end)()
+local T: any = Lib.Theme
+
+-- ───────────────────────── Offsets ─────────────────────────
+
+-- GUI offsets: built-in values are replaced by the live dump when it can be fetched (they change every Roblox update)
+local OFF: { [string]: number } = { Position = 0x4D8, Size = 0x4F8, GuiEnabled = 0x48C }
+local offsetInfo = "built-in (26.10.2026)"
+
+-- Offset keys with the namespace and field they come from in the offsets dump.
+local OFFSET_FIELDS = table.freeze({
+	{ "Position", "GuiObject", "Position" },
+	{ "Size", "GuiObject", "Size" },
+	{ "GuiEnabled", "GuiObject", "ScreenGui_Enabled" },
+})
+
+-- Text of one `namespace Name { ... }` block (plain searches only, the dump is large).
+local function namespaceBlock(body: string, name: string): string?
+	local at = string.find(body, "namespace " .. name .. " {", 1, true)
+	if at == nil then
+		return nil
+	end
+	local stop = string.find(body, "\n    }", at, true)
+	if stop == nil then
+		return nil
+	end
+	return string.sub(body, at, stop)
+end
+
+-- Overwrites the offsets from one dump text; returns how many of them were found.
+local function applyOffsets(body: string): number
+	local found = 0
+	for _, f in OFFSET_FIELDS do
+		local block = namespaceBlock(body, f[2])
+		local hex = if block ~= nil then string.match(block, "uintptr_t%s+" .. f[3] .. "%s*=%s*0x(%x+)") else nil
+		local value = if hex ~= nil then tonumber(hex, 16) else nil
+		if value ~= nil then
+			OFF[f[1]] = value
+			found += 1
+		end
+	end
+	if found > 0 then
+		local vAt = string.find(body, "ClientVersion", 1, true)
+		local version = if vAt ~= nil then string.match(string.sub(body, vAt, vAt + 80), '"([^"]+)"') else nil
+		offsetInfo = `live {found}/{#OFFSET_FIELDS} ({version or "?"})`
+	end
+	return found
+end
+
+-- Fetches the latest offsets dump once at start; the built-in values stay when nothing usable comes back.
+local function loadOffsets(): ()
+	for _, url in OFFSETS_URLS do
+		local body: any = game:HttpGet(url)
+		if type(body) == "string" and #body > 0 and applyOffsets(body) > 0 then
+			return
+		end
+	end
+end
+loadOffsets()
+
+-- ───────────────────────── Memory helpers ─────────────────────────
+
+-- Converts Instance.Data (hex text, with or without the 0x prefix) into an address number (0 when invalid).
+local function parseAddress(text: any): number
+	if type(text) ~= "string" then
+		return 0
+	end
+	local n: number? = if string.sub(text, 1, 2) == "0x" then tonumber(text) else tonumber(text, 16)
+	return if n ~= nil and n > 4096 then n else 0
+end
+
+-- Address of an instance (0 when unknown).
+local function addressOf(inst: any): number
+	if inst == nil then
+		return 0
+	end
+	return parseAddress(inst.Data)
+end
+
+-- Reads a float at the address (0 for a null address).
+local function readF32(a: number): number
+	return if a == 0 then 0 else memory.readf32(a)
+end
+
+-- Reads a byte at the address (0 for a null address).
+local function readU8(a: number): number
+	return if a == 0 then 0 else memory.readu8(a)
+end
+
+-- True for a normal finite number inside [lo, hi].
+local function sane(v: number, lo: number, hi: number): boolean
+	return v == v and v >= lo and v <= hi
+end
+
+-- ScreenGui.Enabled read from memory.
+local function guiEnabled(gui: any): boolean
+	local a = addressOf(gui)
+	return a ~= 0 and readU8(a + OFF.GuiEnabled) ~= 0
+end
+
+-- Position.X.Scale of a frame.
+local function frameX(obj: any): number
+	local a = addressOf(obj)
+	return if a == 0 then 0 else readF32(a + OFF.Position)
+end
+
+-- Size.X.Scale of a frame.
+local function frameW(obj: any): number
+	local a = addressOf(obj)
+	return if a == 0 then 0 else readF32(a + OFF.Size)
+end
+
+-- ───────────────────────── Input ─────────────────────────
+
+local HAS_RELEASE = type(mouse1release) == "function"
+local mouseHeld = false
+local pendingKeys: { { code: number, at: number } } = {}
+
+-- Presses the left mouse button once (no-op while already held).
+local function holdMouse(): ()
+	if not mouseHeld then
+		mouse1press()
+		mouseHeld = true
+	end
+end
+
+-- Releases the left mouse button (no-op while not held).
+local function releaseMouse(): ()
+	if mouseHeld then
+		mouseHeld = false
+		if HAS_RELEASE then
+			mouse1release()
+		else
+			keyrelease(0x01)
+		end
+	end
+end
+
+-- Sends a fresh press even if the game missed the previous one.
+local function repressMouse(): ()
+	if mouseHeld then
+		if HAS_RELEASE then
+			mouse1release()
+		else
+			keyrelease(0x01)
+		end
+	end
+	mouse1press()
+	mouseHeld = true
+end
+
+-- Sends a fresh release even if the game missed the previous one.
+local function rereleaseMouse(): ()
+	if HAS_RELEASE then
+		mouse1release()
+	else
+		keyrelease(0x01)
+	end
+	mouseHeld = false
+end
+
+local mouseSees = false -- true once isleftpressed() was seen true while we held the button
+local mouseGapAt = 0.0
+local mouseNudgeAt = 0.0
+
+-- Re-presses when we want the button held but the system says it is up (user click, missed event).
+local function syncMouse(now: number): ()
+	if not mouseHeld then
+		mouseGapAt = 0.0
+		return
+	end
+	if isleftpressed() then
+		mouseSees = true
+		mouseGapAt = 0.0
+		return
+	end
+	if mouseSees then
+		if mouseGapAt == 0.0 then
+			mouseGapAt = now
+		elseif now - mouseGapAt >= 0.04 then
+			mouseGapAt = 0.0
+			mouse1press()
+		end
+	elseif now - mouseNudgeAt >= 0.15 then
+		-- isleftpressed has not shown our presses yet: keep nudging, a press while held is harmless
+		mouseNudgeAt = now
+		mouse1press()
+	end
+end
+
+-- Presses a key now and releases it after holdSec (handled by flushKeys).
+local function tapKey(code: number, holdSec: number): ()
+	keypress(code)
+	table.insert(pendingKeys, { code = code, at = os.clock() + holdSec })
+end
+
+-- Releases keys whose hold time has passed.
+local function flushKeys(now: number): ()
+	for i = #pendingKeys, 1, -1 do
+		local p = pendingKeys[i]
+		if now >= p.at then
+			keyrelease(p.code)
+			table.remove(pendingKeys, i)
+		end
+	end
+end
+
+-- ───────────────────────── Game readers ─────────────────────────
+
+local reel: { [string]: any } = {}
+local flags: { [string]: any } = {}
+
+local pgCache: any = nil
+
+-- PlayerGui of the local player (cached while it stays parented).
+local function getPlayerGui(): any
+	if pgCache ~= nil and pgCache.Parent ~= nil then
+		return pgCache
+	end
+	local lp = Players.LocalPlayer
+	pgCache = if lp ~= nil then lp:FindFirstChild("PlayerGui") else nil
+	return pgCache
+end
+
+-- Character model of the local player (workspace model by name, then Player.Character).
+local function getCharacter(): any
+	local lp = Players.LocalPlayer
+	if lp == nil then
+		return nil
+	end
+	local model: any = workspace:FindFirstChild(lp.Name)
+	if model ~= nil then
+		return model
+	end
+	return lp.Character
+end
+
+-- First Tool held by the character.
+local function findTool(char: any): any
+	return char:FindFirstChildOfClass("Tool")
+end
+
+-- True when the rod's values.casted flag is set.
+local function isCasted(tool: any): boolean
+	local values = tool:FindFirstChild("values")
+	local flag = if values ~= nil then values:FindFirstChild("casted") else nil
+	return flag ~= nil and flag.Value == true
+end
+
+local shakeScan = { alt = false, at = 0.0 } -- alt: a shake button was found by the bounded search (Model thread)
+
+-- Fast path: PlayerGui.shakeui.safezone.button (the known layout), only FindFirstChild lookups.
+local function shakeFast(pg: any): boolean
+	local gui = pg:FindFirstChild("shakeui")
+	local zone = if gui ~= nil then gui:FindFirstChild("safezone") else nil
+	return zone ~= nil and zone:FindFirstChild("button") ~= nil
+end
+
+-- Model thread: bounded search for a renamed shake gui or button, so GetChildren never runs in the macro tick.
+local function scanShake(pg: any, now: number): ()
+	shakeScan.at = now
+	local gui: any = pg:FindFirstChild("shakeui")
+	if gui == nil then
+		for _, c in pg:GetChildren() do
+			if string.find(string.lower(c.Name), "shake", 1, true) ~= nil then
+				gui = c
+				break
+			end
+		end
+	end
+	if gui == nil then
+		shakeScan.alt = false
+		return
+	end
+	local found = false
+	local queue: { any } = { gui }
+	local i = 1
+	while not found and i <= #queue and i <= 80 do
+		local node = queue[i]
+		i += 1
+		for _, c in node:GetChildren() do
+			if string.lower(c.Name) == "button" or string.find(c.ClassName, "Button", 1, true) ~= nil then
+				found = true
+				break
+			end
+			table.insert(queue, c)
+		end
+	end
+	shakeScan.alt = found
+end
+
+-- Shake prompt: its button exists.
+local function shakeUp(pg: any): boolean
+	return shakeFast(pg) or shakeScan.alt
+end
+
+-- Resolves the reel minigame parts into `reel`; false when it is not on screen.
+local function readReel(pg: any): boolean
+	local gui = pg:FindFirstChild("reel")
+	if gui == nil then
+		reel.why = "no gui"
+		return false
+	end
+	if not guiEnabled(gui) then
+		reel.why = "gui off"
+		return false
+	end
+	local bar = gui:FindFirstChild("bar")
+	if bar == nil then
+		reel.why = "no bar"
+		return false
+	end
+	local fish = bar:FindFirstChild("fish")
+	if fish == nil then
+		reel.why = "no fish"
+		return false
+	end
+	local playerbar = bar:FindFirstChild("playerbar")
+	if playerbar == nil then
+		reel.why = "no playerbar"
+		return false
+	end
+	reel.why = "ok"
+	reel.bar = bar
+	reel.fish = fish
+	reel.playerbar = playerbar
+	return true
+end
+
+-- Reel progress 0-100 (reel.bar.progress.bar width), nil when unreadable.
+local function readProgress(): number?
+	local progress = reel.bar:FindFirstChild("progress")
+	local fill = if progress ~= nil then progress:FindFirstChild("bar") else nil
+	if fill == nil then
+		return nil
+	end
+	local w = frameW(fill)
+	if not sane(w, -0.05, 1.5) then
+		return nil
+	end
+	return math.clamp(w * 100, 0, 100)
+end
+
+-- Cast power 0-100 (power bar height), nil when the bar is not there.
+local function readPower(char: any): number?
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	local power = if hrp ~= nil then hrp:FindFirstChild("power") else nil
+	if power == nil then
+		return nil
+	end
+	local bar = power:FindFirstChild("bar")
+	if bar == nil then
+		for _, c in power:GetChildren() do
+			bar = c:FindFirstChild("bar")
+			if bar ~= nil then
+				break
+			end
+		end
+	end
+	local a = addressOf(bar)
+	if a == 0 then
+		return nil
+	end
+	local h = readF32(a + OFF.Size + 8)
+	if not sane(h, -0.05, 1.5) then
+		return nil
+	end
+	return math.clamp(h * 100, 0, 100)
+end
+
+-- ───────────────────────── Reel controller ─────────────────────────
+
+local ctl = {
+	stuck = 0.0, -- seconds the bar has been drifting the wrong way
+	resyncs = 0,
+	dt = 0.016,
+	lastCall = 0.0,
+	invert = false,
+	hasLast = false,
+	lastTime = 0.0,
+	fishVel = 0.0,
+	barVel = 0.0,
+	smoothFish = 0.0,
+	smoothBar = 0.0,
+	smoothCtl = 0.0,
+	integ = 0.0,
+	pulseUntil = 0.0,
+	stable = false,
+	stableUntil = 0.0,
+	warmupUntil = 0.0,
+	lastBarRaw = nil :: number?,
+	lastFishRaw = nil :: number?,
+	fv = 0.0, -- fish speed, units/s
+	bv = 0.0, -- bar speed, units/s
+	fishAt = 0.0,
+	barAt = 0.0,
+}
+
+-- Clears the tracker state at the start and end of every reel.
+local function resetCtl(): ()
+	ctl.stuck = 0.0
+	ctl.lastCall = 0.0
+	ctl.invert = false
+	ctl.hasLast = false
+	ctl.lastTime = 0.0
+	ctl.fishVel = 0.0
+	ctl.barVel = 0.0
+	ctl.smoothFish = 0.0
+	ctl.smoothBar = 0.0
+	ctl.smoothCtl = 0.0
+	ctl.integ = 0.0
+	ctl.pulseUntil = 0.0
+	ctl.stable = false
+	ctl.stableUntil = 0.0
+	ctl.warmupUntil = os.clock() + 0.2
+	ctl.lastBarRaw = nil
+	ctl.lastFishRaw = nil
+	ctl.fv = 0.0
+	ctl.bv = 0.0
+	ctl.fishAt = 0.0
+	ctl.barAt = 0.0
+end
+
+-- Logical hold: the mouse is released instead while the rod is inverted (Dreambreaker past 40%).
+local function hold(): ()
+	if ctl.invert then
+		releaseMouse()
+	else
+		holdMouse()
+	end
+end
+
+-- Logical release: the mouse is held instead while the rod is inverted.
+local function rel(): ()
+	if ctl.invert then
+		holdMouse()
+	else
+		releaseMouse()
+	end
+end
+
+-- Reel tracker tuning (positions are 0-1 along the bar track, times in seconds)
+local TUNE_H = table.freeze({
+	EdgeBoundary = 0.1, -- bar position near either track end where the bar is forced back toward the fish
+	CloseThreshold = 0.0055, -- distance to the fish under which the PID takes over from the hard correction
+	FishLeadS = 0.18, -- seconds of fish movement the tracker looks ahead (scaled by tracker strength)
+	PredictionS = 0.13, -- seconds of bar movement used to predict overshoot
+	BrakeS = 0.08, -- seconds of bar travel that count as "already arriving"
+	Kp = 2.7, -- PID proportional gain: how hard the bar chases the fish
+	Ki = 0.08, -- PID integral gain: removes a steady offset
+	Kd = 3.6, -- PID derivative gain: damps overshoot from the fish/bar speed difference
+	PdClamp = 48.0, -- limit of the PID output
+	IntegralClamp = 130.0, -- limit of the integral term
+	BarRatioFromSide = 0.6, -- bar widths from a track end inside which the fish forces a full hold or release
+	CenterZoneRatio = 0.05, -- bar width fraction counted as centered on the fish (pulsing zone)
+	CenterPulsePeriodS = 0.016, -- length of one hold/release pulse cycle inside the centered zone
+	CenterPulseHoldS = 0.013, -- hold time inside one pulse cycle
+	CenterReleaseBlipS = 0.006, -- forced release after a pulse hold
+	CenterWeakPeriodS = 0.017, -- pulse cycle for a weak push inside the centered zone
+	CenterWeakHoldS = 0.01, -- hold time of the weak pulse
+	OnThreshold = 3.5, -- PID output above which the mouse is held
+	MaxVelocity = 1.05, -- speed clamp (track lengths per second)
+	PositionAlpha = 0.92, -- smoothing of the fish and bar positions (higher = less smoothing)
+	ControlAlpha = 0.99, -- smoothing of the PID output (higher = less smoothing)
+})
+
+-- Positive modulo.
+local function posmod(v: number, m: number): number
+	local mm = math.max(0.001, m)
+	local r = v % mm
+	return if r < 0 then r + mm else r
+end
+
+-- Speed from real game updates only: re-reading an unchanged value is not zero speed.
+local function trackSpeed(fishC: number, barC: number, now: number): ()
+	local lf = ctl.lastFishRaw
+	local lb = ctl.lastBarRaw
+	if lf == nil or lb == nil then
+		ctl.lastFishRaw = fishC
+		ctl.lastBarRaw = barC
+		ctl.fishAt = now
+		ctl.barAt = now
+		return
+	end
+	if fishC ~= lf then
+		ctl.fv = math.clamp(0.6 * (fishC - lf) / math.max(0.004, now - ctl.fishAt) + 0.4 * ctl.fv, -4, 4)
+		ctl.lastFishRaw = fishC
+		ctl.fishAt = now
+	elseif now - ctl.fishAt > 0.1 then
+		ctl.fv *= 0.8
+	end
+	if barC ~= lb then
+		ctl.bv = math.clamp(0.6 * (barC - lb) / math.max(0.004, now - ctl.barAt) + 0.4 * ctl.bv, -4, 4)
+		ctl.lastBarRaw = barC
+		ctl.barAt = now
+	elseif now - ctl.barAt > 0.1 then
+		ctl.bv *= 0.8
+	end
+end
+
+-- Hybrid helper: smooths positions and publishes speeds (x1000 units) for the PID.
+local function hybridEma(fishC: number, barC: number, now: number, s: any): ()
+	trackSpeed(fishC, barC, now)
+	local fishX = fishC * 1000
+	local barX = barC * 1000
+	if not ctl.hasLast then
+		ctl.smoothFish = fishX
+		ctl.smoothBar = barX
+		ctl.fishVel = 0
+		ctl.barVel = 0
+		ctl.lastTime = now
+		ctl.hasLast = true
+		return
+	end
+	local alpha: number = s.PositionAlpha
+	ctl.smoothFish = alpha * fishX + (1 - alpha) * ctl.smoothFish
+	ctl.smoothBar = alpha * barX + (1 - alpha) * ctl.smoothBar
+	local maxv = math.max(1, s.MaxVelocity * 1000)
+	ctl.fishVel = math.clamp(ctl.fv * 1000, -maxv, maxv)
+	ctl.barVel = math.clamp(ctl.bv * 1000, -maxv, maxv)
+	ctl.lastTime = now
+end
+
+-- Hybrid fine control near the fish: PID with a stable zone; returns whether to hold.
+local function hybridFine(fishC: number, barC: number, barW01: number, now: number, s: any): boolean
+	local barWidth = math.max(1, barW01 * 1000)
+	local g = (flags.trackGain or 100) / 100
+	local lead = math.clamp(ctl.fishVel * s.FishLeadS * g, -barWidth * 1.2, barWidth * 1.2)
+	local err = ctl.smoothFish + lead - ctl.smoothBar
+	err += math.clamp(barWidth * 0.035, 1.5, 5.0)
+	local dt = ctl.dt
+	ctl.integ = math.clamp(ctl.integ + err * dt, -s.IntegralClamp, s.IntegralClamp)
+	local sideMargin = barWidth * s.BarRatioFromSide
+	local clampV = math.max(s.PdClamp, s.OnThreshold + 1)
+	local raw: number
+	if ctl.smoothFish < sideMargin then
+		raw = -clampV
+	elseif ctl.smoothFish > 1000 - sideMargin then
+		raw = clampV
+	else
+		raw = math.clamp(s.Kp * g * err + s.Ki * ctl.integ + s.Kd * g * (ctl.fishVel - ctl.barVel), -s.PdClamp, s.PdClamp)
+	end
+	ctl.smoothCtl = s.ControlAlpha * raw + (1 - s.ControlAlpha) * ctl.smoothCtl
+	local control = ctl.smoothCtl
+	local centerZone = math.max(2, barWidth * s.CenterZoneRatio)
+	if math.abs(err) <= centerZone then
+		if not ctl.stable then
+			ctl.stable = true
+			ctl.stableUntil = now + 3.0
+		end
+		if now < ctl.stableUntil then
+			return control > s.OnThreshold
+		end
+		if now < ctl.pulseUntil then
+			return false
+		elseif control > s.OnThreshold then
+			local h = posmod(now, s.CenterPulsePeriodS) < math.max(0.001, s.CenterPulseHoldS)
+			if h then
+				ctl.pulseUntil = now + math.max(0, s.CenterReleaseBlipS)
+			end
+			return h
+		elseif control < -s.OnThreshold then
+			return false
+		end
+		return control > 0 and posmod(now, s.CenterWeakPeriodS) < math.max(0.001, s.CenterWeakHoldS)
+	end
+	ctl.stable = false
+	return control > s.OnThreshold
+end
+
+-- Hybrid tracker: aims at the predicted fish position; hard correction when far, PID when close.
+local function reelHybrid(fishC: number, barC: number, barW01: number): ()
+	local s = TUNE_H
+	local now = os.clock()
+	local g = (flags.trackGain or 100) / 100
+	hybridEma(fishC, barC, now, s)
+	local leadMax = math.max(0.03, barW01 * 1.2)
+	local fishP = fishC + math.clamp(ctl.fv * s.FishLeadS * g, -leadMax, leadMax)
+	local err = fishP - barC
+	if now < ctl.warmupUntil then
+		if err > math.max(0.015, barW01 * 0.04) then
+			hold()
+		else
+			rel()
+		end
+		return
+	end
+	if barC < s.EdgeBoundary and err > 0 then
+		hold()
+		return
+	end
+	if barC > 1 - s.EdgeBoundary and err < 0 then
+		rel()
+		return
+	end
+	if math.abs(err) > s.CloseThreshold then
+		local remaining = math.abs(err) - s.CloseThreshold
+		local predErr = fishP - (barC + ctl.bv * s.PredictionS * g)
+		if err * predErr > 0 and not (err * ctl.bv > 0 and math.abs(ctl.bv) * s.BrakeS >= remaining) then
+			if err > 0 then
+				hold()
+			else
+				rel()
+			end
+			return
+		end
+	end
+	if hybridFine(fishC, barC, barW01, now, s) then
+		hold()
+	else
+		rel()
+	end
+end
+
+-- Drives the mouse from the fish and bar positions (hybrid tracker plus input resync).
+local function reelTrack(fishC: number, barC: number, barW01: number): ()
+	local clock = os.clock()
+	ctl.dt = if ctl.lastCall > 0 then math.clamp(clock - ctl.lastCall, 0.001, 0.1) else 0.016
+	ctl.lastCall = clock
+	-- Resync: the bar keeps drifting the wrong way, so the game probably missed a press or release.
+	-- The drift is measured in seconds, so extra samples from PreLocal do not shorten it.
+	local err = fishC - barC
+	local barVel = ctl.bv * 0.021 -- bar travel per game frame
+	local held = if ctl.invert then not mouseHeld else mouseHeld
+	local halfW = barW01 / 2 + 0.03
+	if held and err > 0.06 and barVel < 0.0003 and barC < 1 - halfW then
+		ctl.stuck += ctl.dt
+	elseif not held and err < -0.06 and barVel > -0.0003 and barC > halfW then
+		ctl.stuck += ctl.dt
+	else
+		ctl.stuck = 0.0
+	end
+	if ctl.stuck >= STUCK_RESYNC_S then
+		ctl.stuck = 0.0
+		ctl.resyncs += 1
+		if held == not ctl.invert then
+			repressMouse()
+		else
+			rereleaseMouse()
+		end
+	end
+	reelHybrid(fishC, barC, barW01)
+end
+
+-- ───────────────────────── Menu ─────────────────────────
+
+local infoLines: { string } = {
+	"State: --",
+	"Phase: --   Rod: --",
+	"Casts: 0   Shakes: 0",
+	"Caught: 0   Lost: 0",
+	"Reel progress: --",
+	"Cast power: --",
+	"Uptime: 00:00",
+	"Success: --   Fish/h: --",
+	"Avg catch: --   Streak: 0 (best 0)",
+	"Timeouts: 0",
+	"Offsets: --",
+	"Mouse release: --",
+	"Tick rate: --",
+	"Game streak: --",
+}
+local hudLines: { string } = { "Off", "Caught 0   Lost 0" }
+
+-- Macro and session state (mutable, kept apart from the frozen constants)
+local S = {
+	phase = "OFF",
+	phaseAt = 0.0,
+	wasEnabled = false,
+	navDone = false,
+	castPressAt = 0.0,
+	lastShakeAt = 0.0,
+	equipAt = 0.0,
+	rodCheckAt = 0.0,
+	rodMissing = 0,
+	reequipLeft = 0,
+	reequipAt = 0.0,
+	reelGoneAt = 0.0,
+	maxProgress = 0.0,
+	shakeSeen = false,
+	casts = 0,
+	shakes = 0,
+	caught = 0,
+	lost = 0,
+	infoAt = 0.0,
+	power = -1.0,
+	progress = -1.0,
+	rod = "none",
+	status = "Off",
+	notice = "",
+	noticeUntil = 0.0,
+	activeSec = 0.0,
+	cycleAt = 0.0,
+	catchSum = 0.0,
+	streak = 0,
+	bestStreak = 0,
+	timeouts = 0,
+	reelStartAt = 0.0,
+	lastFishX = 0.0,
+	lastBarX = 0.0,
+	resyncs = 0,
+	inTicks = 0,
+	totalTicks = 0,
+	tickCount = 0,
+	hz = 0.0,
+	hzAt = 0.0,
+	streakBefore = -1,
+	badTicks = 0, -- consecutive reel ticks with unreadable fish or bar positions
+	gs = nil :: number?, -- last sampled game streak (tracker_streak)
+	ups = 0, -- streak increases seen (catches)
+	downs = 0, -- streak drops seen (losses)
+	ups0 = 0, -- ups at the start of the current reel
+	downs0 = 0, -- downs at the start of the current reel
+	attrAt = 0.0, -- time of the last character attribute read
+	attrReeling = false, -- character attributes say a reel is active
+	attrLearned = false, -- the attributes were seen active during a reel, so their end can be trusted
+}
+
+-- Shows a short message in the Info tab for a few seconds.
+local function notice(text: string): ()
+	S.notice = text
+	S.noticeUntil = os.clock() + 3.0
+end
+
+-- Menu flags that are saved between runs (Auto Fish is never saved).
+local PERSIST = table.freeze({
+	"autoCast", "autoShake", "autoReel", "perfect", "holdMs", "shakeMs", "navOnStart", "autoEquip",
+	"hud", "fromSaved", "trackGain", "worldOn", "huntOn",
+	"walkWater", "walkOcean", "walkDesolate", "walkDepths",
+})
+local SETTINGS_FILE = "fisch_settings.json"
+local settingsSnap: { [string]: any } = {}
+
+-- Loads saved flags from the workspace file (the menu keeps values that are already set).
+local function loadSettings(): ()
+	if not isfile(SETTINGS_FILE) then
+		return
+	end
+	local text: string = readfile(SETTINGS_FILE)
+	if string.sub(text, 1, 1) ~= "{" then
+		return
+	end
+	local data: any = crypt.json.decode(text)
+	if type(data) ~= "table" then
+		return
+	end
+	for _, key in PERSIST do
+		local v = data[key]
+		if type(v) == "boolean" or type(v) == "number" then
+			flags[key] = v
+			settingsSnap[key] = v
+		end
+	end
+end
+loadSettings()
+
+-- Writes the saved flags when any of them changed.
+local function saveSettings(): ()
+	local changed = false
+	for _, key in PERSIST do
+		if flags[key] ~= settingsSnap[key] then
+			changed = true
+			break
+		end
+	end
+	if not changed then
+		return
+	end
+	local out: { [string]: any } = {}
+	for _, key in PERSIST do
+		local v = flags[key]
+		out[key] = v
+		settingsSnap[key] = v
+	end
+	writefile(SETTINGS_FILE, crypt.json.encode(out))
+end
+
+local ui: any = Lib.new({
+	Title = "FISCH",
+	Key = "RightShift",
+	Flags = flags,
+	-- The macro presses the left button itself: those presses must not click the menu
+	Mute = function(): boolean
+		return mouseHeld
+	end,
+	Stat = {
+		Label = "STATE",
+		Value = function(): string
+			local ph = S.phase
+			if ph == "CAST" or ph == "CASTED" then
+				return "Cast"
+			elseif ph == "SHAKE" then
+				return if S.shakeSeen then "Shake" else "Bite"
+			elseif ph == "REEL" then
+				return "Reel"
+			elseif ph == "DONE" then
+				return "Done"
+			elseif ph == "REEQUIP" then
+				return "Equip"
+			end
+			return "Off"
+		end,
+	},
+})
+
+local connections: { any } = {}
+local onUnload: { any } = {}
+
+-- Stops everything: macro, input, menu and event connections.
+local function unload(): ()
+	saveSettings()
+	flags.enabled = false
+	releaseMouse()
+	for _, fn in onUnload do
+		fn()
+	end
+	for _, p in pendingKeys do
+		keyrelease(p.code)
+	end
+	table.clear(pendingKeys)
+	for _, c in connections do
+		c:disconnect()
+	end
+	table.clear(connections)
+	ui:destroy()
+	G.FischKill = nil
+end
+G.FischKill = unload
+
+local fishing = ui:tab("Fishing")
+fishing:toggle({ Name = "Auto Fish", Flag = "enabled", Default = false, Key = "F1" })
+-- Only read when Auto Fish is switched on; flipping this toggle alone does nothing.
+fishing:toggle({ Name = "Fish from saved spot", Flag = "fromSaved", Default = false })
+fishing:dropdown({
+	Name = "Auto cast / shake / reel",
+	Items = {
+		{ Name = "Auto Cast", Flag = "autoCast", Default = true },
+		{ Name = "Auto Shake", Flag = "autoShake", Default = true },
+		{ Name = "Auto Reel", Flag = "autoReel", Default = true },
+	},
+})
+fishing:section({ Title = "CAST", Divider = true })
+fishing:toggle({ Name = "Perfect cast", Flag = "perfect", Default = true })
+fishing:slider({ Name = "HOLD TIME", Flag = "holdMs", Min = 100, Max = 1500, Default = 300, Step = 50, Suffix = " ms" })
+fishing:section({ Title = "SHAKE", Divider = true })
+fishing:slider({ Name = "SHAKE DELAY", Flag = "shakeMs", Min = 10, Max = 200, Default = 25, Step = 5, Suffix = " ms" })
+fishing:toggle({ Name = "UI nav on start (\\)", Flag = "navOnStart", Default = true })
+fishing:section({ Title = "TRACKER", Divider = true })
+fishing:slider({ Name = "TRACKER STRENGTH", Flag = "trackGain", Min = 50, Max = 300, Default = 100, Step = 5, Suffix = "%" })
+fishing:section({ Title = "ROD", Divider = true })
+fishing:toggle({ Name = "Auto equip rod (T)", Flag = "autoEquip", Default = true })
+fishing:section({ Title = "WALK ON WATER", Divider = true })
+fishing:toggle({ Name = "Walk on water", Flag = "walkWater", Default = false })
+fishing:dropdown({
+	Name = "Water zones",
+	Items = {
+		{ Name = "Ocean", Flag = "walkOcean", Default = true },
+		{ Name = "Desolate Deep", Flag = "walkDesolate" },
+		{ Name = "The Depths", Flag = "walkDepths" },
+	},
+})
+
+-- ───────────────────────── Teleports ─────────────────────────
+
+-- Teleport spots as { name, x, y, z }, grouped for the menu lists.
+local TP_GROUPS: { any } = table.freeze({
+	{ "Islands", {
+		{ "Moosewood", 383.1, 131.24, 243.93 },
+		{ "Roslit Bay", -1476.51, 130.17, 671.69 },
+		{ "Mushgrove Swamp", 2501.49, 127.76, -720.7 },
+		{ "Snowcap Island", 2648.68, 139.07, 2521.3 },
+		{ "Sunstone Island", -933.26, 128.14, -1119.52 },
+		{ "Terrapin Island", -143.88, 141.17, 1909.61 },
+		{ "Statue", 72.88, 138.7, -1028.42 },
+		{ "The Arch", 998.97, 126.68, -1237.14 },
+		{ "Birch Cay", 1742.32, 138.26, -2502.24 },
+		{ "Harvesters Spike", -1254.8, 133.89, 1554.2 },
+		{ "Roslit Volcano", -1888.52, 163.85, 329.24 },
+		{ "Vertigo", -112.01, -492.9, 1040.33 },
+		{ "Ancient Isle", 5833.0, 125.0, 401.0 },
+	} },
+	{ "Places", {
+		{ "Keepers Altar", 1296.32, -808.55, -298.94 },
+		{ "Brine Pool", -1794.11, -145.85, -3302.92 },
+		{ "Deep", -1510.89, -237.7, -2852.91 },
+		{ "Deep Shop", -979.2, -247.91, -2699.87 },
+		{ "Wilson", 2938.81, 277.47, 2567.13 },
+		{ "Wilsons Rod", 2879.21, 135.08, 2723.64 },
+		{ "Executive", -29.84, -250.48, 199.12 },
+		{ "Mod House", -30.21, -249.41, 204.05 },
+	} },
+	{ "Fish areas 1", {
+		{ "Roslit Bay", -1663.74, 149.23, 495.5 },
+		{ "Roslit Bay Ocean", -1708.09, 155.0, 384.93 },
+		{ "Roslit Pond", -1811.97, 148.05, 592.64 },
+		{ "Roslit Pond Seaweed", -1785.29, 148.16, 639.93 },
+		{ "Lava", -1959.86, 193.14, 271.96 },
+		{ "Moosewood Docks", 343.24, 133.62, 267.06 },
+		{ "Moosewood Pond", 509.74, 152.0, 302.17 },
+		{ "Moosewood Ocean", -167.64, 125.2, 248.01 },
+		{ "Moosewood Mythical", 252.8, 135.85, 36.88 },
+		{ "Ocean", 7665.1, 125.44, 2601.59 },
+		{ "Deep Ocean", 3569.07, 125.48, 6697.13 },
+		{ "Vertigo", -137.7, -736.86, 1233.15 },
+	} },
+	{ "Fish areas 2", {
+		{ "Snowcap Pond", 2778.09, 283.28, 2580.32 },
+		{ "Snowcap Ocean", 3088.67, 131.53, 2587.11 },
+		{ "Harvesters Spike", -1234.62, 125.23, 1748.57 },
+		{ "Sunstone", -845.9, 133.17, -1163.58 },
+		{ "Sunstone Hidden", -1139.56, 134.62, -1076.94 },
+		{ "Terrapin Ocean", 58.65, 135.5, 2147.42 },
+		{ "Terrapin Olm", 22.06, 182.0, 1944.37 },
+		{ "Scallop Ocean", 23.23, 125.24, 738.95 },
+		{ "The Arch", 1283.31, 130.92, -1165.3 },
+		{ "Mushgrove Stone", 2525.36, 131.0, -776.18 },
+		{ "Altar fish spot", 1307.14, -805.29, -161.36 },
+		{ "Isonade", -1061.0, 121.16, 954.0 },
+	} },
+	{ "NPCs 1", {
+		{ "Sell spot", 464.0, 151.0, 232.0 },
+		{ "Marc", 466.16, 151.0, 224.5 },
+		{ "Merchant", 416.69, 130.3, 342.77 },
+		{ "Appraiser", 453.18, 150.5, 206.91 },
+		{ "Pierre", 391.39, 135.35, 196.71 },
+		{ "Phineas", 469.91, 150.69, 277.95 },
+		{ "Paul", 381.74, 136.5, 341.89 },
+		{ "Shipwright", 357.97, 133.62, 258.15 },
+		{ "Angler", 480.1, 150.5, 302.23 },
+		{ "Lucas", 449.34, 182.0, 180.69 },
+		{ "Inn Keeper", 487.46, 150.8, 231.5 },
+		{ "Henry", 483.54, 152.38, 236.3 },
+		{ "Daisy", 581.55, 165.49, 213.5 },
+		{ "Witch", 409.64, 134.45, 311.4 },
+		{ "Quiet Synph", 566.26, 152.0, 353.87 },
+	} },
+	{ "NPCs 2", {
+		{ "Roslit Keeper", -1512.38, 134.5, 631.24 },
+		{ "Fishing NPC 1", -1429.04, 134.37, 686.03 },
+		{ "Fishing NPC 2", -1778.55, 149.79, 648.1 },
+		{ "Fishing NPC 3", -1778.27, 147.83, 653.26 },
+		{ "Ashe", -1709.94, 149.86, 729.4 },
+		{ "Alfredrickus", -1520.61, 142.92, 764.52 },
+		{ "Lantern Keeper", -39.05, -246.6, 195.64 },
+		{ "Lantern Keeper 2", -17.42, -304.97, -14.53 },
+		{ "Mod Keeper", -39.09, -245.14, 195.84 },
+		{ "Jack Marrow", -2824.36, 214.31, 1518.13 },
+	} },
+	{ "Totems", {
+		{ "Aurora Totem", -1811.0, -137.0, -3282.0 },
+		{ "Sundial Totem", -1148.0, 135.0, -1075.0 },
+		{ "Windset Totem", 2849.0, 178.0, 2702.0 },
+		{ "Smokescreen Totem", 2789.0, 140.0, -625.0 },
+		{ "Tempest Totem", 35.0, 133.0, 1943.0 },
+	} },
+	{ "Rods", {
+		{ "Training Rod", 457.69, 148.36, 230.41 },
+		{ "Plastic Rod", 454.43, 148.17, 229.17 },
+		{ "Flimsy Rod", 471.11, 148.36, 229.64 },
+		{ "Lucky Rod", 446.09, 148.25, 222.16 },
+		{ "Fast Rod", 447.18, 148.23, 220.19 },
+		{ "Carbon Rod", 454.08, 150.59, 225.33 },
+		{ "Long Rod", 485.7, 171.66, 145.75 },
+		{ "Mythical Rod", 389.72, 132.59, 314.04 },
+		{ "Midas Rod", 401.98, 133.26, 326.33 },
+		{ "Nocturnal Rod", -141.87, -515.31, 1139.05 },
+		{ "Kings Rod", 1375.58, -810.2, -303.51 },
+		{ "Trident Rod", -1484.34, -222.33, -2194.77 },
+		{ "Stone Rod", 5500.0, 145.0, -315.0 },
+	} },
+	{ "Items", {
+		{ "Enchanted Altar", 1310.55, -799.47, -82.73 },
+		{ "Bait Crate", 384.58, 135.35, 337.53 },
+		{ "Quality Bait Crate", -177.88, 144.47, 1932.84 },
+		{ "Crab Cage", 474.8, 149.66, 229.49 },
+		{ "GPS", 517.9, 149.22, 284.86 },
+		{ "Basic Diving Gear", 369.17, 132.51, 248.71 },
+		{ "Fish Radar", 365.75, 134.5, 274.11 },
+	} },
+})
+
+local tpJob: any = nil
+
+-- Reads a part's position as three numbers (nil when unreadable).
+local function readPosition(part: any): (number?, number?, number?)
+	local p: any = part.Position
+	if p == nil then
+		return nil, nil, nil
+	end
+	local x, y, z = p.X, p.Y, p.Z
+	if type(x) == "number" and type(y) == "number" and type(z) == "number" then
+		return x, y, z
+	end
+	return nil, nil, nil
+end
+
+-- Reads the part's flat (XZ) look direction as { x, z }, nil when unreadable.
+local function readFacing(part: any): { number }?
+	local v: any = part.LookVector
+	if v == nil then
+		return nil
+	end
+	local x, z = v.X, v.Z
+	if type(x) ~= "number" or type(z) ~= "number" then
+		return nil
+	end
+	local len = math.sqrt(x * x + z * z)
+	if len < 0.1 then
+		return nil
+	end
+	return { x / len, z / len }
+end
+
+-- Starts a teleport job; stepTeleport applies it for a moment.
+local function queueTeleport(name: string, x: number, y: number, z: number, lift: number, face: { number }?): ()
+	tpJob = {
+		name = name,
+		x = x,
+		y = y + lift,
+		z = z,
+		face = face,
+		untilAt = os.clock() + 0.6,
+		woke = false,
+		frames = 0,
+		noCf = false,
+	}
+end
+
+-- Menu teleport (blocked while Auto Fish runs).
+local function teleportTo(name: string, x: number, y: number, z: number, lift: number?, face: { number }?): ()
+	if flags.enabled == true then
+		notice("Stop Auto Fish to teleport")
+		return
+	end
+	queueTeleport(name, x, y, z, lift or 4, face)
+	notice(`Teleporting: {name}`)
+end
+
+-- Writes the target every frame for a moment: CFrame.new(position, lookAt) when a facing is
+-- given, otherwise Position. A standing character has a sleeping physics assembly that ignores
+-- the write, so a short W tap wakes it first. If the CFrame write has no effect, it falls back to Position.
+local function stepTeleport(now: number): ()
+	local job = tpJob
+	if job == nil then
+		return
+	end
+	local char: any = getCharacter()
+	local hrp: any = if char ~= nil then char:FindFirstChild("HumanoidRootPart") else nil
+	if hrp == nil then
+		tpJob = nil
+		notice("No character")
+		return
+	end
+	if now >= job.untilAt then
+		tpJob = nil
+		notice(`Teleported: {job.name}`)
+		return
+	end
+	if not job.woke and isrbxactive() then
+		job.woke = true
+		tapKey(VK.W, 0.25)
+	end
+	job.frames += 1
+	local face: { number }? = job.face
+	local useCf = face ~= nil and not job.noCf
+	if useCf and job.frames == 4 then
+		local px, py, pz = readPosition(hrp)
+		if px == nil or py == nil or pz == nil then
+			job.noCf = true
+		else
+			local dx, dy, dz = px - job.x, py - job.y, pz - job.z
+			if dx * dx + dy * dy + dz * dz > 400 then
+				job.noCf = true
+			end
+		end
+	end
+	if useCf and face ~= nil then
+		hrp.CFrame = CFrame.new(
+			Vector3.new(job.x, job.y, job.z),
+			Vector3.new(job.x + face[1], job.y, job.z + face[2])
+		)
+	else
+		hrp.Position = vec(job.x, job.y, job.z)
+	end
+end
+
+local SAVE_FILE = "fisch_saved_spot.txt"
+local saved: { x: number, y: number, z: number, face: { number }? }? = nil
+local savedLines: { string } = { "Saved: none", "Facing: --" }
+
+-- Remembers the saved position and facing and updates the Teleports tab text.
+local function setSaved(x: number, y: number, z: number, face: { number }?): ()
+	saved = { x = x, y = y, z = z, face = face }
+	savedLines[1] = string.format("Saved: %.0f, %.0f, %.0f", x, y, z)
+	savedLines[2] = if face ~= nil then "Facing: saved" else "Facing: not saved"
+end
+
+-- Stores the current character position and facing (also written to a workspace file).
+local function savePosition(): ()
+	local char: any = getCharacter()
+	local hrp: any = if char ~= nil then char:FindFirstChild("HumanoidRootPart") else nil
+	if hrp == nil then
+		notice("No character")
+		return
+	end
+	local x, y, z = readPosition(hrp)
+	if x == nil or y == nil or z == nil then
+		notice("Can't read position")
+		return
+	end
+	local face = readFacing(hrp)
+	setSaved(x, y, z, face)
+	local text = string.format("%.2f,%.2f,%.2f", x, y, z)
+	if face ~= nil then
+		text ..= string.format(",%.4f,%.4f", face[1], face[2])
+	end
+	writefile(SAVE_FILE, text)
+	notice("Position saved")
+end
+
+-- Teleports to the stored position and facing.
+local function gotoSaved(): ()
+	local pos = saved
+	if pos == nil then
+		notice("No saved position")
+		return
+	end
+	teleportTo("saved position", pos.x, pos.y, pos.z, 0, pos.face)
+end
+
+if isfile(SAVE_FILE) then
+	local nums: { number } = {}
+	for token in string.gmatch(readfile(SAVE_FILE), "%-?%d+%.?%d*") do
+		local n = tonumber(token)
+		if n ~= nil then
+			table.insert(nums, n)
+		end
+	end
+	if #nums >= 3 then
+		setSaved(nums[1], nums[2], nums[3], if #nums >= 5 then { nums[4], nums[5] } else nil)
+	end
+end
+
+-- ───────────────────────── World info, hunts, stats ─────────────────────────
+
+-- ReplicatedStorage.world (GetService can return nil here, so look it up by name).
+local function getWorld(): any
+	local rs: any = game:FindFirstChild("ReplicatedStorage")
+	if rs == nil then
+		rs = game:GetService("ReplicatedStorage")
+	end
+	return if rs ~= nil then rs:FindFirstChild("world") else nil
+end
+
+-- Cooldown stamps in seconds: keep the heavy reads rare.
+local W = { gsAt = 0.0, clockAt = 0.0, scanAt = 0.0, huntAt = 0.0, saveAt = 0.0, lastTick = 0.0, waterAt = 0.0, resolveAt = 0.0, playersAt = 0.0 }
+
+-- Workspace attributes that hold an active event (value = end time or true).
+local EVENT_ATTRS = table.freeze({
+	AbsoluteDarkness = "Absolute Darkness",
+	DepthsAbsoluteDarkness = "Absolute Darkness",
+	NectarBloom = "Nectar Bloom",
+	BrineStorm = "Brine Storm",
+	DripstoneCollapse = "Dripstone Collapse",
+	PowerBurst = "Power Burst",
+	Earthquake = "Earthquake",
+	Eruption = "Eruption",
+	Blizzard = "Blizzard",
+	Avalanche = "Avalanche",
+	ZeusStorm = "Zeus Storm",
+	PoseidonWrath = "Poseidon Wrath",
+	WarSurge = "War Surge",
+	SolarChorus = "Solar Chorus",
+	StormFlood = "Storm Flood",
+	SoulScourge = "Soul Scourge",
+	WispHaunt = "Wisp Haunt",
+	DustStorm = "Dust Storm",
+	TorrentialRain = "Torrential Rain",
+})
+
+-- Known hunt names (matched by normalized key)
+local HUNT_KNOWN = table.freeze({
+	"Baby Bloop Fish", "Bloop Fish", "Profane Leviathan", "Elder Mossjaw", "Colossal Ancient Dragon",
+	"Colossal Blue Dragon", "Colossal Ethereal Dragon", "Dreadfin", "Flower Guardian", "Frostwyrm",
+	"Goldwraith", "Beluga", "Helios Sunray", "Humpback Whale Migration", "Kerauno Wyrm", "Kraken",
+	"Legionnaire Lamprey", "Leviathan", "Megalodon", "Megamouth Shark", "Mossjaw", "Mosslurker",
+	"Olympian Devil", "Omnithal", "Orca Migration", "Plesiosaur", "Pliosaur", "Reef Titan", "Rotbloom",
+	"Scylla", "Sea Leviathan", "Shark", "Skeletal Leviathan", "Styx Angler", "Tidecrasher Archon",
+	"Toxic Guardian", "Whale Migration", "Wyvern", "Whale Shark", "Great White Shark", "Awakened Omnithal",
+	"Ancient Megalodon", "Livyatan", "The Depths - Serpent", "Nectar Den - Serpent",
+	"Great Hammerhead Shark", "Brine Storm", "Isonade",
+})
+
+-- Alternative instance names that map to a known hunt
+local HUNT_ALIASES = table.freeze({
+	["orca"] = "Orca Migration",
+	["ancient orca"] = "Orca Migration",
+	["whale"] = "Whale Migration",
+	["humpback whale"] = "Humpback Whale Migration",
+	["forsaken veil - scylla"] = "Scylla",
+})
+
+-- Normalized key: lowercase letters and digits only.
+local function huntKey(raw: string): string
+	return (string.gsub(string.lower(raw), "[^%w]", ""))
+end
+
+local huntKeys: { [string]: string } = {}
+for _, name in HUNT_KNOWN do
+	huntKeys[huntKey(name)] = name
+end
+for alias, name in HUNT_ALIASES do
+	huntKeys[huntKey(alias)] = name
+end
+-- EventParts folders that exist while an event or hunt is active.
+for key, name in {
+	soulpool = "Soul Pool",
+	starfall = "Starfall",
+	terrosunder = "Terrosunder",
+	anniversaryspawns = "Anniversary",
+	abaia = "Abaia",
+	monstrouscusk = "Monstrous Cusk",
+	flowerguardian = "Flower Guardian",
+	globalmigration = "Migration",
+	globalfisheventpools = "Event Pools",
+} do
+	huntKeys[key] = name
+end
+
+-- Maps an instance name to a known hunt name (handles fish_ / Hunt / Default / Paths / Nodes decorations).
+local function classifyHuntRaw(raw: string): string?
+	local key = huntKey(raw)
+	key = string.gsub(key, "^fish", "")
+	local direct = huntKeys[key]
+	if direct ~= nil then
+		return direct
+	end
+	for _, suffix in { "hunt", "default", "paths", "waypoints", "nodes", "parts", "huntpools" } do
+		local n = #suffix
+		if #key > n and string.sub(key, -n) == suffix then
+			local hit = huntKeys[string.sub(key, 1, #key - n)]
+			if hit ~= nil then
+				return hit
+			end
+		end
+	end
+	local lower = string.lower(raw)
+	if
+		string.find(lower, "hunt", 1, true) ~= nil
+		or string.find(lower, "pool", 1, true) ~= nil
+		or string.find(lower, "boil", 1, true) ~= nil
+	then
+		return raw
+	end
+	return nil
+end
+
+local classifyCache: { [string]: any } = {}
+
+-- Cached classifyHunt: each distinct name is parsed only once (keeps ticks short).
+local function classifyHunt(raw: string): string?
+	local c = classifyCache[raw]
+	if c == nil then
+		c = classifyHuntRaw(raw) or false
+		classifyCache[raw] = c
+	end
+	return if c == false then nil else c
+end
+
+-- Position of a part, or of a model's primary / first part.
+local function posOf(inst: any): (number?, number?, number?)
+	local target: any = inst
+	if inst.ClassName == "Folder" then
+		local queue: { any } = { inst }
+		local depths: { number } = { 0 }
+		local i = 1
+		while i <= #queue and i <= 60 do
+			local node = queue[i]
+			local depth = depths[i]
+			i += 1
+			for _, c in node:GetChildren() do
+				local cn = c.ClassName
+				if cn == "Part" or cn == "MeshPart" or cn == "UnionOperation" then
+					return readPosition(c)
+				end
+				if depth < 3 and (cn == "Folder" or cn == "Model") then
+					table.insert(queue, c)
+					table.insert(depths, depth + 1)
+				end
+			end
+		end
+		return nil, nil, nil
+	end
+	if inst.ClassName == "Model" then
+		local pp: any = inst.PrimaryPart
+		if pp ~= nil then
+			target = pp
+		else
+			for _, c in inst:GetChildren() do
+				local cn = c.ClassName
+				if cn == "Part" or cn == "MeshPart" or cn == "UnionOperation" then
+					target = c
+					break
+				end
+			end
+		end
+	end
+	return readPosition(target)
+end
+
+-- Day / night text from the world cycle value.
+local function serverClock(): string
+	local world: any = getWorld()
+	local cyc: any = if world ~= nil then world:FindFirstChild("cycle") else nil
+	local text: any = if cyc ~= nil then cyc.Value else nil
+	return `Time: {if type(text) == "string" and text ~= "" then text else "?"}`
+end
+
+-- World tab text parts, rebuilt in the Model thread and published as a whole new table (snapshot for Render).
+local worldState = {
+	time = "Time: --",
+	events = { "Events: --", "", "", "", "" } :: { string },
+	hunts = { "Hunt: off" } :: { string },
+}
+local worldNote: any = nil
+local worldSeen: { [string]: boolean } = {}
+
+-- Builds the World tab lines (time, 5 event slots, hunts) and swaps them in.
+local function publishWorld(): ()
+	local lines: { string } = { worldState.time }
+	for _, l in worldState.events do
+		table.insert(lines, l)
+	end
+	for _, l in worldState.hunts do
+		table.insert(lines, l)
+	end
+	if worldNote ~= nil then
+		worldNote.Lines = lines
+	end
+end
+
+-- Converts an end-time value to unix seconds (nil when it is not one).
+local function toUnix(v: any): number?
+	if type(v) ~= "number" or v ~= v then
+		return nil
+	end
+	local n = if v >= 1e12 then v / 1000 else v
+	return if n >= 1e8 then n else nil
+end
+
+-- Reads weather and events from a few known places and updates the World tab text.
+local function scanWorld(): ()
+	local names: { string } = {}
+	local ends: { [string]: number } = {}
+	local srcs: { [string]: string } = {}
+	-- Registers one active event (first source wins, the end time is kept when known).
+	local function add(name: string, endAt: number?, source: string): ()
+		if srcs[name] == nil then
+			table.insert(names, name)
+			srcs[name] = source
+		end
+		if endAt ~= nil then
+			ends[name] = endAt
+		end
+	end
+	local unixNow = os.time()
+	local world: any = getWorld()
+	if world ~= nil then
+		for _, slotName in { "weather", "clientWeather", "event", "admin_event", "AdminEventText" } do
+			local slot: any = world:FindFirstChild(slotName)
+			if slot ~= nil and slot.ClassName == "StringValue" then
+				local text: any = slot.Value
+				if type(text) == "string" and text ~= "" and string.lower(text) ~= "none" then
+					local e: any = slot:GetAttribute("EndTime")
+					if e == nil then
+						e = slot:GetAttribute("endTime")
+					end
+					local endAt = toUnix(e)
+					if endAt == nil or endAt > unixNow then
+						add(text, endAt, "world." .. slotName)
+					end
+				end
+			end
+		end
+		for flagName, display in { meteor_active = "Meteor", blizzard_active = "Blizzard", absolute_darkness_active = "Absolute Darkness" } do
+			local f: any = world:FindFirstChild(flagName)
+			if f ~= nil and f.ClassName == "BoolValue" and f.Value == true then
+				add(display, nil, "world." .. flagName)
+			end
+		end
+	end
+	for key, display in EVENT_ATTRS do
+		local v: any = workspace:GetAttribute(key)
+		if v == nil then
+			v = workspace:GetAttribute(key .. "Active")
+		end
+		if type(v) == "number" then
+			local endAt = toUnix(v)
+			if endAt ~= nil then
+				if endAt > unixNow then
+					add(display, endAt, "workspace." .. key)
+				end
+			elseif v > 0 then
+				add(display, nil, "workspace." .. key)
+			end
+		elseif v == true then
+			add(display, nil, "workspace." .. key)
+		end
+	end
+
+	local current: { [string]: boolean } = {}
+	local lines: { string } = { "", "", "", "", "" }
+	for i, name in names do
+		current[name] = true
+		local endAt = ends[name]
+		local left = if endAt ~= nil then math.max(0, endAt - unixNow) else nil
+		if i <= 5 then
+			lines[i] = if left ~= nil then string.format("%s  %d:%02d", name, math.floor(left / 60), math.floor(left % 60)) else name
+		end
+	end
+	worldSeen = current
+	if #names == 0 then
+		lines[1] = "Events: none"
+	end
+	worldState.events = lines
+	publishWorld()
+end
+
+local streakNode: any = nil
+local streakNodeAt = -1e9
+
+-- The game's own streak (workspace.PlayerStats.<name>.T.<name>.Stats.tracker_streak); nil when unreadable.
+local function readGameStreak(): number?
+	local player: any = Players.LocalPlayer
+	if player == nil then
+		return nil
+	end
+	if streakNode ~= nil and streakNode.Parent == nil then
+		streakNode = nil
+	end
+	if streakNode == nil then
+		local now = os.clock()
+		if now - streakNodeAt < 1.0 then
+			return nil
+		end
+		streakNodeAt = now
+		local node: any = workspace
+		for _, name in { "PlayerStats", player.Name, "T", player.Name, "Stats", "tracker_streak" } do
+			node = node:FindFirstChild(name)
+			if node == nil then
+				return nil
+			end
+		end
+		streakNode = node
+	end
+	local v: any = streakNode.Value
+	return if type(v) == "number" and v == v then v else nil
+end
+
+-- Counts catches and losses from the game's own streak: +1 = caught, a drop = lost. Counted only while
+-- Auto Fish runs (phase is not OFF); the first sample is just the baseline. Independent of the reel state machine.
+local function trackStreak(now: number): ()
+	if now - W.gsAt < 0.1 then
+		return
+	end
+	W.gsAt = now
+	local cur = readGameStreak()
+	if cur == nil then
+		return
+	end
+	local last = S.gs
+	S.gs = cur
+	if last == nil or cur == last then
+		return
+	end
+	local counting = S.phase ~= "OFF"
+	if cur > last then
+		S.ups += 1
+		if counting then
+			S.caught += 1
+			S.streak += 1
+			S.bestStreak = math.max(S.bestStreak, S.streak)
+			if S.cycleAt > 0 then
+				S.catchSum += now - S.cycleAt
+			end
+		end
+	else
+		S.downs += 1
+		if counting then
+			S.lost += 1
+			S.streak = 0
+		end
+	end
+end
+
+local huntFound: { [string]: any } = {} -- snapshot: replaced as a whole after every scan
+
+local huntOrder: { string } = {}
+local huntCursor = 0
+local huntActive = false -- hunt detection has published results that must be cleared when it is switched off
+local megaNames: { [string]: any } = {} -- cache: instance name -> hunt name (false when not a megalodon)
+local MEGA_EXACT = table.freeze({ "Megalodon", "Ancient Megalodon" })
+
+-- A Megalodon can spawn outside zones.fishing: exact names are looked up in workspace (no GetChildren on the
+-- big root), the small active and active.bosses folders are scanned by name.
+local function scanMegalodon(current: { [string]: any }): ()
+	local active: any = workspace:FindFirstChild("active")
+	local bosses: any = if active ~= nil then active:FindFirstChild("bosses") else nil
+	for _, name in MEGA_EXACT do
+		local c: any = workspace:FindFirstChild(name)
+		if c ~= nil and current[name] == nil then
+			current[name] = c
+		end
+	end
+	local roots: { any } = {}
+	if active ~= nil then
+		table.insert(roots, active)
+	end
+	if bosses ~= nil then
+		table.insert(roots, bosses)
+	end
+	for _, root in roots do
+		for _, c in root:GetChildren() do
+			local raw: string = c.Name
+			local name = megaNames[raw]
+			if name == nil then
+				local lower = string.lower(raw)
+				if string.find(lower, "megalodon", 1, true) == nil then
+					name = false
+				elseif string.find(lower, "ancient", 1, true) ~= nil then
+					name = "Ancient Megalodon"
+				else
+					name = "Megalodon"
+				end
+				megaNames[raw] = name
+			end
+			if name ~= false and current[name] == nil then
+				current[name] = c
+			end
+		end
+	end
+end
+local huntPicker: any = nil -- dropdown with one chip per detected hunt
+local huntPickerKey = ""
+local playerPicker: any = nil -- dropdown with one chip per other player in the server
+local playerPickerKey = ""
+
+-- Teleport offsets above the zone part of a hunt (same heights as the reference script); other hunts use max(y + 10, 135).
+local HUNT_TP: any = table.freeze({
+	["Isonade"] = { 25.0, 135.0, 25.0 },
+	["Great Hammerhead Shark"] = { 0.0, 135.0, 0.0 },
+	["Great White Shark"] = { 0.0, 135.0, 0.0 },
+	["Whale Shark"] = { 0.0, 135.0, 0.0 },
+	["The Depths - Serpent"] = { 0.0, 50.0, 0.0 },
+})
+
+-- Teleports to one detected hunt by name.
+local function gotoHuntNamed(name: string): ()
+	local inst: any = huntFound[name]
+	if inst == nil then
+		notice("Hunt is gone")
+		return
+	end
+	local x, y, z = posOf(inst)
+	if x == nil or y == nil or z == nil then
+		notice("Hunt position unknown")
+		return
+	end
+	local off: any = HUNT_TP[name]
+	if off ~= nil then
+		teleportTo(name, x + off[1], y + off[2], z + off[3], 0, nil)
+	else
+		teleportTo(name, x, math.max(y + 10, 135), z, 0, nil)
+	end
+end
+
+-- Looks for hunts and events among the children of Workspace.zones.fishing (they exist only while active).
+local function scanHunts(): ()
+	huntActive = true
+	local zones: any = workspace:FindFirstChild("zones")
+	local fishing: any = if zones ~= nil then zones:FindFirstChild("fishing") else nil
+	if fishing == nil then
+		worldState.hunts = { "Hunt: zones.fishing not found" }
+		publishWorld()
+		return
+	end
+	local current: { [string]: any } = {}
+	for _, c in fishing:GetChildren() do
+		local hit = classifyHunt(c.Name)
+		if hit ~= nil then
+			current[hit] = c
+		end
+	end
+	if current["Megalodon"] == nil and current["Ancient Megalodon"] == nil then
+		scanMegalodon(current)
+	end
+	local order: { string } = {}
+	for name, inst in current do
+		table.insert(order, name)
+		if huntFound[name] == nil then
+			notice(`Hunt: {name}`)
+		end
+	end
+	table.sort(order)
+	huntFound = current
+	huntOrder = order
+	local orderKey = table.concat(order, "|")
+	if huntPicker ~= nil and orderKey ~= huntPickerKey then
+		huntPickerKey = orderKey
+		local items: { any } = {}
+		for _, name in order do
+			table.insert(items, {
+				Name = name,
+				Callback = function()
+					gotoHuntNamed(name)
+				end,
+			})
+		end
+		huntPicker.Items = items
+	end
+	local lines: { string } = {}
+	for _, name in order do
+		local x, _, z = posOf(current[name])
+		table.insert(lines, if x ~= nil and z ~= nil then string.format("%s (%.0f, %.0f)", name, x, z) else name)
+	end
+	if #lines == 0 then
+		lines[1] = "Hunt: none"
+	end
+	worldState.hunts = lines
+	publishWorld()
+end
+
+-- Clears hunt results when detection is switched off, so no stale hunt can be teleported to.
+local function clearHunts(): ()
+	huntActive = false
+	huntFound = {}
+	huntOrder = {}
+	huntPickerKey = ""
+	if huntPicker ~= nil then
+		huntPicker.Items = {}
+	end
+	worldState.hunts = { "Hunt: off" }
+	publishWorld()
+end
+
+-- Teleports to the next detected hunt (each press moves to the next one).
+local function gotoHunt(): ()
+	if #huntOrder == 0 then
+		notice("No hunt detected")
+		return
+	end
+	huntCursor = huntCursor % #huntOrder + 1
+	gotoHuntNamed(huntOrder[huntCursor])
+end
+
+-- Teleports next to one player by name (same teleport as the location chips).
+local function gotoPlayer(name: string): ()
+	local target: any = Players:FindFirstChild(name)
+	local char: any = if target ~= nil then target.Character else nil
+	if char == nil then
+		char = workspace:FindFirstChild(name)
+	end
+	local hrp: any = if char ~= nil then char:FindFirstChild("HumanoidRootPart") else nil
+	if hrp == nil then
+		notice("Player has no character")
+		return
+	end
+	local x, y, z = readPosition(hrp)
+	if x == nil or y == nil or z == nil then
+		notice("Can't read position")
+		return
+	end
+	teleportTo(name, x, y, z)
+end
+
+-- Rebuilds the player chips when someone joins or leaves.
+local function scanPlayers(): ()
+	local lp: any = Players.LocalPlayer
+	local myName: string = if lp ~= nil then lp.Name else ""
+	local names: { string } = {}
+	for _, p in Players:GetChildren() do
+		local n: string = p.Name
+		if n ~= myName then
+			table.insert(names, n)
+		end
+	end
+	table.sort(names)
+	local key = table.concat(names, "|")
+	if playerPicker == nil or key == playerPickerKey then
+		return
+	end
+	playerPickerKey = key
+	local items: { any } = {}
+	for _, n in names do
+		table.insert(items, {
+			Name = n,
+			Callback = function()
+				gotoPlayer(n)
+			end,
+		})
+	end
+	playerPicker.Items = items
+end
+
+-- Walk on water: makes the sea parts of the chosen zones solid (client-side CanCollide).
+local WATER_ZONES = table.freeze({
+	{ "walkOcean", "Ocean" },
+	{ "walkDesolate", "Desolate Deep" },
+	{ "walkDepths", "The Depths" },
+})
+local waterOn = false
+
+-- Sets CanCollide on the zone parts (Ocean also covers Deep Ocean); zones that are not selected go back to off.
+local function applyWater(on: boolean): ()
+	local zones: any = workspace:FindFirstChild("zones")
+	local fishing: any = if zones ~= nil then zones:FindFirstChild("fishing") else nil
+	if fishing == nil then
+		return
+	end
+	for _, part in fishing:GetChildren() do
+		local class: string = part.ClassName
+		if class == "Part" or class == "MeshPart" or class == "UnionOperation" then
+			local name: string = part.Name
+			local known = false
+			local target = false
+			for _, z in WATER_ZONES do
+				if name == z[2] or (z[2] == "Ocean" and name == "Deep Ocean") then
+					known = true
+					target = on and flags[z[1]] == true
+				end
+			end
+			if known and part.CanCollide ~= target then
+				part.CanCollide = target
+			end
+		end
+	end
+end
+
+table.insert(onUnload, function()
+	if waterOn then
+		waterOn = false
+		applyWater(false)
+	end
+end)
+
+-- Resets the session counters.
+local function resetStats(): ()
+	S.casts = 0
+	S.shakes = 0
+	S.caught = 0
+	S.lost = 0
+	S.activeSec = 0.0
+	S.catchSum = 0.0
+	S.streak = 0
+	S.bestStreak = 0
+	S.timeouts = 0
+	S.cycleAt = 0.0
+	notice("Stats reset")
+end
+
+-- Model thread (scans belong here, not in the macro tick): one heavy job per tick, each on its own cooldown.
+local function onPostModel(): ()
+	local now = os.clock()
+	local pg: any = getPlayerGui()
+	if flags.enabled == true and pg ~= nil and now - shakeScan.at >= 0.3 then
+		scanShake(pg, now)
+		return
+	end
+	local wantWater = flags.walkWater == true
+	if (wantWater or waterOn) and (wantWater ~= waterOn or now - W.waterAt >= 2.0) then
+		W.waterAt = now
+		waterOn = wantWater
+		applyWater(wantWater)
+		return
+	end
+	if flags.worldOn == true then
+		if now - W.clockAt >= 1.0 then
+			W.clockAt = now
+			worldState.time = serverClock()
+			publishWorld()
+			return
+		end
+		if now - W.scanAt >= 3.0 then
+			W.scanAt = now
+			scanWorld()
+			return
+		end
+	end
+	if flags.huntOn == true then
+		if now - W.huntAt >= 4.0 then
+			W.huntAt = now
+			scanHunts()
+			return
+		end
+	elseif huntActive then
+		clearHunts()
+		return
+	end
+	if now - W.playersAt >= 2.0 then
+		W.playersAt = now
+		scanPlayers()
+		return
+	end
+end
+
+-- Teleports to the coordinates typed in the Teleports tab (any text with three numbers).
+local function gotoTyped(): ()
+	local text: any = flags.gotoText
+	if type(text) ~= "string" then
+		notice("Type x, y, z first")
+		return
+	end
+	local nums: { number } = {}
+	for token in string.gmatch(text, "%-?%d+%.?%d*") do
+		local n = tonumber(token)
+		if n ~= nil then
+			table.insert(nums, n)
+		end
+	end
+	if #nums < 3 then
+		notice("Need three numbers: x, y, z")
+		return
+	end
+	teleportTo("coordinates", nums[1], nums[2], nums[3], 0, nil)
+end
+
+local teleports = ui:tab("Teleports")
+teleports:section({ Title = "SAVED POSITION" })
+teleports:note({ Lines = savedLines })
+teleports:action({ Name = "Save current position", Button = "Save", Callback = savePosition })
+teleports:action({ Name = "Go to saved position", Button = "Go", Callback = gotoSaved })
+teleports:section({ Title = "COORDINATES", Divider = true })
+teleports:input({ Name = "Type x, y, z (L = minus), Enter", Flag = "gotoText", MaxLen = 48, OnSubmit = gotoTyped })
+teleports:action({ Name = "Go to typed coordinates", Button = "Go", Callback = gotoTyped })
+teleports:section({ Title = "SPOTS", Divider = true })
+for _, group in TP_GROUPS do
+	local items: { any } = {}
+	for _, spot in group[2] do
+		local name: string, x: number, y: number, z: number = spot[1], spot[2], spot[3], spot[4]
+		table.insert(items, {
+			Name = name,
+			Callback = function()
+				teleportTo(name, x, y, z)
+			end,
+		})
+	end
+	teleports:dropdown({ Name = group[1], Items = items, Layout = "chips", Accordion = "tp" })
+end
+playerPicker = teleports:dropdown({ Name = "Players", Items = {}, Layout = "chips", Accordion = "tp" })
+
+-- The Info tab stays last: add new tabs above this line.
+local worldTab = ui:tab("World")
+worldTab:toggle({ Name = "World scan (time, events)", Flag = "worldOn", Default = true })
+do
+	local first: { string } = { worldState.time }
+	for _, l in worldState.events do
+		table.insert(first, l)
+	end
+	for _, l in worldState.hunts do
+		table.insert(first, l)
+	end
+	worldNote = worldTab:note({ Lines = first })
+end
+worldTab:section({ Title = "HUNTS (Workspace.zones.fishing)", Divider = true })
+worldTab:toggle({ Name = "Hunt detect", Flag = "huntOn", Default = false })
+worldTab:action({ Name = "Go to hunt (next)", Button = "Go", Callback = gotoHunt })
+huntPicker = worldTab:dropdown({ Name = "Teleport to hunt", Items = {}, Layout = "chips", Accordion = "hunt" })
+
+local info = ui:tab("Info")
+info:note({ Lines = infoLines })
+info:section({ Title = "TOOLS", Divider = true })
+info:toggle({ Name = "Info overlay", Flag = "hud", Default = true })
+info:action({
+	Name = "UI navigation (\\)",
+	Button = "Press",
+	Callback = function()
+		tapKey(VK.Backslash, 0.02)
+	end,
+})
+info:action({ Name = "Reset stats", Button = "Reset", Callback = resetStats })
+info:action({ Name = "Unload script", Button = "Unload", Callback = unload })
+
+-- ───────────────────────── Macro ─────────────────────────
+
+-- Switches the phase and stamps the time.
+local function go(phase: string, now: number): ()
+	S.phase = phase
+	S.phaseAt = now
+	if phase == "CAST" then
+		S.castPressAt = 0
+		if S.cycleAt == 0 then
+			S.cycleAt = now
+		end
+	elseif phase == "SHAKE" then
+		S.shakeSeen = false
+		S.lastShakeAt = 0
+	elseif phase == "REEL" then
+		resetCtl()
+		ctl.resyncs = 0
+		S.reelStartAt = now
+		S.inTicks = 0
+		S.totalTicks = 0
+		S.streakBefore = readGameStreak() or -1
+		S.maxProgress = 0
+		S.reelGoneAt = 0
+		S.badTicks = 0
+		S.ups0 = S.ups
+		S.downs0 = S.downs
+	elseif phase == "REEQUIP" then
+		S.reequipLeft = 2
+		S.reequipAt = 0
+	end
+end
+
+local pendingRec: any = nil
+
+-- Settles one finished reel. `counted` = the streak events already
+-- updated the counters (trackStreak), so only the fallback verdicts (progress) add to them here.
+local function finalizeReel(rec: any, caught: boolean, how: string, counted: boolean): ()
+	if caught then
+		if not counted then
+			S.caught += 1
+			S.streak += 1
+			S.bestStreak = math.max(S.bestStreak, S.streak)
+			if rec.cycleDur > 0 then
+				S.catchSum += rec.cycleDur
+			end
+		end
+		return
+	end
+	if not counted then
+		S.lost += 1
+		S.streak = 0
+	end
+end
+
+-- Verdict for a pending reel: (caught, how, counted). caught = nil while undecided (force = decide now).
+-- A streak rise or drop since the reel started decides it (trackStreak already counted it). If the streak did
+-- not move, the reel progress decides after a wait (a loss at streak 0 leaves the value unchanged).
+local function verdict(rec: any, now: number, force: boolean): (boolean?, string, boolean)
+	rec.after = S.gs
+	if S.ups > rec.ups0 then
+		return true, "streak up", true
+	elseif S.downs > rec.downs0 then
+		return false, "streak down", true
+	end
+	local wait = if rec.before > 0 then STREAK_WAIT_S else STREAK_ZERO_WAIT_S
+	if force or now - rec.at > wait then
+		local how = if S.gs ~= nil then "streak unchanged" else "no streak"
+		return rec.maxP >= CATCH_PCT, how .. ", progress", false
+	end
+	return nil, "", false
+end
+
+-- Settles the pending reel as soon as a verdict exists.
+local function resolvePending(now: number): ()
+	local rec = pendingRec
+	if rec == nil or now - W.resolveAt < 0.1 then
+		return
+	end
+	W.resolveAt = now
+	local caught, how, counted = verdict(rec, now, false)
+	if caught ~= nil then
+		pendingRec = nil
+		finalizeReel(rec, caught, how, counted)
+	end
+end
+
+-- Equips the rod with the game's T key (works from any hotbar slot).
+local function equipRod(): ()
+	tapKey(VK.T, 0.06)
+end
+
+-- True while the character attributes Reeling / ReelActive say a reel is running (read every REEL_ATTR_EVERY s).
+-- Learned, not assumed: the end of the attributes is trusted only after they were seen active during a reel.
+local function reelAttrActive(char: any, now: number): boolean
+	if char == nil then
+		return false
+	end
+	if now - S.attrAt >= REEL_ATTR_EVERY then
+		S.attrAt = now
+		local reeling: any = char:GetAttribute("Reeling")
+		local reelActive: any = char:GetAttribute("ReelActive")
+		S.attrReeling = reeling == true or (reelActive ~= nil and reelActive ~= false)
+	end
+	return S.attrReeling
+end
+
+-- Runs one macro tick.
+local function step(now: number): ()
+	local pg: any = getPlayerGui()
+	if pg == nil then
+		return
+	end
+	local char: any = getCharacter()
+	local tool: any = if char ~= nil then findTool(char) else nil
+	S.rod = if tool ~= nil then tool.Name else "none"
+
+	local reeling = readReel(pg)
+	if reeling and S.phase ~= "REEL" then
+		releaseMouse()
+		go("REEL", now)
+	end
+	local phase = S.phase
+
+	-- Rod watchdog: re-equip only after the rod was missing for 3 checks in a row.
+	if tool ~= nil then
+		S.rodMissing = 0
+	elseif
+		flags.autoEquip == true
+		and (phase == "CAST" or phase == "CASTED" or phase == "SHAKE")
+		and now - S.rodCheckAt >= 1.2
+	then
+		S.rodCheckAt = now
+		S.rodMissing += 1
+		if S.rodMissing >= 3 and now - S.equipAt >= 1.5 then
+			S.rodMissing = 0
+			S.equipAt = now
+			equipRod()
+		end
+	end
+
+	if phase == "REEL" then
+		if reeling then
+			S.reelGoneAt = 0
+			S.status = "Reeling"
+			if not S.attrLearned and reelAttrActive(char, now) then
+				S.attrLearned = true
+			end
+			local p = readProgress()
+			if p ~= nil then
+				S.progress = p
+				S.maxProgress = math.max(S.maxProgress, p)
+			end
+			if flags.autoReel ~= true then
+				releaseMouse()
+				return
+			end
+			ctl.invert = S.progress >= 40 and string.find(string.lower(S.rod), "dreambreaker", 1, true) ~= nil
+			local fishX = frameX(reel.fish) + frameW(reel.fish) / 2
+			local barX = frameX(reel.playerbar)
+			local barW = math.max(0.001, frameW(reel.playerbar))
+			S.lastFishX = fishX
+			S.lastBarX = barX
+			S.resyncs = ctl.resyncs
+			if sane(fishX, -0.5, 1.5) and sane(barX, -0.5, 1.5) then
+				S.totalTicks += 1
+				if math.abs(fishX - barX) <= barW / 2 then
+					S.inTicks += 1
+				end
+				S.badTicks = 0
+				reelTrack(fishX, barX, barW)
+			else
+				S.badTicks += 1
+				if S.badTicks > 6 then
+					releaseMouse()
+				end
+			end
+		else
+			if S.reelGoneAt == 0 then
+				S.reelGoneAt = now
+			end
+			-- The reel is over at once when the attributes (already seen active in a reel) went inactive
+			local over = S.attrLearned and not reelAttrActive(char, now)
+			local partial = reel.why == "no fish" or reel.why == "no playerbar"
+			if not over and now - S.reelGoneAt < (if partial then REEL_PART_GRACE_S else REEL_GONE_S) then
+				return -- short miss: keep the mouse state and the tracker
+			end
+			releaseMouse()
+			resetCtl()
+			local rec = {
+				at = now,
+				before = S.streakBefore,
+				maxP = S.maxProgress,
+				cycleDur = if S.cycleAt > 0 then now - S.cycleAt else 0,
+				after = nil :: number?,
+				ups0 = S.ups0,
+				downs0 = S.downs0,
+			}
+			if pendingRec ~= nil then
+				local caught, how, counted = verdict(pendingRec, now, true)
+				finalizeReel(pendingRec, caught == true, "superseded, " .. how, counted)
+				pendingRec = nil
+			end
+			if S.streakBefore >= 0 then
+				pendingRec = rec
+			else
+				finalizeReel(rec, S.maxProgress >= CATCH_PCT, "progress", false)
+			end
+			S.cycleAt = 0
+			S.progress = -1
+			go("DONE", now)
+		end
+	elseif phase == "GOTO" then
+		releaseMouse()
+		S.status = "Going to saved spot"
+		if tpJob == nil and now - S.phaseAt >= 1.0 then
+			go("CAST", now)
+		end
+	elseif phase == "DONE" then
+		S.status = "Next cast soon"
+		if now - S.phaseAt >= POST_CATCH_S then
+			go("CAST", now)
+		end
+	elseif phase == "CAST" then
+		S.power = -1
+		if char == nil then
+			S.status = "No character"
+			return
+		end
+		if tool == nil then
+			releaseMouse()
+			S.castPressAt = 0
+			S.status = "No rod in hand"
+			return
+		end
+		if shakeUp(pg) or isCasted(tool) then
+			releaseMouse()
+			go("SHAKE", now)
+			return
+		end
+		if flags.autoCast ~= true then
+			releaseMouse()
+			S.status = "Waiting (auto cast off)"
+			return
+		end
+		S.status = "Casting"
+		holdMouse()
+		if S.castPressAt == 0 then
+			S.castPressAt = now
+		end
+		local held = now - S.castPressAt
+		local power = readPower(char)
+		if power ~= nil then
+			S.power = power
+		end
+		local release = false
+		if flags.perfect == true then
+			release = (power ~= nil and power >= CAST_FULL) or held >= CAST_TIMEOUT
+		else
+			release = held * 1000 >= (flags.holdMs or 300)
+		end
+		if release then
+			releaseMouse()
+			S.casts += 1
+			go("CASTED", now)
+		end
+	elseif phase == "CASTED" then
+		S.status = "Line cast"
+		releaseMouse()
+		if now - S.phaseAt >= POST_CAST_S then
+			go("SHAKE", now)
+		end
+	elseif phase == "SHAKE" then
+		releaseMouse()
+		local waited = now - S.phaseAt
+		if shakeUp(pg) then
+			S.shakeSeen = true
+			S.status = "Shaking"
+			if flags.autoShake == true and now - S.lastShakeAt >= (flags.shakeMs or 25) / 1000 then
+				S.lastShakeAt = now
+				S.shakes += 1
+				tapKey(VK.Enter, 0.02)
+			end
+		else
+			S.status = "Waiting for a bite"
+		end
+		-- A cast that never produced a reel keeps values.casted set, so recasting directly would loop back here:
+		-- the rod is re-equipped instead, which resets the line.
+		if (not S.shakeSeen and waited >= SHAKE_MISS_S) or waited >= SHAKE_LOST_S then
+			S.timeouts += 1
+			go("REEQUIP", now)
+		end
+	elseif phase == "REEQUIP" then
+		releaseMouse()
+		S.status = "Re-equipping rod"
+		if S.reequipLeft > 0 then
+			if S.reequipAt == 0 or now - S.reequipAt >= 0.4 then
+				equipRod()
+				S.reequipLeft -= 1
+				S.reequipAt = now
+			end
+		elseif now - S.reequipAt >= 0.6 then
+			go("CAST", now)
+		end
+	end
+end
+
+-- Rebuilds the info texts (menu tab and overlay).
+local function refreshInfo(now: number): ()
+	if now - S.infoAt < INFO_EVERY then
+		return
+	end
+	S.infoAt = now
+	infoLines[1] = `State: {if now < S.noticeUntil then S.notice else S.status}`
+	infoLines[2] = `Phase: {S.phase}   Rod: {S.rod}`
+	infoLines[3] = string.format("Casts: %d   Shakes: %d", S.casts, S.shakes)
+	infoLines[4] = string.format("Caught: %d   Lost: %d", S.caught, S.lost)
+	infoLines[5] = if S.progress >= 0 then string.format("Reel progress: %.0f%%", S.progress) else "Reel progress: --"
+	infoLines[6] = if S.power >= 0 then string.format("Cast power: %.0f%%", S.power) else "Cast power: --"
+	local act = S.activeSec
+	infoLines[7] = string.format("Uptime: %02d:%02d", math.floor(act / 60), math.floor(act % 60))
+	local total = S.caught + S.lost
+	local rate = if total > 0 then string.format("%d%%", math.floor(S.caught * 100 / total + 0.5)) else "--"
+	local perHour = if act >= 60 then string.format("%.0f", S.caught * 3600 / act) else "--"
+	infoLines[8] = `Success: {rate}   Fish/h: {perHour}`
+	local avg = if S.caught > 0 and S.catchSum > 0 then string.format("%.0fs", S.catchSum / S.caught) else "--"
+	infoLines[9] = `Avg catch: {avg}   Streak: {S.streak} (best {S.bestStreak})`
+	infoLines[10] = `Timeouts: {S.timeouts}`
+	infoLines[11] = `Offsets: {offsetInfo}`
+	infoLines[12] = if HAS_RELEASE then "Mouse release: ok" else "Mouse release: missing (fallback)"
+	S.hz = S.tickCount / math.max(0.001, now - S.hzAt)
+	S.tickCount = 0
+	S.hzAt = now
+	infoLines[13] = string.format("Tick rate: %.0f Hz", S.hz)
+	local gs = S.gs
+	infoLines[14] = if gs ~= nil then `Game streak: {gs} (ours {S.streak})` else "Game streak: unreadable"
+	hudLines[1] = S.status
+	hudLines[2] = string.format("Caught %d   Lost %d", S.caught, S.lost)
+end
+
+-- Starts or stops the macro when the Auto Fish flag changes.
+local function syncEnabled(now: number): ()
+	local on = flags.enabled == true
+	if on == S.wasEnabled then
+		return
+	end
+	S.wasEnabled = on
+	if on then
+		S.rodMissing = 0
+		S.rodCheckAt = now
+		local startChar: any = getCharacter()
+		if flags.autoEquip == true and (startChar == nil or findTool(startChar) == nil) then
+			equipRod()
+			S.equipAt = now
+		end
+		local pos = saved
+		if flags.fromSaved == true and pos ~= nil then
+			queueTeleport("saved spot", pos.x, pos.y, pos.z, 0, pos.face)
+			go("GOTO", now)
+			S.status = "Going to saved spot"
+		else
+			if flags.fromSaved == true then
+				notice("No saved position")
+			end
+			go("CAST", now)
+			S.status = "Starting"
+		end
+		if flags.navOnStart == true and not S.navDone then
+			S.navDone = true
+			tapKey(VK.Backslash, 0.02)
+		end
+	else
+		releaseMouse()
+		resetCtl()
+		shakeScan.alt = false
+		S.phase = "OFF"
+		S.status = "Off"
+		S.progress = -1
+		S.power = -1
+	end
+end
+
+-- PostLocal: menu input and callbacks, then the macro tick.
+local function onPostLocal(): ()
+	ui:update()
+	local now = os.clock()
+	flushKeys(now)
+	stepTeleport(now)
+	syncEnabled(now)
+	trackStreak(now)
+	resolvePending(now)
+	if flags.enabled == true then
+		S.activeSec += math.min(now - W.lastTick, 0.5)
+		if isrbxactive() then
+			syncMouse(now)
+			step(now)
+		else
+			releaseMouse()
+			S.status = "Roblox not focused"
+		end
+	end
+	S.tickCount += 1
+	W.lastTick = now
+	if now - W.saveAt >= 2.0 then
+		W.saveAt = now
+		saveSettings()
+	end
+	refreshInfo(now)
+end
+
+-- PreLocal: extra reel samples between the PostLocal ticks. Uses the reel parts found by the last
+-- step() and feeds the same tracker; a destroyed part (no Parent) stops it before any memory read.
+local function onPreLocal(): ()
+	if flags.enabled ~= true or flags.autoReel ~= true or S.phase ~= "REEL" or S.reelGoneAt ~= 0 then
+		return
+	end
+	local bar: any = reel.bar
+	local fish: any = reel.fish
+	local playerbar: any = reel.playerbar
+	if bar == nil or fish == nil or playerbar == nil then
+		return
+	end
+	if bar.Parent == nil or fish.Parent == nil or playerbar.Parent == nil then
+		return
+	end
+	if not isrbxactive() then
+		return
+	end
+	local fishX = frameX(fish) + frameW(fish) / 2
+	local barX = frameX(playerbar)
+	local barW = math.max(0.001, frameW(playerbar))
+	if sane(fishX, -0.5, 1.5) and sane(barX, -0.5, 1.5) then
+		reelTrack(fishX, barX, barW)
+	end
+end
+
+-- Draws the small info panel in the menu style.
+local function drawHud(): ()
+	local x, y, w = 16, 16, 190
+	local h = 34 + #hudLines * 15
+	DrawingImmediate.FilledRectangle(vec(x, y, 0), vec(w, h, 0), T.Bg, 0.92)
+	DrawingImmediate.Rectangle(vec(x, y, 0), vec(w, h, 0), T.Divider, 1, 1)
+	DrawingImmediate.FilledRectangle(vec(x + 12, y + 13, 0), vec(6, 6, 0), T.White, 1)
+	DrawingImmediate.Text(vec(x + 24, y + 9, 0), 13, T.TextMain, 1, "FISCH", false)
+	for i, line in hudLines do
+		DrawingImmediate.Text(vec(x + 12, y + 28 + (i - 1) * 15, 0), 12, T.TextRow, 1, line, false)
+	end
+end
+
+-- Render: drawing only.
+local function onRender(): ()
+	ui:render()
+	if flags.hud == true then
+		drawHud()
+	end
+end
+
+table.insert(connections, (RunService.PreLocal:Connect(onPreLocal)))
+table.insert(connections, (RunService.PostLocal:Connect(onPostLocal)))
+table.insert(connections, (RunService.PostModel:Connect(onPostModel)))
+table.insert(connections, (RunService.Render:Connect(onRender)))
