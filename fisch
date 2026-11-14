@@ -1,32 +1,31 @@
 --!strict
 --!optimize 2
 
--- Fisch for Severe: auto cast, shake and reel with an info overlay. Menu: IAMPR1MEUI.
+-- Fisch for Severe: auto cast, shake and reel with an info overlay, nuke minigame, chest ESP / auto collect,
+-- teleports (locations, points of interest, rods, coordinates, players). Menu: IAMPR1MEUI.
 
 local Players = game:GetService("Players")
 local RunService: any = game:GetService("RunService")
 local G: any = _G
 
--- Offsets dump URLs: the first is the one used by the official modules, the second is the fallback
 local OFFSETS_URLS = table.freeze({ "https://offsets.imtheo.lol/Offsets.hpp", "https://offsets.imtheo.lol/offsets.hpp" })
 
--- Virtual-key codes used by the macro
-local VK = table.freeze({ Enter = 0x0D, Backslash = 0xDC, W = 0x57, T = 0x54 })
+local VK = table.freeze({ Enter = 0x0D, Backslash = 0xDC, W = 0x57, T = 0x54, E = 0x45 })
 
-local CAST_FULL = 97.0 -- cast power (%) at which a perfect cast is released
-local CAST_TIMEOUT = 2.5 -- max seconds to hold the cast before releasing anyway
-local POST_CAST_S = 0.15 -- pause after releasing a cast before waiting for the bite
-local POST_CATCH_S = 0.4 -- pause after a finished reel before the next cast
-local SHAKE_MISS_S = 25.0 -- seconds without any shake prompt before the rod is re-equipped
-local SHAKE_LOST_S = 45.0 -- seconds in SHAKE (prompt seen, no reel) after which the rod is re-equipped
-local REEL_GONE_S = 0.25 -- seconds the reel UI must stay gone to end a reel
-local CATCH_PCT = 97.0 -- reel progress (%) counted as a catch
-local INFO_EVERY = 0.25 -- seconds between info text rebuilds
-local REEL_PART_GRACE_S = 0.6 -- seconds a missing fish or playerbar is tolerated before the reel counts as over
-local STREAK_WAIT_S = 4.0 -- seconds to wait for the game streak to move after a reel that started above 0 (then progress decides)
-local STREAK_ZERO_WAIT_S = 2.5 -- same, for a reel that started at streak 0 (the value may stay hidden, progress decides)
-local STUCK_RESYNC_S = 0.21 -- seconds the bar may drift the wrong way before the mouse state is re-sent
-local REEL_ATTR_EVERY = 0.1 -- seconds between reads of the character reel attributes
+local CAST_FULL = 97.0
+local CAST_TIMEOUT = 2.5
+local POST_CAST_S = 0.15
+local POST_CATCH_S = 0.4
+local SHAKE_MISS_S = 25.0
+local SHAKE_LOST_S = 45.0
+local REEL_GONE_S = 0.25
+local CATCH_PCT = 97.0
+local INFO_EVERY = 0.25
+local REEL_PART_GRACE_S = 0.6
+local STREAK_WAIT_S = 4.0
+local STREAK_ZERO_WAIT_S = 2.5
+local STUCK_RESYNC_S = 0.21
+local REEL_ATTR_EVERY = 0.1
 
 if type(G.FischKill) == "function" then
 	G.FischKill()
@@ -36,35 +35,16 @@ local vec = vector.create
 
 -- ───────────────────────── Library ─────────────────────────
 
--- IAMPR1MEUI is embedded below (menu library, no files or links needed).
 local Lib: any = (function(): any
 -- IAMPR1MEUI: immediate-mode menu library for Severe (DrawingImmediate).
--- Look and behaviour menu: dark rounded panel, tab bar, toggle pills, action buttons,
--- sliders, collapsible lists (rows or two-column chips), drag by the title bar, hotkeys.
---
---   local ui = UI.new({ Title = "MY SCRIPT", Key = "RightShift", Flags = flagsTable, Mute = function() return false end })
---   local tab = ui:tab("Main")
---   tab:toggle({ Name = "Enabled", Flag = "enabled", Default = true, Key = "F1", OnChange = function(value) end })
---   tab:slider({ Name = "RANGE", Flag = "range", Min = 0, Max = 100, Default = 50, Suffix = " st" })
---   tab:action({ Name = "Do it", Button = "Go", Callback = function() end })
---   tab:section({ Title = "LIST", Divider = true })
---   tab:dropdown({ Name = "Targets", All = "All targets", Items = { { Name = "A", Flag = "a", Default = true } } })
---   tab:note({ Lines = { "dim text" } })
---   -- PostLocal: ui:update()   input sampling, drag, hotkeys, queued callbacks (memory calls are fine here)
---   -- Render:    ui:render()   drawing and hit-testing only, no input or API calls
---
--- Values live in ui.Flags (or in the Store table of a control). OnChange / Callback run inside ui:update(),
--- never in Render. Get / Set of a toggle and Show of any control run inside Render: plain Lua only.
--- Mute (optional function): while it returns true the mouse is ignored (the script itself holds the button).
+-- PostLocal: ui:update() (input, drag, hotkeys, queued callbacks). Render: ui:render() (drawing only).
 
 local UI: any = {}
 UI.__index = UI
 
-
 local vec = vector.create
 local floor = math.floor
 
--- Menu colors
 local THEME = table.freeze({
 	Bg = Color3.fromRGB(15, 15, 17),
 	Divider = Color3.fromRGB(26, 26, 30),
@@ -85,21 +65,20 @@ local THEME = table.freeze({
 UI.Theme = THEME
 local T = THEME
 
-local HEADER_H = 38 -- title bar (drag handle)
+local HEADER_H = 38
 local TAB_H = 26
-local ROW_H = 28 -- normal row
-local DROP_ROW_H = 24 -- row inside a list
+local ROW_H = 28
+local DROP_ROW_H = 24
 local DROP_GAP = 1
 local SLIDER_ROW_H = 56
 local CHIP_H = 22
 local CHIP_GAP = 4
-local DROP_TOP_GAP = 6 -- space between a list header and its content
-local KEY_POLL = 0.03 -- seconds between key reads
+local DROP_TOP_GAP = 6
+local KEY_POLL = 0.03
 
 local EMPTY_KEYS: { any } = {}
 table.freeze(EMPTY_KEYS)
 
--- Key names accepted by Key options (virtual-key codes); letters, digits and F1-F12 are added below
 local KEY_CODES: { [string]: number } = {
 	RightShift = 0xA1,
 	LeftShift = 0xA0,
@@ -130,9 +109,6 @@ for i = 1, 12 do
 end
 table.freeze(KEY_CODES)
 
--- ───────────────────────── Helpers ─────────────────────────
-
--- True if a key spec (name, virtual-key code or a list of them) is in the pressed keys.
 local function keyDown(keys: { any }, spec: any): boolean
 	if type(spec) == "table" then
 		for _, one in spec do
@@ -153,7 +129,6 @@ local function keyDown(keys: { any }, spec: any): boolean
 	return code ~= nil and table.find(keys, code) ~= nil
 end
 
--- Text shown for a key spec.
 local function keyLabel(spec: any): string
 	if type(spec) == "table" then
 		for _, one in spec do
@@ -174,12 +149,10 @@ local function keyLabel(spec: any): string
 	return tostring(spec)
 end
 
--- True if the point is inside the rectangle.
 local function inRect(px: number, py: number, x: number, y: number, w: number, h: number): boolean
 	return px >= x and px <= x + w and py >= y and py <= y + h
 end
 
--- Cuts a label to maxLen characters.
 local function shortLabel(s: string, maxLen: number): string
 	if #s > maxLen then
 		return string.sub(s, 1, maxLen - 1) .. "."
@@ -195,8 +168,6 @@ local function push(ui: any, fn: any, a: any, b: any): ()
 	ui.QA[n] = a
 	ui.QB[n] = b
 end
-
--- ───────────────────────── Drawing primitives ─────────────────────────
 
 -- Immediate mode has no rounding: corners are built from rectangles (small radii) or circles (large ones).
 local function RoundRect(x: number, y: number, w: number, h: number, r: number, color: Color3): ()
@@ -223,7 +194,6 @@ local function RoundRect(x: number, y: number, w: number, h: number, r: number, 
 	DrawingImmediate.FilledCircle(vec(x + w - r, y + h - r, 0), r, color, 1)
 end
 
--- Toggle pill with a 1px outline and a square knob (right = on, left = off).
 local function DrawPill(x: number, y: number, w: number, h: number, on: boolean): ()
 	RoundRect(x, y, w, h, 5, if on then T.PillLine else T.PillLineOff)
 	RoundRect(x + 1, y + 1, w - 2, h - 2, 4, if on then T.PillBg else T.PillBgOff)
@@ -232,7 +202,6 @@ local function DrawPill(x: number, y: number, w: number, h: number, on: boolean)
 	RoundRect(kx, y + (h - knob) / 2, knob, knob, 3, if on then T.Knob else T.KnobOff)
 end
 
--- One toggle row (optional color swatch). Returns true if the row was clicked.
 local function DrawToggleRow(
 	x: number,
 	y: number,
@@ -254,7 +223,6 @@ local function DrawToggleRow(
 	return clicked and inRect(mp.x, mp.y, x, y, w, h)
 end
 
--- A row with a small button on the right. Returns true if the button was clicked.
 local function DrawActionRow(
 	x: number,
 	y: number,
@@ -277,7 +245,6 @@ local function DrawActionRow(
 	return clicked and hover
 end
 
--- A compact chip; `on` = nil hides the on/off indicator. Returns true if it was clicked.
 local function DrawChip(
 	x: number,
 	y: number,
@@ -299,7 +266,6 @@ local function DrawChip(
 	return clicked and hover
 end
 
--- Collapsible list header (label, counter, arrow). Returns true if clicked.
 local function DrawDropdownHeader(
 	x: number,
 	y: number,
@@ -327,7 +293,6 @@ local function DrawDropdownHeader(
 	return clicked and hover
 end
 
--- Slider row; returns the new value and keeps dragging while the button is held.
 local function DrawSliderRow(ui: any, el: any, x: number, y: number, w: number, value: number, clicked: boolean, ldown: boolean, mp: vector): number
 	local minV: number = el.Min
 	local maxV: number = el.Max
@@ -338,7 +303,7 @@ local function DrawSliderRow(ui: any, el: any, x: number, y: number, w: number, 
 
 	local tX = x + 10
 	local tW = w - 20
-	local tC = y + 43 -- vertical center of the track
+	local tC = y + 43
 
 	if clicked and inRect(mp.x, mp.y, tX - 6, tC - 10, tW + 12, 20) then
 		ui.SliderActive = el
@@ -358,14 +323,10 @@ local function DrawSliderRow(ui: any, el: any, x: number, y: number, w: number, 
 	return value
 end
 
--- Dim small label text.
 local function DrawLabel(x: number, y: number, text: string): ()
 	DrawingImmediate.Text(vec(x + 18, y, 0), 11, T.TextDim, 1, text, false)
 end
 
--- ───────────────────────── Controls ─────────────────────────
-
--- Reads the current value of a control.
 local function getValue(ui: any, el: any): any
 	if el.Get ~= nil then
 		return el.Get()
@@ -374,7 +335,6 @@ local function getValue(ui: any, el: any): any
 	return store[el.Flag]
 end
 
--- Stores a new value and queues OnChange.
 local function setValue(ui: any, el: any, value: any): ()
 	if el.Set ~= nil then
 		el.Set(value)
@@ -387,7 +347,6 @@ local function setValue(ui: any, el: any, value: any): ()
 	end
 end
 
--- Draws a toggle row and returns the y of the next control.
 local function drawToggle(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
 	local on = getValue(ui, el) == true
 	if DrawToggleRow(ux + 8, yo, uw - 16, ROW_H, el.Label, on, clicked, mp, el.Swatch) then
@@ -396,7 +355,6 @@ local function drawToggle(ui: any, el: any, ux: number, yo: number, uw: number, 
 	return yo + ROW_H + el.Gap
 end
 
--- Draws an action row and returns the y of the next control.
 local function drawAction(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
 	if DrawActionRow(ux + 8, yo, uw - 16, ROW_H, el.Label, el.Button, clicked, mp) and el.Callback ~= nil then
 		push(ui, el.Callback, nil, nil)
@@ -404,12 +362,10 @@ local function drawAction(ui: any, el: any, ux: number, yo: number, uw: number, 
 	return yo + ROW_H + el.Gap
 end
 
--- Requests the game-input block state; it is applied in ui:update() (never from Render).
 local function setBlock(ui: any, state: boolean): ()
 	ui.BlockWant = state
 end
 
--- Leaves the text field and gives the keyboard back to the game.
 local function blur(ui: any): ()
 	if ui.Focus ~= nil then
 		ui.Focus = nil
@@ -417,7 +373,6 @@ local function blur(ui: any): ()
 	end
 end
 
--- Focuses a text field and blocks game input while typing.
 local function focus(ui: any, el: any): ()
 	ui.Focus = el
 	ui.FocusAt = os.clock()
@@ -428,7 +383,6 @@ local function focus(ui: any, el: any): ()
 	setBlock(ui, true)
 end
 
--- Text field row: click to type, Enter submits, Esc or a click elsewhere leaves it.
 local function drawInput(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
 	local store = el.Store or ui.Flags
 	local text: string = if type(store[el.Flag]) == "string" then store[el.Flag] else ""
@@ -468,7 +422,6 @@ local function drawInput(ui: any, el: any, ux: number, yo: number, uw: number, c
 	return yo + ROW_H + el.Gap
 end
 
--- Draws a slider row and returns the y of the next control.
 local function drawSlider(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
 	local value: number = getValue(ui, el)
 	local nextValue = DrawSliderRow(ui, el, ux + 8, yo, uw - 16, value, clicked, ui.Input.down, mp)
@@ -478,7 +431,6 @@ local function drawSlider(ui: any, el: any, ux: number, yo: number, uw: number, 
 	return yo + SLIDER_ROW_H + 9 + el.Gap
 end
 
--- Draws a section heading and returns the y of the next control.
 local function drawSection(ui: any, el: any, ux: number, yo: number, uw: number): number
 	if el.Divider then
 		DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
@@ -489,7 +441,6 @@ local function drawSection(ui: any, el: any, ux: number, yo: number, uw: number)
 	return yo + 20
 end
 
--- Draws dim text lines (a snapshot of el.Lines) and returns the y of the next control.
 local function drawNote(ui: any, el: any, ux: number, yo: number): number
 	yo += el.Before
 	local lines: { string } = el.Lines
@@ -499,7 +450,6 @@ local function drawNote(ui: any, el: any, ux: number, yo: number): number
 	return yo + #lines * 14 + 6
 end
 
--- Open state of a list: one open list per accordion id, or one flag per list.
 local function isOpen(ui: any, el: any): boolean
 	if el.Accordion ~= nil then
 		return ui.Accordion[el.Accordion] == el
@@ -507,7 +457,6 @@ local function isOpen(ui: any, el: any): boolean
 	return ui.Open[el] == true
 end
 
--- Opens or closes a list.
 local function toggleOpen(ui: any, el: any): ()
 	local open = isOpen(ui, el)
 	if el.Accordion ~= nil then
@@ -517,14 +466,12 @@ local function toggleOpen(ui: any, el: any): ()
 	end
 end
 
--- Draws a collapsible list (rows or chips) and returns the y of the next control.
 local function drawDropdown(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
 	local items: { any } = el.Items
 	local store = el.Store or ui.Flags
 	local chips = el.Layout == "chips"
 	local size = #items
 
-	-- Counter: on / total for flag items, the item count for plain action chips
 	local flagged = false
 	local onCount = 0
 	for _, item in items do
@@ -547,7 +494,6 @@ local function drawDropdown(ui: any, el: any, ux: number, yo: number, uw: number
 	end
 	yo += DROP_TOP_GAP
 
-	-- "All" row switches every flag item at once
 	if el.All ~= nil and flagged then
 		local allOn = onCount == size
 		if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, el.All, allOn, clicked, mp, T.White) then
@@ -598,7 +544,6 @@ local function drawDropdown(ui: any, el: any, ux: number, yo: number, uw: number
 	return yo + el.Gap
 end
 
--- Draws one control and returns the y of the next one.
 local function drawElement(ui: any, el: any, ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
 	if el.Show ~= nil and not el.Show() then
 		return yo
@@ -620,12 +565,9 @@ local function drawElement(ui: any, el: any, ux: number, yo: number, uw: number,
 	return drawNote(ui, el, ux, yo)
 end
 
--- ───────────────────────── Tabs ─────────────────────────
-
 local Tab: any = {}
 Tab.__index = Tab
 
--- Registers a control: defaults, hotkey, label.
 function Tab:_add(kind: string, o: any): any
 	local ui = self.Ui
 	o.Kind = kind
@@ -659,53 +601,40 @@ function Tab:_add(kind: string, o: any): any
 	return o
 end
 
--- Toggle: Name, Flag (or Get / Set), Default, Key, KeyLabel, Swatch, Gap, Store, OnChange(value, flag).
 function Tab:toggle(o: any): any
 	return self:_add("toggle", o)
 end
 
--- Button row: Name, Button (text), Callback(), Key, KeyLabel, Gap.
 function Tab:action(o: any): any
 	o.Button = o.Button or "Run"
 	return self:_add("action", o)
 end
 
--- Text field: Name (placeholder), Flag (string), Default, MaxLen (48), Gap, OnSubmit(text).
 function Tab:input(o: any): any
 	o.Placeholder = o.Placeholder or o.Name or ""
 	return self:_add("input", o)
 end
 
--- Slider: Name, Flag, Min, Max, Default, Step (10), Suffix, Gap, OnChange(value, flag).
 function Tab:slider(o: any): any
 	o.Step = o.Step or 10
 	o.Suffix = o.Suffix or ""
 	return self:_add("slider", o)
 end
 
--- Small heading: Title, Divider (line above it).
 function Tab:section(o: any): any
 	return self:_add("section", o)
 end
 
--- Dim text lines: Lines (replace the whole table to update it), Before (space above, 0).
 function Tab:note(o: any): any
 	o.Before = o.Before or 0
 	return self:_add("note", o)
 end
 
--- Collapsible list: Name, Items, All (text of the all-row), Layout ("rows" or "chips"), Accordion (id: only one list
--- of that id stays open), Store, Gap, MaxLabel, OnChange(flag, value) (flag = nil for the all-row).
--- Items: { Name, Flag, Swatch, Default } for switches, { Name, Callback } for plain chips.
 function Tab:dropdown(o: any): any
 	o.MaxLabel = o.MaxLabel or 19
 	return self:_add("dropdown", o)
 end
 
--- ───────────────────────── Window ─────────────────────────
-
--- Options: Title, Key (menu key, "RightShift"), KeyLabel, Flags (table that holds the values), X, Y, Width (290),
--- Mute (function -> boolean, ignore the mouse while true), Stat = { Label, Value = function() -> string } (left footer text).
 function UI.new(opts: any): any
 	local self = setmetatable({
 		Title = opts.Title or "MENU",
@@ -715,7 +644,7 @@ function UI.new(opts: any): any
 		X = opts.X or 200,
 		Y = opts.Y or 100,
 		Width = opts.Width or 290,
-		PanelH = 320, -- measured by the last drawn frame
+		PanelH = 320,
 		Visible = true,
 		MenuKey = opts.Key or "RightShift",
 		MenuKeyLabel = opts.KeyLabel or keyLabel(opts.Key or "RightShift"),
@@ -753,14 +682,12 @@ function UI.new(opts: any): any
 	return self
 end
 
--- Adds a tab.
 function UI:tab(name: string): any
 	local tab = setmetatable({ Name = name, Ui = self, Elements = {} }, Tab)
 	table.insert(self.Tabs, tab)
 	return tab
 end
 
--- Stops drawing and input (call it from the script's cleanup).
 function UI:destroy(): ()
 	self.Alive = false
 	self.Focus = nil
@@ -771,7 +698,6 @@ function UI:destroy(): ()
 	end
 end
 
--- Keys that type a character into a focused text field: { id, ch, specs }.
 local TYPE_KEYS: { any } = {}
 do
 	local digitNames = { "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine" }
@@ -789,7 +715,6 @@ local KEYS_BACK: { any } = table.freeze({ 0x08, "Backspace" })
 local KEYS_ENTER: { any } = table.freeze({ 0x0D, "Return", "Enter" })
 local KEYS_ESC: { any } = table.freeze({ 0x1B, "Escape" })
 
--- Reads typed characters, Backspace (with repeat), Enter and Esc for the focused text field.
 local function typeKeys(ui: any, keys: { any }, now: number): ()
 	local el = ui.Focus
 	local store = el.Store or ui.Flags
@@ -835,7 +760,6 @@ local function typeKeys(ui: any, keys: { any }, now: number): ()
 	ui.EscDown = esc
 end
 
--- Hotkey pressed: flips a toggle or runs an action.
 local function fireHotkey(ui: any, el: any): ()
 	if el.Kind == "toggle" then
 		setValue(ui, el, getValue(ui, el) ~= true)
@@ -844,7 +768,6 @@ local function fireHotkey(ui: any, el: any): ()
 	end
 end
 
--- Samples the mouse once per update, latches new presses for Render and moves the window while dragging.
 local function sampleMouse(ui: any, active: boolean): ()
 	local input = ui.Input
 	local mouse = getmouseposition()
@@ -878,7 +801,6 @@ local function sampleMouse(ui: any, active: boolean): ()
 	end
 end
 
--- PostLocal: reads input (mouse, menu key, hotkeys), refreshes the viewport, runs queued callbacks.
 function UI:update(): ()
 	if not self.Alive then
 		return
@@ -903,7 +825,6 @@ function UI:update(): ()
 
 	sampleMouse(self, active)
 
-	-- Keys are read only while Roblox is the active window
 	if now - self.KeysAt >= KEY_POLL then
 		self.KeysAt = now
 		local keys: { any } = if active then getpressedkeys() else EMPTY_KEYS
@@ -924,14 +845,12 @@ function UI:update(): ()
 		end
 	end
 
-	-- Callbacks queued by Render and by hotkeys; ones queued while running wait for the next update
 	local n = self.QN
 	if n > 0 then
 		local fns, qa, qb = self.QFn, self.QA, self.QB
 		local runFn: { any } = table.move(fns, 1, n, 1, {})
 		local runA: { any } = table.move(qa, 1, n, 1, {})
 		local runB: { any } = table.move(qb, 1, n, 1, {})
-		-- Shift the queue first so a failing callback is not re-run on every update
 		local total = self.QN
 		for i = n + 1, total do
 			fns[i - n] = fns[i]
@@ -949,14 +868,12 @@ function UI:update(): ()
 		end
 	end
 
-	-- Game input block follows the text field focus (requested by Render, applied here)
 	if self.BlockWant ~= self.BlockOn and self.Alive then
 		self.BlockOn = self.BlockWant
 		block_roblox_window(self.BlockOn)
 	end
 end
 
--- Render: draws the menu and hit-tests the latched click (state changes only, no input or API calls).
 function UI:render(): ()
 	if not self.Alive then
 		return
@@ -978,14 +895,13 @@ function UI:render(): ()
 
 	DrawingImmediate.FilledRectangle(vec(ux + 18, uy + 18, 0), vec(6, 6, 0), T.White, 1)
 	DrawingImmediate.Text(vec(ux + 30, uy + 14, 0), 13, T.TextMain, 1, self.Title, false)
-	DrawingImmediate.Text(vec(ux + 31, uy + 14, 0), 13, T.TextMain, 1, self.Title, false) -- second pass = bolder title
+	DrawingImmediate.Text(vec(ux + 31, uy + 14, 0), 13, T.TextMain, 1, self.Title, false)
 	DrawingImmediate.Text(vec(ux + uw - 26, uy + 13, 0), 14, T.TextDim, 1, "x", false)
 	if clicked and inRect(mx, my, ux + uw - 28, uy, 28, HEADER_H) then
 		self.Visible = false
 		return
 	end
 
-	-- Tab bar
 	local tabs: { any } = self.Tabs
 	local count = #tabs
 	if count == 0 then
@@ -1008,7 +924,6 @@ function UI:render(): ()
 		end
 	end
 
-	-- Controls of the open tab
 	local yo: number = uy + HEADER_H + TAB_H + 8
 	local tab = tabs[self.TabIndex]
 	for _, el in tab.Elements do
@@ -1016,7 +931,6 @@ function UI:render(): ()
 	end
 	yo += 6
 
-	-- Footer: optional status text on the left, the menu key on the right
 	DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
 	local stat = self.Stat
 	if stat ~= nil then
@@ -1034,56 +948,56 @@ local T: any = Lib.Theme
 
 -- ───────────────────────── Offsets ─────────────────────────
 
--- GUI offsets: built-in values are replaced by the live dump when it can be fetched (they change every Roblox update)
-local OFF: { [string]: number } = { Position = 0x4D8, Size = 0x4F8, GuiEnabled = 0x48C }
+local OFF: { [string]: number } = { Position = 0x4D8, Size = 0x4F8, GuiEnabled = 0x48C, Rotation = 0, Visible = 0 }
 local offsetInfo = "built-in (26.10.2026)"
 
--- Offset keys with the namespace and field they come from in the offsets dump.
-local OFFSET_FIELDS = table.freeze({
-	{ "Position", "GuiObject", "Position" },
-	{ "Size", "GuiObject", "Size" },
-	{ "GuiEnabled", "GuiObject", "ScreenGui_Enabled" },
-})
+local loadOffsets: any
+do
+	local OFFSET_FIELDS = table.freeze({
+		{ "Position", "GuiObject", "Position" },
+		{ "Size", "GuiObject", "Size" },
+		{ "GuiEnabled", "GuiObject", "ScreenGui_Enabled" },
+		{ "Rotation", "GuiObject", "Rotation" },
+		{ "Visible", "GuiObject", "Visible" },
+	})
 
--- Text of one `namespace Name { ... }` block (plain searches only, the dump is large).
-local function namespaceBlock(body: string, name: string): string?
-	local at = string.find(body, "namespace " .. name .. " {", 1, true)
-	if at == nil then
-		return nil
-	end
-	local stop = string.find(body, "\n    }", at, true)
-	if stop == nil then
-		return nil
-	end
-	return string.sub(body, at, stop)
-end
-
--- Overwrites the offsets from one dump text; returns how many of them were found.
-local function applyOffsets(body: string): number
-	local found = 0
-	for _, f in OFFSET_FIELDS do
-		local block = namespaceBlock(body, f[2])
-		local hex = if block ~= nil then string.match(block, "uintptr_t%s+" .. f[3] .. "%s*=%s*0x(%x+)") else nil
-		local value = if hex ~= nil then tonumber(hex, 16) else nil
-		if value ~= nil then
-			OFF[f[1]] = value
-			found += 1
+	local function namespaceBlock(body: string, name: string): string?
+		local at = string.find(body, "namespace " .. name .. " {", 1, true)
+		if at == nil then
+			return nil
 		end
+		local stop = string.find(body, "\n    }", at, true)
+		if stop == nil then
+			return nil
+		end
+		return string.sub(body, at, stop)
 	end
-	if found > 0 then
-		local vAt = string.find(body, "ClientVersion", 1, true)
-		local version = if vAt ~= nil then string.match(string.sub(body, vAt, vAt + 80), '"([^"]+)"') else nil
-		offsetInfo = `live {found}/{#OFFSET_FIELDS} ({version or "?"})`
-	end
-	return found
-end
 
--- Fetches the latest offsets dump once at start; the built-in values stay when nothing usable comes back.
-local function loadOffsets(): ()
-	for _, url in OFFSETS_URLS do
-		local body: any = game:HttpGet(url)
-		if type(body) == "string" and #body > 0 and applyOffsets(body) > 0 then
-			return
+	local function applyOffsets(body: string): number
+		local found = 0
+		for _, f in OFFSET_FIELDS do
+			local block = namespaceBlock(body, f[2])
+			local hex = if block ~= nil then string.match(block, "uintptr_t%s+" .. f[3] .. "%s*=%s*0x(%x+)") else nil
+			local value = if hex ~= nil then tonumber(hex, 16) else nil
+			if value ~= nil then
+				OFF[f[1]] = value
+				found += 1
+			end
+		end
+		if found > 0 then
+			local vAt = string.find(body, "ClientVersion", 1, true)
+			local version = if vAt ~= nil then string.match(string.sub(body, vAt, vAt + 80), '"([^"]+)"') else nil
+			offsetInfo = `live {found}/{#OFFSET_FIELDS} ({version or "?"})`
+		end
+		return found
+	end
+
+	function loadOffsets(): ()
+		for _, url in OFFSETS_URLS do
+			local body: any = game:HttpGet(url)
+			if type(body) == "string" and #body > 0 and applyOffsets(body) > 0 then
+				return
+			end
 		end
 	end
 end
@@ -1091,7 +1005,6 @@ loadOffsets()
 
 -- ───────────────────────── Memory helpers ─────────────────────────
 
--- Converts Instance.Data (hex text, with or without the 0x prefix) into an address number (0 when invalid).
 local function parseAddress(text: any): number
 	if type(text) ~= "string" then
 		return 0
@@ -1100,7 +1013,6 @@ local function parseAddress(text: any): number
 	return if n ~= nil and n > 4096 then n else 0
 end
 
--- Address of an instance (0 when unknown).
 local function addressOf(inst: any): number
 	if inst == nil then
 		return 0
@@ -1108,34 +1020,32 @@ local function addressOf(inst: any): number
 	return parseAddress(inst.Data)
 end
 
--- Reads a float at the address (0 for a null address).
 local function readF32(a: number): number
 	return if a == 0 then 0 else memory.readf32(a)
 end
 
--- Reads a byte at the address (0 for a null address).
+local function readI32(a: number): number
+	return if a == 0 then 0 else memory.readi32(a)
+end
+
 local function readU8(a: number): number
 	return if a == 0 then 0 else memory.readu8(a)
 end
 
--- True for a normal finite number inside [lo, hi].
 local function sane(v: number, lo: number, hi: number): boolean
 	return v == v and v >= lo and v <= hi
 end
 
--- ScreenGui.Enabled read from memory.
 local function guiEnabled(gui: any): boolean
 	local a = addressOf(gui)
 	return a ~= 0 and readU8(a + OFF.GuiEnabled) ~= 0
 end
 
--- Position.X.Scale of a frame.
 local function frameX(obj: any): number
 	local a = addressOf(obj)
 	return if a == 0 then 0 else readF32(a + OFF.Position)
 end
 
--- Size.X.Scale of a frame.
 local function frameW(obj: any): number
 	local a = addressOf(obj)
 	return if a == 0 then 0 else readF32(a + OFF.Size)
@@ -1147,7 +1057,6 @@ local HAS_RELEASE = type(mouse1release) == "function"
 local mouseHeld = false
 local pendingKeys: { { code: number, at: number } } = {}
 
--- Presses the left mouse button once (no-op while already held).
 local function holdMouse(): ()
 	if not mouseHeld then
 		mouse1press()
@@ -1155,7 +1064,6 @@ local function holdMouse(): ()
 	end
 end
 
--- Releases the left mouse button (no-op while not held).
 local function releaseMouse(): ()
 	if mouseHeld then
 		mouseHeld = false
@@ -1167,7 +1075,6 @@ local function releaseMouse(): ()
 	end
 end
 
--- Sends a fresh press even if the game missed the previous one.
 local function repressMouse(): ()
 	if mouseHeld then
 		if HAS_RELEASE then
@@ -1180,7 +1087,6 @@ local function repressMouse(): ()
 	mouseHeld = true
 end
 
--- Sends a fresh release even if the game missed the previous one.
 local function rereleaseMouse(): ()
 	if HAS_RELEASE then
 		mouse1release()
@@ -1190,42 +1096,42 @@ local function rereleaseMouse(): ()
 	mouseHeld = false
 end
 
-local mouseSees = false -- true once isleftpressed() was seen true while we held the button
-local mouseGapAt = 0.0
-local mouseNudgeAt = 0.0
+local syncMouse: any
+do
+	local mouseSees = false
+	local mouseGapAt = 0.0
+	local mouseNudgeAt = 0.0
 
--- Re-presses when we want the button held but the system says it is up (user click, missed event).
-local function syncMouse(now: number): ()
-	if not mouseHeld then
-		mouseGapAt = 0.0
-		return
-	end
-	if isleftpressed() then
-		mouseSees = true
-		mouseGapAt = 0.0
-		return
-	end
-	if mouseSees then
-		if mouseGapAt == 0.0 then
-			mouseGapAt = now
-		elseif now - mouseGapAt >= 0.04 then
+	-- Re-presses when we want the button held but the system says it is up (user click, missed event).
+	function syncMouse(now: number): ()
+		if not mouseHeld then
 			mouseGapAt = 0.0
+			return
+		end
+		if isleftpressed() then
+			mouseSees = true
+			mouseGapAt = 0.0
+			return
+		end
+		if mouseSees then
+			if mouseGapAt == 0.0 then
+				mouseGapAt = now
+			elseif now - mouseGapAt >= 0.04 then
+				mouseGapAt = 0.0
+				mouse1press()
+			end
+		elseif now - mouseNudgeAt >= 0.15 then
+			mouseNudgeAt = now
 			mouse1press()
 		end
-	elseif now - mouseNudgeAt >= 0.15 then
-		-- isleftpressed has not shown our presses yet: keep nudging, a press while held is harmless
-		mouseNudgeAt = now
-		mouse1press()
 	end
 end
 
--- Presses a key now and releases it after holdSec (handled by flushKeys).
 local function tapKey(code: number, holdSec: number): ()
 	keypress(code)
 	table.insert(pendingKeys, { code = code, at = os.clock() + holdSec })
 end
 
--- Releases keys whose hold time has passed.
 local function flushKeys(now: number): ()
 	for i = #pendingKeys, 1, -1 do
 		local p = pendingKeys[i]
@@ -1243,7 +1149,6 @@ local flags: { [string]: any } = {}
 
 local pgCache: any = nil
 
--- PlayerGui of the local player (cached while it stays parented).
 local function getPlayerGui(): any
 	if pgCache ~= nil and pgCache.Parent ~= nil then
 		return pgCache
@@ -1253,7 +1158,6 @@ local function getPlayerGui(): any
 	return pgCache
 end
 
--- Character model of the local player (workspace model by name, then Player.Character).
 local function getCharacter(): any
 	local lp = Players.LocalPlayer
 	if lp == nil then
@@ -1266,66 +1170,65 @@ local function getCharacter(): any
 	return lp.Character
 end
 
--- First Tool held by the character.
 local function findTool(char: any): any
 	return char:FindFirstChildOfClass("Tool")
 end
 
--- True when the rod's values.casted flag is set.
 local function isCasted(tool: any): boolean
 	local values = tool:FindFirstChild("values")
 	local flag = if values ~= nil then values:FindFirstChild("casted") else nil
 	return flag ~= nil and flag.Value == true
 end
 
-local shakeScan = { alt = false, at = 0.0 } -- alt: a shake button was found by the bounded search (Model thread)
+local shakeScan = { alt = false, at = 0.0 }
+local scanShake: any
+local shakeUp: any
+do
+	-- Fast path: PlayerGui.shakeui.safezone.button (the known layout), only FindFirstChild lookups.
+	local function shakeFast(pg: any): boolean
+		local gui = pg:FindFirstChild("shakeui")
+		local zone = if gui ~= nil then gui:FindFirstChild("safezone") else nil
+		return zone ~= nil and zone:FindFirstChild("button") ~= nil
+	end
 
--- Fast path: PlayerGui.shakeui.safezone.button (the known layout), only FindFirstChild lookups.
-local function shakeFast(pg: any): boolean
-	local gui = pg:FindFirstChild("shakeui")
-	local zone = if gui ~= nil then gui:FindFirstChild("safezone") else nil
-	return zone ~= nil and zone:FindFirstChild("button") ~= nil
-end
-
--- Model thread: bounded search for a renamed shake gui or button, so GetChildren never runs in the macro tick.
-local function scanShake(pg: any, now: number): ()
-	shakeScan.at = now
-	local gui: any = pg:FindFirstChild("shakeui")
-	if gui == nil then
-		for _, c in pg:GetChildren() do
-			if string.find(string.lower(c.Name), "shake", 1, true) ~= nil then
-				gui = c
-				break
+	-- Model thread: bounded search for a renamed shake gui or button.
+	function scanShake(pg: any, now: number): ()
+		shakeScan.at = now
+		local gui: any = pg:FindFirstChild("shakeui")
+		if gui == nil then
+			for _, c in pg:GetChildren() do
+				if string.find(string.lower(c.Name), "shake", 1, true) ~= nil then
+					gui = c
+					break
+				end
 			end
 		end
-	end
-	if gui == nil then
-		shakeScan.alt = false
-		return
-	end
-	local found = false
-	local queue: { any } = { gui }
-	local i = 1
-	while not found and i <= #queue and i <= 80 do
-		local node = queue[i]
-		i += 1
-		for _, c in node:GetChildren() do
-			if string.lower(c.Name) == "button" or string.find(c.ClassName, "Button", 1, true) ~= nil then
-				found = true
-				break
-			end
-			table.insert(queue, c)
+		if gui == nil then
+			shakeScan.alt = false
+			return
 		end
+		local found = false
+		local queue: { any } = { gui }
+		local i = 1
+		while not found and i <= #queue and i <= 80 do
+			local node = queue[i]
+			i += 1
+			for _, c in node:GetChildren() do
+				if string.lower(c.Name) == "button" or string.find(c.ClassName, "Button", 1, true) ~= nil then
+					found = true
+					break
+				end
+				table.insert(queue, c)
+			end
+		end
+		shakeScan.alt = found
 	end
-	shakeScan.alt = found
+
+	function shakeUp(pg: any): boolean
+		return shakeFast(pg) or shakeScan.alt
+	end
 end
 
--- Shake prompt: its button exists.
-local function shakeUp(pg: any): boolean
-	return shakeFast(pg) or shakeScan.alt
-end
-
--- Resolves the reel minigame parts into `reel`; false when it is not on screen.
 local function readReel(pg: any): boolean
 	local gui = pg:FindFirstChild("reel")
 	if gui == nil then
@@ -1358,7 +1261,6 @@ local function readReel(pg: any): boolean
 	return true
 end
 
--- Reel progress 0-100 (reel.bar.progress.bar width), nil when unreadable.
 local function readProgress(): number?
 	local progress = reel.bar:FindFirstChild("progress")
 	local fill = if progress ~= nil then progress:FindFirstChild("bar") else nil
@@ -1372,7 +1274,6 @@ local function readProgress(): number?
 	return math.clamp(w * 100, 0, 100)
 end
 
--- Cast power 0-100 (power bar height), nil when the bar is not there.
 local function readPower(char: any): number?
 	local hrp = char:FindFirstChild("HumanoidRootPart")
 	local power = if hrp ~= nil then hrp:FindFirstChild("power") else nil
@@ -1401,8 +1302,8 @@ end
 
 -- ───────────────────────── Reel controller ─────────────────────────
 
-local ctl = {
-	stuck = 0.0, -- seconds the bar has been drifting the wrong way
+local ctl: any = {
+	stuck = 0.0,
 	resyncs = 0,
 	dt = 0.016,
 	lastCall = 0.0,
@@ -1421,13 +1322,12 @@ local ctl = {
 	warmupUntil = 0.0,
 	lastBarRaw = nil :: number?,
 	lastFishRaw = nil :: number?,
-	fv = 0.0, -- fish speed, units/s
-	bv = 0.0, -- bar speed, units/s
+	fv = 0.0,
+	bv = 0.0,
 	fishAt = 0.0,
 	barAt = 0.0,
 }
 
--- Clears the tracker state at the start and end of every reel.
 local function resetCtl(): ()
 	ctl.stuck = 0.0
 	ctl.lastCall = 0.0
@@ -1452,225 +1352,224 @@ local function resetCtl(): ()
 	ctl.barAt = 0.0
 end
 
--- Logical hold: the mouse is released instead while the rod is inverted (Dreambreaker past 40%).
-local function hold(): ()
-	if ctl.invert then
-		releaseMouse()
-	else
-		holdMouse()
-	end
-end
-
--- Logical release: the mouse is held instead while the rod is inverted.
-local function rel(): ()
-	if ctl.invert then
-		holdMouse()
-	else
-		releaseMouse()
-	end
-end
-
--- Reel tracker tuning (positions are 0-1 along the bar track, times in seconds)
-local TUNE_H = table.freeze({
-	EdgeBoundary = 0.1, -- bar position near either track end where the bar is forced back toward the fish
-	CloseThreshold = 0.0055, -- distance to the fish under which the PID takes over from the hard correction
-	FishLeadS = 0.18, -- seconds of fish movement the tracker looks ahead (scaled by tracker strength)
-	PredictionS = 0.13, -- seconds of bar movement used to predict overshoot
-	BrakeS = 0.08, -- seconds of bar travel that count as "already arriving"
-	Kp = 2.7, -- PID proportional gain: how hard the bar chases the fish
-	Ki = 0.08, -- PID integral gain: removes a steady offset
-	Kd = 3.6, -- PID derivative gain: damps overshoot from the fish/bar speed difference
-	PdClamp = 48.0, -- limit of the PID output
-	IntegralClamp = 130.0, -- limit of the integral term
-	BarRatioFromSide = 0.6, -- bar widths from a track end inside which the fish forces a full hold or release
-	CenterZoneRatio = 0.05, -- bar width fraction counted as centered on the fish (pulsing zone)
-	CenterPulsePeriodS = 0.016, -- length of one hold/release pulse cycle inside the centered zone
-	CenterPulseHoldS = 0.013, -- hold time inside one pulse cycle
-	CenterReleaseBlipS = 0.006, -- forced release after a pulse hold
-	CenterWeakPeriodS = 0.017, -- pulse cycle for a weak push inside the centered zone
-	CenterWeakHoldS = 0.01, -- hold time of the weak pulse
-	OnThreshold = 3.5, -- PID output above which the mouse is held
-	MaxVelocity = 1.05, -- speed clamp (track lengths per second)
-	PositionAlpha = 0.92, -- smoothing of the fish and bar positions (higher = less smoothing)
-	ControlAlpha = 0.99, -- smoothing of the PID output (higher = less smoothing)
-})
-
--- Positive modulo.
-local function posmod(v: number, m: number): number
-	local mm = math.max(0.001, m)
-	local r = v % mm
-	return if r < 0 then r + mm else r
-end
-
--- Speed from real game updates only: re-reading an unchanged value is not zero speed.
-local function trackSpeed(fishC: number, barC: number, now: number): ()
-	local lf = ctl.lastFishRaw
-	local lb = ctl.lastBarRaw
-	if lf == nil or lb == nil then
-		ctl.lastFishRaw = fishC
-		ctl.lastBarRaw = barC
-		ctl.fishAt = now
-		ctl.barAt = now
-		return
-	end
-	if fishC ~= lf then
-		ctl.fv = math.clamp(0.6 * (fishC - lf) / math.max(0.004, now - ctl.fishAt) + 0.4 * ctl.fv, -4, 4)
-		ctl.lastFishRaw = fishC
-		ctl.fishAt = now
-	elseif now - ctl.fishAt > 0.1 then
-		ctl.fv *= 0.8
-	end
-	if barC ~= lb then
-		ctl.bv = math.clamp(0.6 * (barC - lb) / math.max(0.004, now - ctl.barAt) + 0.4 * ctl.bv, -4, 4)
-		ctl.lastBarRaw = barC
-		ctl.barAt = now
-	elseif now - ctl.barAt > 0.1 then
-		ctl.bv *= 0.8
-	end
-end
-
--- Hybrid helper: smooths positions and publishes speeds (x1000 units) for the PID.
-local function hybridEma(fishC: number, barC: number, now: number, s: any): ()
-	trackSpeed(fishC, barC, now)
-	local fishX = fishC * 1000
-	local barX = barC * 1000
-	if not ctl.hasLast then
-		ctl.smoothFish = fishX
-		ctl.smoothBar = barX
-		ctl.fishVel = 0
-		ctl.barVel = 0
-		ctl.lastTime = now
-		ctl.hasLast = true
-		return
-	end
-	local alpha: number = s.PositionAlpha
-	ctl.smoothFish = alpha * fishX + (1 - alpha) * ctl.smoothFish
-	ctl.smoothBar = alpha * barX + (1 - alpha) * ctl.smoothBar
-	local maxv = math.max(1, s.MaxVelocity * 1000)
-	ctl.fishVel = math.clamp(ctl.fv * 1000, -maxv, maxv)
-	ctl.barVel = math.clamp(ctl.bv * 1000, -maxv, maxv)
-	ctl.lastTime = now
-end
-
--- Hybrid fine control near the fish: PID with a stable zone; returns whether to hold.
-local function hybridFine(fishC: number, barC: number, barW01: number, now: number, s: any): boolean
-	local barWidth = math.max(1, barW01 * 1000)
-	local g = (flags.trackGain or 100) / 100
-	local lead = math.clamp(ctl.fishVel * s.FishLeadS * g, -barWidth * 1.2, barWidth * 1.2)
-	local err = ctl.smoothFish + lead - ctl.smoothBar
-	err += math.clamp(barWidth * 0.035, 1.5, 5.0)
-	local dt = ctl.dt
-	ctl.integ = math.clamp(ctl.integ + err * dt, -s.IntegralClamp, s.IntegralClamp)
-	local sideMargin = barWidth * s.BarRatioFromSide
-	local clampV = math.max(s.PdClamp, s.OnThreshold + 1)
-	local raw: number
-	if ctl.smoothFish < sideMargin then
-		raw = -clampV
-	elseif ctl.smoothFish > 1000 - sideMargin then
-		raw = clampV
-	else
-		raw = math.clamp(s.Kp * g * err + s.Ki * ctl.integ + s.Kd * g * (ctl.fishVel - ctl.barVel), -s.PdClamp, s.PdClamp)
-	end
-	ctl.smoothCtl = s.ControlAlpha * raw + (1 - s.ControlAlpha) * ctl.smoothCtl
-	local control = ctl.smoothCtl
-	local centerZone = math.max(2, barWidth * s.CenterZoneRatio)
-	if math.abs(err) <= centerZone then
-		if not ctl.stable then
-			ctl.stable = true
-			ctl.stableUntil = now + 3.0
-		end
-		if now < ctl.stableUntil then
-			return control > s.OnThreshold
-		end
-		if now < ctl.pulseUntil then
-			return false
-		elseif control > s.OnThreshold then
-			local h = posmod(now, s.CenterPulsePeriodS) < math.max(0.001, s.CenterPulseHoldS)
-			if h then
-				ctl.pulseUntil = now + math.max(0, s.CenterReleaseBlipS)
-			end
-			return h
-		elseif control < -s.OnThreshold then
-			return false
-		end
-		return control > 0 and posmod(now, s.CenterWeakPeriodS) < math.max(0.001, s.CenterWeakHoldS)
-	end
-	ctl.stable = false
-	return control > s.OnThreshold
-end
-
--- Hybrid tracker: aims at the predicted fish position; hard correction when far, PID when close.
-local function reelHybrid(fishC: number, barC: number, barW01: number): ()
-	local s = TUNE_H
-	local now = os.clock()
-	local g = (flags.trackGain or 100) / 100
-	hybridEma(fishC, barC, now, s)
-	local leadMax = math.max(0.03, barW01 * 1.2)
-	local fishP = fishC + math.clamp(ctl.fv * s.FishLeadS * g, -leadMax, leadMax)
-	local err = fishP - barC
-	if now < ctl.warmupUntil then
-		if err > math.max(0.015, barW01 * 0.04) then
-			hold()
+local reelTrack: any
+do
+	-- Logical hold: the mouse is released instead while the rod is inverted (Dreambreaker past 40%).
+	local function hold(): ()
+		if ctl.invert then
+			releaseMouse()
 		else
-			rel()
+			holdMouse()
 		end
-		return
 	end
-	if barC < s.EdgeBoundary and err > 0 then
-		hold()
-		return
+
+	local function rel(): ()
+		if ctl.invert then
+			holdMouse()
+		else
+			releaseMouse()
+		end
 	end
-	if barC > 1 - s.EdgeBoundary and err < 0 then
-		rel()
-		return
+
+	-- Tuning (positions are 0-1 along the bar track, times in seconds)
+	local TUNE_H = table.freeze({
+		EdgeBoundary = 0.1,
+		CloseThreshold = 0.0055,
+		FishLeadS = 0.18,
+		PredictionS = 0.13,
+		BrakeS = 0.08,
+		Kp = 2.7,
+		Ki = 0.08,
+		Kd = 3.6,
+		PdClamp = 48.0,
+		IntegralClamp = 130.0,
+		BarRatioFromSide = 0.6,
+		CenterZoneRatio = 0.05,
+		CenterPulsePeriodS = 0.016,
+		CenterPulseHoldS = 0.013,
+		CenterReleaseBlipS = 0.006,
+		CenterWeakPeriodS = 0.017,
+		CenterWeakHoldS = 0.01,
+		OnThreshold = 3.5,
+		MaxVelocity = 1.05,
+		PositionAlpha = 0.92,
+		ControlAlpha = 0.99,
+	})
+
+	local function posmod(v: number, m: number): number
+		local mm = math.max(0.001, m)
+		local r = v % mm
+		return if r < 0 then r + mm else r
 	end
-	if math.abs(err) > s.CloseThreshold then
-		local remaining = math.abs(err) - s.CloseThreshold
-		local predErr = fishP - (barC + ctl.bv * s.PredictionS * g)
-		if err * predErr > 0 and not (err * ctl.bv > 0 and math.abs(ctl.bv) * s.BrakeS >= remaining) then
-			if err > 0 then
+
+	-- Speed from real game updates only: re-reading an unchanged value is not zero speed.
+	local function trackSpeed(fishC: number, barC: number, now: number): ()
+		local lf = ctl.lastFishRaw
+		local lb = ctl.lastBarRaw
+		if lf == nil or lb == nil then
+			ctl.lastFishRaw = fishC
+			ctl.lastBarRaw = barC
+			ctl.fishAt = now
+			ctl.barAt = now
+			return
+		end
+		if fishC ~= lf then
+			ctl.fv = math.clamp(0.6 * (fishC - lf) / math.max(0.004, now - ctl.fishAt) + 0.4 * ctl.fv, -4, 4)
+			ctl.lastFishRaw = fishC
+			ctl.fishAt = now
+		elseif now - ctl.fishAt > 0.1 then
+			ctl.fv *= 0.8
+		end
+		if barC ~= lb then
+			ctl.bv = math.clamp(0.6 * (barC - lb) / math.max(0.004, now - ctl.barAt) + 0.4 * ctl.bv, -4, 4)
+			ctl.lastBarRaw = barC
+			ctl.barAt = now
+		elseif now - ctl.barAt > 0.1 then
+			ctl.bv *= 0.8
+		end
+	end
+
+	local function hybridEma(fishC: number, barC: number, now: number, s: any): ()
+		trackSpeed(fishC, barC, now)
+		local fishX = fishC * 1000
+		local barX = barC * 1000
+		if not ctl.hasLast then
+			ctl.smoothFish = fishX
+			ctl.smoothBar = barX
+			ctl.fishVel = 0
+			ctl.barVel = 0
+			ctl.lastTime = now
+			ctl.hasLast = true
+			return
+		end
+		local alpha: number = s.PositionAlpha
+		ctl.smoothFish = alpha * fishX + (1 - alpha) * ctl.smoothFish
+		ctl.smoothBar = alpha * barX + (1 - alpha) * ctl.smoothBar
+		local maxv = math.max(1, s.MaxVelocity * 1000)
+		ctl.fishVel = math.clamp(ctl.fv * 1000, -maxv, maxv)
+		ctl.barVel = math.clamp(ctl.bv * 1000, -maxv, maxv)
+		ctl.lastTime = now
+	end
+
+	-- Fine control near the fish: PID with a stable zone; returns whether to hold.
+	local function hybridFine(fishC: number, barC: number, barW01: number, now: number, s: any): boolean
+		local barWidth = math.max(1, barW01 * 1000)
+		local g = (flags.trackGain or 100) / 100
+		local lead = math.clamp(ctl.fishVel * s.FishLeadS * g, -barWidth * 1.2, barWidth * 1.2)
+		local err = ctl.smoothFish + lead - ctl.smoothBar
+		err += math.clamp(barWidth * 0.035, 1.5, 5.0)
+		local dt = ctl.dt
+		ctl.integ = math.clamp(ctl.integ + err * dt, -s.IntegralClamp, s.IntegralClamp)
+		local sideMargin = barWidth * s.BarRatioFromSide
+		local clampV = math.max(s.PdClamp, s.OnThreshold + 1)
+		local raw: number
+		if ctl.smoothFish < sideMargin then
+			raw = -clampV
+		elseif ctl.smoothFish > 1000 - sideMargin then
+			raw = clampV
+		else
+			raw = math.clamp(s.Kp * g * err + s.Ki * ctl.integ + s.Kd * g * (ctl.fishVel - ctl.barVel), -s.PdClamp, s.PdClamp)
+		end
+		ctl.smoothCtl = s.ControlAlpha * raw + (1 - s.ControlAlpha) * ctl.smoothCtl
+		local control = ctl.smoothCtl
+		local centerZone = math.max(2, barWidth * s.CenterZoneRatio)
+		if math.abs(err) <= centerZone then
+			if not ctl.stable then
+				ctl.stable = true
+				ctl.stableUntil = now + 3.0
+			end
+			if now < ctl.stableUntil then
+				return control > s.OnThreshold
+			end
+			if now < ctl.pulseUntil then
+				return false
+			elseif control > s.OnThreshold then
+				local h = posmod(now, s.CenterPulsePeriodS) < math.max(0.001, s.CenterPulseHoldS)
+				if h then
+					ctl.pulseUntil = now + math.max(0, s.CenterReleaseBlipS)
+				end
+				return h
+			elseif control < -s.OnThreshold then
+				return false
+			end
+			return control > 0 and posmod(now, s.CenterWeakPeriodS) < math.max(0.001, s.CenterWeakHoldS)
+		end
+		ctl.stable = false
+		return control > s.OnThreshold
+	end
+
+	-- Aims at the predicted fish position; hard correction when far, PID when close.
+	local function reelHybrid(fishC: number, barC: number, barW01: number): ()
+		local s = TUNE_H
+		local now = os.clock()
+		local g = (flags.trackGain or 100) / 100
+		hybridEma(fishC, barC, now, s)
+		local leadMax = math.max(0.03, barW01 * 1.2)
+		local fishP = fishC + math.clamp(ctl.fv * s.FishLeadS * g, -leadMax, leadMax)
+		local err = fishP - barC
+		if now < ctl.warmupUntil then
+			if err > math.max(0.015, barW01 * 0.04) then
 				hold()
 			else
 				rel()
 			end
 			return
 		end
-	end
-	if hybridFine(fishC, barC, barW01, now, s) then
-		hold()
-	else
-		rel()
-	end
-end
-
--- Drives the mouse from the fish and bar positions (hybrid tracker plus input resync).
-local function reelTrack(fishC: number, barC: number, barW01: number): ()
-	local clock = os.clock()
-	ctl.dt = if ctl.lastCall > 0 then math.clamp(clock - ctl.lastCall, 0.001, 0.1) else 0.016
-	ctl.lastCall = clock
-	-- Resync: the bar keeps drifting the wrong way, so the game probably missed a press or release.
-	-- The drift is measured in seconds, so extra samples from PreLocal do not shorten it.
-	local err = fishC - barC
-	local barVel = ctl.bv * 0.021 -- bar travel per game frame
-	local held = if ctl.invert then not mouseHeld else mouseHeld
-	local halfW = barW01 / 2 + 0.03
-	if held and err > 0.06 and barVel < 0.0003 and barC < 1 - halfW then
-		ctl.stuck += ctl.dt
-	elseif not held and err < -0.06 and barVel > -0.0003 and barC > halfW then
-		ctl.stuck += ctl.dt
-	else
-		ctl.stuck = 0.0
-	end
-	if ctl.stuck >= STUCK_RESYNC_S then
-		ctl.stuck = 0.0
-		ctl.resyncs += 1
-		if held == not ctl.invert then
-			repressMouse()
+		if barC < s.EdgeBoundary and err > 0 then
+			hold()
+			return
+		end
+		if barC > 1 - s.EdgeBoundary and err < 0 then
+			rel()
+			return
+		end
+		if math.abs(err) > s.CloseThreshold then
+			local remaining = math.abs(err) - s.CloseThreshold
+			local predErr = fishP - (barC + ctl.bv * s.PredictionS * g)
+			if err * predErr > 0 and not (err * ctl.bv > 0 and math.abs(ctl.bv) * s.BrakeS >= remaining) then
+				if err > 0 then
+					hold()
+				else
+					rel()
+				end
+				return
+			end
+		end
+		if hybridFine(fishC, barC, barW01, now, s) then
+			hold()
 		else
-			rereleaseMouse()
+			rel()
 		end
 	end
-	reelHybrid(fishC, barC, barW01)
+
+	-- Drives the mouse from the fish and bar positions (tracker plus input resync).
+	function reelTrack(fishC: number, barC: number, barW01: number): ()
+		local clock = os.clock()
+		ctl.dt = if ctl.lastCall > 0 then math.clamp(clock - ctl.lastCall, 0.001, 0.1) else 0.016
+		ctl.lastCall = clock
+		-- Resync: the bar keeps drifting the wrong way, so the game probably missed a press or release.
+		local err = fishC - barC
+		local barVel = ctl.bv * 0.021
+		local held = if ctl.invert then not mouseHeld else mouseHeld
+		local halfW = barW01 / 2 + 0.03
+		if held and err > 0.06 and barVel < 0.0003 and barC < 1 - halfW then
+			ctl.stuck += ctl.dt
+		elseif not held and err < -0.06 and barVel > -0.0003 and barC > halfW then
+			ctl.stuck += ctl.dt
+		else
+			ctl.stuck = 0.0
+		end
+		if ctl.stuck >= STUCK_RESYNC_S then
+			ctl.stuck = 0.0
+			ctl.resyncs += 1
+			if held == not ctl.invert then
+				repressMouse()
+			else
+				rereleaseMouse()
+			end
+		end
+		reelHybrid(fishC, barC, barW01)
+	end
 end
 
 -- ───────────────────────── Menu ─────────────────────────
@@ -1690,10 +1589,10 @@ local infoLines: { string } = {
 	"Mouse release: --",
 	"Tick rate: --",
 	"Game streak: --",
+	"Nukes survived: 0",
 }
 local hudLines: { string } = { "Off", "Caught 0   Lost 0" }
 
--- Macro and session state (mutable, kept apart from the frozen constants)
 local S = {
 	phase = "OFF",
 	phaseAt = 0.0,
@@ -1713,6 +1612,7 @@ local S = {
 	shakes = 0,
 	caught = 0,
 	lost = 0,
+	nukes = 0,
 	infoAt = 0.0,
 	power = -1.0,
 	progress = -1.0,
@@ -1736,80 +1636,83 @@ local S = {
 	hz = 0.0,
 	hzAt = 0.0,
 	streakBefore = -1,
-	badTicks = 0, -- consecutive reel ticks with unreadable fish or bar positions
-	gs = nil :: number?, -- last sampled game streak (tracker_streak)
-	ups = 0, -- streak increases seen (catches)
-	downs = 0, -- streak drops seen (losses)
-	ups0 = 0, -- ups at the start of the current reel
-	downs0 = 0, -- downs at the start of the current reel
-	attrAt = 0.0, -- time of the last character attribute read
-	attrReeling = false, -- character attributes say a reel is active
-	attrLearned = false, -- the attributes were seen active during a reel, so their end can be trusted
+	badTicks = 0,
+	gs = nil :: number?,
+	ups = 0,
+	downs = 0,
+	ups0 = 0,
+	downs0 = 0,
+	attrAt = 0.0,
+	attrReeling = false,
+	attrLearned = false,
 }
 
--- Shows a short message in the Info tab for a few seconds.
 local function notice(text: string): ()
 	S.notice = text
 	S.noticeUntil = os.clock() + 3.0
 end
 
--- Menu flags that are saved between runs (Auto Fish is never saved).
-local PERSIST = table.freeze({
-	"autoCast", "autoShake", "autoReel", "perfect", "holdMs", "shakeMs", "navOnStart", "autoEquip",
-	"hud", "fromSaved", "trackGain", "worldOn", "huntOn",
-	"walkWater", "walkOcean", "walkDesolate", "walkDepths",
-})
-local SETTINGS_FILE = "fisch_settings.json"
-local settingsSnap: { [string]: any } = {}
+-- Settings: flags saved between runs (Auto Fish is never saved) and the saved spot.
+local saved: { x: number, y: number, z: number, face: { number }? }? = nil
+local saveSettings: any
+do
+	local PERSIST = table.freeze({
+		"autoCast", "autoShake", "autoReel", "perfect", "holdMs", "shakeMs", "navOnStart", "autoEquip",
+		"hud", "fromSaved", "trackGain", "worldOn", "huntOn",
+		"walkWater", "walkOcean", "walkDesolate", "walkDepths",
+		"chestOn", "chestDist", "chestText", "chestMax",
+	})
+	local SETTINGS_FILE = "fisch_settings.json"
+	local settingsSnap: { [string]: any } = {}
 
--- Loads saved flags from the workspace file (the menu keeps values that are already set).
-local function loadSettings(): ()
-	if not isfile(SETTINGS_FILE) then
-		return
+	local function loadSettings(): ()
+		if not isfile(SETTINGS_FILE) then
+			return
+		end
+		local text: string = readfile(SETTINGS_FILE)
+		if string.sub(text, 1, 1) ~= "{" then
+			return
+		end
+		local data: any = crypt.json.decode(text)
+		if type(data) ~= "table" then
+			return
+		end
+		for _, key in PERSIST do
+			local v = data[key]
+			if type(v) == "boolean" or type(v) == "number" then
+				flags[key] = v
+				settingsSnap[key] = v
+			end
+		end
 	end
-	local text: string = readfile(SETTINGS_FILE)
-	if string.sub(text, 1, 1) ~= "{" then
-		return
-	end
-	local data: any = crypt.json.decode(text)
-	if type(data) ~= "table" then
-		return
-	end
-	for _, key in PERSIST do
-		local v = data[key]
-		if type(v) == "boolean" or type(v) == "number" then
-			flags[key] = v
+	loadSettings()
+
+	function saveSettings(): ()
+		local changed = false
+		for _, key in PERSIST do
+			if flags[key] ~= settingsSnap[key] then
+				changed = true
+				break
+			end
+		end
+		if not changed then
+			return
+		end
+		local out: { [string]: any } = {}
+		for _, key in PERSIST do
+			local v = flags[key]
+			out[key] = v
 			settingsSnap[key] = v
 		end
+		writefile(SETTINGS_FILE, crypt.json.encode(out))
 	end
-end
-loadSettings()
-
--- Writes the saved flags when any of them changed.
-local function saveSettings(): ()
-	local changed = false
-	for _, key in PERSIST do
-		if flags[key] ~= settingsSnap[key] then
-			changed = true
-			break
-		end
-	end
-	if not changed then
-		return
-	end
-	local out: { [string]: any } = {}
-	for _, key in PERSIST do
-		local v = flags[key]
-		out[key] = v
-		settingsSnap[key] = v
-	end
-	writefile(SETTINGS_FILE, crypt.json.encode(out))
 end
 
 local ui: any = Lib.new({
 	Title = "FISCH",
 	Key = "RightShift",
 	Flags = flags,
+	Width = 380,
 	-- The macro presses the left button itself: those presses must not click the menu
 	Mute = function(): boolean
 		return mouseHeld
@@ -1824,6 +1727,8 @@ local ui: any = Lib.new({
 				return if S.shakeSeen then "Shake" else "Bite"
 			elseif ph == "REEL" then
 				return "Reel"
+			elseif ph == "NUKE" then
+				return "Nuke"
 			elseif ph == "DONE" then
 				return "Done"
 			elseif ph == "REEQUIP" then
@@ -1837,7 +1742,6 @@ local ui: any = Lib.new({
 local connections: { any } = {}
 local onUnload: { any } = {}
 
--- Stops everything: macro, input, menu and event connections.
 local function unload(): ()
 	saveSettings()
 	flags.enabled = false
@@ -1891,128 +1795,10 @@ fishing:dropdown({
 	},
 })
 
--- ───────────────────────── Teleports ─────────────────────────
-
--- Teleport spots as { name, x, y, z }, grouped for the menu lists.
-local TP_GROUPS: { any } = table.freeze({
-	{ "Islands", {
-		{ "Moosewood", 383.1, 131.24, 243.93 },
-		{ "Roslit Bay", -1476.51, 130.17, 671.69 },
-		{ "Mushgrove Swamp", 2501.49, 127.76, -720.7 },
-		{ "Snowcap Island", 2648.68, 139.07, 2521.3 },
-		{ "Sunstone Island", -933.26, 128.14, -1119.52 },
-		{ "Terrapin Island", -143.88, 141.17, 1909.61 },
-		{ "Statue", 72.88, 138.7, -1028.42 },
-		{ "The Arch", 998.97, 126.68, -1237.14 },
-		{ "Birch Cay", 1742.32, 138.26, -2502.24 },
-		{ "Harvesters Spike", -1254.8, 133.89, 1554.2 },
-		{ "Roslit Volcano", -1888.52, 163.85, 329.24 },
-		{ "Vertigo", -112.01, -492.9, 1040.33 },
-		{ "Ancient Isle", 5833.0, 125.0, 401.0 },
-	} },
-	{ "Places", {
-		{ "Keepers Altar", 1296.32, -808.55, -298.94 },
-		{ "Brine Pool", -1794.11, -145.85, -3302.92 },
-		{ "Deep", -1510.89, -237.7, -2852.91 },
-		{ "Deep Shop", -979.2, -247.91, -2699.87 },
-		{ "Wilson", 2938.81, 277.47, 2567.13 },
-		{ "Wilsons Rod", 2879.21, 135.08, 2723.64 },
-		{ "Executive", -29.84, -250.48, 199.12 },
-		{ "Mod House", -30.21, -249.41, 204.05 },
-	} },
-	{ "Fish areas 1", {
-		{ "Roslit Bay", -1663.74, 149.23, 495.5 },
-		{ "Roslit Bay Ocean", -1708.09, 155.0, 384.93 },
-		{ "Roslit Pond", -1811.97, 148.05, 592.64 },
-		{ "Roslit Pond Seaweed", -1785.29, 148.16, 639.93 },
-		{ "Lava", -1959.86, 193.14, 271.96 },
-		{ "Moosewood Docks", 343.24, 133.62, 267.06 },
-		{ "Moosewood Pond", 509.74, 152.0, 302.17 },
-		{ "Moosewood Ocean", -167.64, 125.2, 248.01 },
-		{ "Moosewood Mythical", 252.8, 135.85, 36.88 },
-		{ "Ocean", 7665.1, 125.44, 2601.59 },
-		{ "Deep Ocean", 3569.07, 125.48, 6697.13 },
-		{ "Vertigo", -137.7, -736.86, 1233.15 },
-	} },
-	{ "Fish areas 2", {
-		{ "Snowcap Pond", 2778.09, 283.28, 2580.32 },
-		{ "Snowcap Ocean", 3088.67, 131.53, 2587.11 },
-		{ "Harvesters Spike", -1234.62, 125.23, 1748.57 },
-		{ "Sunstone", -845.9, 133.17, -1163.58 },
-		{ "Sunstone Hidden", -1139.56, 134.62, -1076.94 },
-		{ "Terrapin Ocean", 58.65, 135.5, 2147.42 },
-		{ "Terrapin Olm", 22.06, 182.0, 1944.37 },
-		{ "Scallop Ocean", 23.23, 125.24, 738.95 },
-		{ "The Arch", 1283.31, 130.92, -1165.3 },
-		{ "Mushgrove Stone", 2525.36, 131.0, -776.18 },
-		{ "Altar fish spot", 1307.14, -805.29, -161.36 },
-		{ "Isonade", -1061.0, 121.16, 954.0 },
-	} },
-	{ "NPCs 1", {
-		{ "Sell spot", 464.0, 151.0, 232.0 },
-		{ "Marc", 466.16, 151.0, 224.5 },
-		{ "Merchant", 416.69, 130.3, 342.77 },
-		{ "Appraiser", 453.18, 150.5, 206.91 },
-		{ "Pierre", 391.39, 135.35, 196.71 },
-		{ "Phineas", 469.91, 150.69, 277.95 },
-		{ "Paul", 381.74, 136.5, 341.89 },
-		{ "Shipwright", 357.97, 133.62, 258.15 },
-		{ "Angler", 480.1, 150.5, 302.23 },
-		{ "Lucas", 449.34, 182.0, 180.69 },
-		{ "Inn Keeper", 487.46, 150.8, 231.5 },
-		{ "Henry", 483.54, 152.38, 236.3 },
-		{ "Daisy", 581.55, 165.49, 213.5 },
-		{ "Witch", 409.64, 134.45, 311.4 },
-		{ "Quiet Synph", 566.26, 152.0, 353.87 },
-	} },
-	{ "NPCs 2", {
-		{ "Roslit Keeper", -1512.38, 134.5, 631.24 },
-		{ "Fishing NPC 1", -1429.04, 134.37, 686.03 },
-		{ "Fishing NPC 2", -1778.55, 149.79, 648.1 },
-		{ "Fishing NPC 3", -1778.27, 147.83, 653.26 },
-		{ "Ashe", -1709.94, 149.86, 729.4 },
-		{ "Alfredrickus", -1520.61, 142.92, 764.52 },
-		{ "Lantern Keeper", -39.05, -246.6, 195.64 },
-		{ "Lantern Keeper 2", -17.42, -304.97, -14.53 },
-		{ "Mod Keeper", -39.09, -245.14, 195.84 },
-		{ "Jack Marrow", -2824.36, 214.31, 1518.13 },
-	} },
-	{ "Totems", {
-		{ "Aurora Totem", -1811.0, -137.0, -3282.0 },
-		{ "Sundial Totem", -1148.0, 135.0, -1075.0 },
-		{ "Windset Totem", 2849.0, 178.0, 2702.0 },
-		{ "Smokescreen Totem", 2789.0, 140.0, -625.0 },
-		{ "Tempest Totem", 35.0, 133.0, 1943.0 },
-	} },
-	{ "Rods", {
-		{ "Training Rod", 457.69, 148.36, 230.41 },
-		{ "Plastic Rod", 454.43, 148.17, 229.17 },
-		{ "Flimsy Rod", 471.11, 148.36, 229.64 },
-		{ "Lucky Rod", 446.09, 148.25, 222.16 },
-		{ "Fast Rod", 447.18, 148.23, 220.19 },
-		{ "Carbon Rod", 454.08, 150.59, 225.33 },
-		{ "Long Rod", 485.7, 171.66, 145.75 },
-		{ "Mythical Rod", 389.72, 132.59, 314.04 },
-		{ "Midas Rod", 401.98, 133.26, 326.33 },
-		{ "Nocturnal Rod", -141.87, -515.31, 1139.05 },
-		{ "Kings Rod", 1375.58, -810.2, -303.51 },
-		{ "Trident Rod", -1484.34, -222.33, -2194.77 },
-		{ "Stone Rod", 5500.0, 145.0, -315.0 },
-	} },
-	{ "Items", {
-		{ "Enchanted Altar", 1310.55, -799.47, -82.73 },
-		{ "Bait Crate", 384.58, 135.35, 337.53 },
-		{ "Quality Bait Crate", -177.88, 144.47, 1932.84 },
-		{ "Crab Cage", 474.8, 149.66, 229.49 },
-		{ "GPS", 517.9, 149.22, 284.86 },
-		{ "Basic Diving Gear", 369.17, 132.51, 248.71 },
-		{ "Fish Radar", 365.75, 134.5, 274.11 },
-	} },
-})
+-- ───────────────────────── Teleport engine ─────────────────────────
 
 local tpJob: any = nil
 
--- Reads a part's position as three numbers (nil when unreadable).
 local function readPosition(part: any): (number?, number?, number?)
 	local p: any = part.Position
 	if p == nil then
@@ -2025,7 +1811,47 @@ local function readPosition(part: any): (number?, number?, number?)
 	return nil, nil, nil
 end
 
--- Reads the part's flat (XZ) look direction as { x, z }, nil when unreadable.
+-- Position of a part, or of a model's primary / first part (folders: first part found below).
+local function posOf(inst: any): (number?, number?, number?)
+	local target: any = inst
+	if inst.ClassName == "Folder" then
+		local queue: { any } = { inst }
+		local depths: { number } = { 0 }
+		local i = 1
+		while i <= #queue and i <= 60 do
+			local node = queue[i]
+			local depth = depths[i]
+			i += 1
+			for _, c in node:GetChildren() do
+				local cn = c.ClassName
+				if cn == "Part" or cn == "MeshPart" or cn == "UnionOperation" then
+					return readPosition(c)
+				end
+				if depth < 3 and (cn == "Folder" or cn == "Model") then
+					table.insert(queue, c)
+					table.insert(depths, depth + 1)
+				end
+			end
+		end
+		return nil, nil, nil
+	end
+	if inst.ClassName == "Model" then
+		local pp: any = inst.PrimaryPart
+		if pp ~= nil then
+			target = pp
+		else
+			for _, c in inst:GetChildren() do
+				local cn = c.ClassName
+				if cn == "Part" or cn == "MeshPart" or cn == "UnionOperation" then
+					target = c
+					break
+				end
+			end
+		end
+	end
+	return readPosition(target)
+end
+
 local function readFacing(part: any): { number }?
 	local v: any = part.LookVector
 	if v == nil then
@@ -2042,7 +1868,6 @@ local function readFacing(part: any): { number }?
 	return { x / len, z / len }
 end
 
--- Starts a teleport job; stepTeleport applies it for a moment.
 local function queueTeleport(name: string, x: number, y: number, z: number, lift: number, face: { number }?): ()
 	tpJob = {
 		name = name,
@@ -2067,9 +1892,8 @@ local function teleportTo(name: string, x: number, y: number, z: number, lift: n
 	notice(`Teleporting: {name}`)
 end
 
--- Writes the target every frame for a moment: CFrame.new(position, lookAt) when a facing is
--- given, otherwise Position. A standing character has a sleeping physics assembly that ignores
--- the write, so a short W tap wakes it first. If the CFrame write has no effect, it falls back to Position.
+-- Writes the target every frame for a moment (CFrame when a facing is given, otherwise Position).
+-- A standing character has a sleeping physics assembly that ignores the write, so a short W tap wakes it first.
 local function stepTeleport(now: number): ()
 	local job = tpJob
 	if job == nil then
@@ -2115,18 +1939,15 @@ local function stepTeleport(now: number): ()
 	end
 end
 
-local SAVE_FILE = "fisch_saved_spot.txt"
-local saved: { x: number, y: number, z: number, face: { number }? }? = nil
+local SAVE_FILE = "fisch_saved_spot.txt" -- saved position and facing: "x,y,z[,fx,fz]"
 local savedLines: { string } = { "Saved: none", "Facing: --" }
 
--- Remembers the saved position and facing and updates the Teleports tab text.
 local function setSaved(x: number, y: number, z: number, face: { number }?): ()
 	saved = { x = x, y = y, z = z, face = face }
 	savedLines[1] = string.format("Saved: %.0f, %.0f, %.0f", x, y, z)
 	savedLines[2] = if face ~= nil then "Facing: saved" else "Facing: not saved"
 end
 
--- Stores the current character position and facing (also written to a workspace file).
 local function savePosition(): ()
 	local char: any = getCharacter()
 	local hrp: any = if char ~= nil then char:FindFirstChild("HumanoidRootPart") else nil
@@ -2149,7 +1970,6 @@ local function savePosition(): ()
 	notice("Position saved")
 end
 
--- Teleports to the stored position and facing.
 local function gotoSaved(): ()
 	local pos = saved
 	if pos == nil then
@@ -2172,8 +1992,833 @@ if isfile(SAVE_FILE) then
 	end
 end
 
--- ───────────────────────── World info, hunts, stats ─────────────────────────
+local function myPosition(): (number?, number?, number?)
+	local char: any = getCharacter()
+	local hrp: any = if char ~= nil then char:FindFirstChild("HumanoidRootPart") else nil
+	if hrp == nil then
+		return nil, nil, nil
+	end
+	return readPosition(hrp)
+end
 
+-- ───────────────────────── Teleport / Rods tabs (own scope: keeps the main chunk under the 200 local limit) ─────────────────────────
+
+local scanPlayers: any
+do
+local function V3(x: number, y: number, z: number): any
+	return { X = x, Y = y, Z = z }
+end
+
+local LOCATIONS: { [string]: any } = {
+	["Obsidian Pocket"] = V3(141.56, -6551.0, 48.81),
+	["Boreal Hollow"] = V3(848.32, -2603.62, 1610.78),
+	["Grand Reef"] = V3(-3577.17, 162.33, 503.51),
+	["Desolate Deep"] = V3(-1512.57, -234.7, -2862.52),
+	["Glacial Grotto (Summit)"] = V3(19990.91, 1142.24, 5550.1),
+	Atlantis = V3(-4343.68, -602.31, 1813.18),
+	["Boreal Pines"] = V3(21575.56, 141.52, 4137.94),
+	["Castaway Cliff"] = V3(384.89, 207.49, -1818.55),
+	["Everturn Forest"] = V3(2426.63, 149.82, -2500.87),
+	["Forsaken Shores"] = V3(-2584.73, 167.55, 1608.71),
+	["Lost Jungle"] = V3(-2707.33, 158.2, -2060.92),
+	Moosewood = V3(486.56, 157.84, 268.3),
+	Mushgrove = V3(2697.28, 140.33, -756.55),
+	["Roslit Bay"] = V3(-1486.62, 142.08, 704.4),
+	["Scoria Reach"] = V3(-5108.09, 145.09, -1456.06),
+	["Snowcap Island"] = V3(2687.71, 160.31, 2385.95),
+	["Sunstone Island"] = V3(-986.11, 208.64, -1074.15),
+	Terrapin = V3(-132.3, 188.15, 1952.43),
+	Tidefall = V3(3133.05, -1081.1, 788.25),
+	["Treasure Island"] = V3(8284, 195, -17093),
+	["Poseidon\'s Storm of Floods"] = V3(-8985.58, -3191.38, 780.49),
+	["Abyssal Zenith"] = V3(-13541, -11048, 154),
+	["Brine Pool"] = V3(-1795, -142, -3331),
+	["Ancient Archives"] = V3(-3162.13, -747.21, 1701.17),
+	["Enchanted Crevice"] = V3(681.17, -754.03, -472.44),
+	["Luminescent Cavern"] = V3(-1013, -313, -4038),
+	["Cursed Isle"] = V3(1860, 135, 1210),
+	["Zeus\'s Thunder of Chaos"] = V3(-8878, -3539, 594),
+	["Living Garden"] = V3(-2401, -316, -2771),
+	["Carrot Garden"] = V3(3732, -1127, -1080),
+	["Northern Expedition"] = V3(19512.69, 132.67, 5303.36),
+	["Above The Clouds"] = V3(1489.51, 2601.67, -1718.3),
+	["Ancient Isle"] = V3(6069, 224, 262),
+	Mineshaft = V3(-684, -864, -74),
+	["Overgrowth Caves"] = V3(20269.78, 273.2, 5557.13),
+	["Cryogenic Canal"] = V3(19956.81, 635.28, 5717.43),
+	["Glacial Grotto (Cave)"] = V3(20007.97, 1035.2, 5699.71),
+	["Bellona\'s Frenzy of War"] = V3(-8667.92, -2361.67, 757.59),
+	["Apollo\'s Song of Light"] = V3(-8707.94, -2904.53, 731.84),
+	["Hades\' Underworld of Indefinite"] = V3(-8649, -4243, 434),
+	["Olympian Fissure"] = V3(-8830, -4243, -147),
+	["Challenger\'s Deep"] = V3(-775, -3283, -675),
+	["Volcanic Vents"] = V3(-3390, -2263, 3822),
+	["Calm Zone"] = V3(-4336, -11174, 3704),
+	["Veil of the Forsaken"] = V3(-2361, -11184, -7073),
+	["Cultist Lair"] = V3(4476, -1997, -4676),
+	["Crystal Cove"] = V3(1364, -612, 2472),
+	["Keepers Altar"] = V3(1296, -805, -296),
+	Snowburrow = V3(2784, 141, 2557),
+	["Collapsed Ruins"] = V3(3136, -1102, 1611),
+	["Crowned Ruins"] = V3(3126, -1126, 2039),
+	["Coral Bastion"] = V3(2544, -1098, 849),
+	["Sunken Reliquary"] = V3(2950, -1102, 443),
+	["Roslit Volcano"] = V3(-1893, 173, 314),
+	Drylands = V3(-6455.02, 204.97, -1539.97),
+	Vertigo = V3(-107, -515, 1143),
+	["The Depths"] = V3(608, -712, 1230),
+	["Crimson Cavern"] = V3(-1035, -360, -4800),
+	["Toxic Grove"] = V3(-2745, -317, -2272),
+	["Poseidons Temple"] = V3(-3950, -550, 968),
+	["Nectar Den"] = V3(-2066, -327, -3125),
+	["Sunken Depths"] = V3(-4938.35, -595.12, 1840.24),
+	["Ethereal Abyss"] = V3(-3792.98, -564.27, 1828.82),
+	["Kraken Lair"] = V3(-4380.05, -996.26, 2052.43),
+	["Zeus\' Sanctuary"] = V3(-4294, -627, 2655),
+	["Astral Observatory"] = V3(842.98, -2603.62, 1619.96),
+	["Blue Moon - First Sea"] = V3(2685.14, 141.51, 2582.13),
+	Skycrest = V3(2779.58, 1621.31, 830.14),
+	["The Deep"] = V3(385.44, -2238.58, -11910.56),
+	["Outer Deep"] = V3(-436.9, -2367.8, -12685.32),
+	["Gloomy Crevice"] = V3(134.63, -2512.3, -11836.59),
+	["Lower Deep"] = V3(1708.02, -2805.78, -11772.06),
+	["Atlantean Storm"] = V3(-3866, 154, 445),
+	["Frigid Cavern"] = V3(19845.54, 440.16, 5633.05),
+}
+
+local POI: { [string]: any } = {
+	["Obsidian Trench"] = V3(-1668.61, -12350.83, 62.88),
+	["Appraisal (Tidefall)"] = V3(3158, -1099, 771),
+	Merlin = V3(-960, 222, -988),
+	Toucan = V3(-2933, 275, -2156),
+	["Bubble Mermaid"] = V3(-3550, 130, 568),
+	["Mermaid Cove"] = V3(-3870, -1286, 505),
+	Rodtp = V3(19227.0, 395.9, 6028.3),
+	["Statue of Sovereignty"] = V3(17.04, 166.1, -1048.24),
+	["The Arch"] = V3(1005.03, 131.32, -1241.27),
+	["Haddock Rock"] = V3(-464.45, 160.01, -454.63),
+	["Earmark Island"] = V3(1272.97, 140.1, 542.9),
+	["Birch Cay"] = V3(1747.19, 143.0, -2449.68),
+	["Harvesters Spike"] = V3(-1254.81, 137.25, 1556.77),
+	Heaven = V3(1459.48, 8876.25, -1717.73),
+	Hawaii = V3(-1346, 130, -39935),
+	Meteor = V3(5733, 184, 625),
+	["Ghosts Tavern"] = V3(268, 800, -6864),
+	["Underground Music Venue"] = V3(2037, -644, 2474),
+	["Oscars Locker"] = V3(213.22, -394.45, 3534.9),
+	["The Laboratory"] = V3(-1934, 224, -449),
+	["Shady Bazaar"] = V3(-2941, -1029, 6178),
+	["Forgotten Temple"] = V3(-5286, -1759, -10000),
+	["Thalassar\'s Secret"] = V3(2897, -579, 1177),
+	["Detonator\'s Rest"] = V3(-1409, -902, -3493),
+	Aether = V3(-146, -654, 966),
+	["Trident Temple"] = V3(-1480, -225, -2242),
+	["Zeus\'s Rod Room"] = V3(-4294, -627, 2655),
+	["Volcanic Depths (Pool)"] = V3(-3345, -2026, 4084),
+	["Challangers Deep (Pool)"] = V3(747, -3353, -1566),
+	["Mossjaw Rest"] = V3(-4928.72, -1792.56, -10168.67),
+	["Forsaken Shores Pond"] = V3(-2665.24, 167.5, 1754.01),
+	["Claypans - Drylands"] = V3(-5765.58, 137.0, -915.12),
+	["Sunken Reservoir"] = V3(-6627.04, 158.68, -1247.25),
+	["Abaia\'s Chamber - Skycrest"] = V3(3412.14, 1562.36, 950.12),
+	button1 = V3(400, 135, 265),
+	button2 = V3(5506, 147, -315),
+	button3 = V3(2930, 281, 2594),
+	button4 = V3(-1715, 149, 737),
+	button5 = V3(-2566, 181, 1353),
+	["Blue crystal"] = V3(20125, 211, 5449),
+	["Green Crystal"] = V3(19873, 448, 5556),
+	["Yellow Crystal"] = V3(19488, 335, 5553),
+	Door = V3(19986, 906, 5453),
+	["Scoria Mines"] = V3(-4544.53, -707.31, -2032.08),
+	["Hall of Whispers"] = V3(4346.09, -2234.82, -4679.79),
+	["Passage of Oaths"] = V3(4284.83, -2483.02, -4680.36),
+	["The Sanctum"] = V3(4373.79, -2710.14, -4673.39),
+	["Inner Tidefall Castle"] = V3(4317.5, -1100.92, 919.84),
+	["Snowcap Island - Astral Cavern"] = V3(2637.73, -410.04, 2521.67),
+	["Boreal Pines - Astral Cavern"] = V3(21878.31, -148.6, 4246.41),
+	["Abyssal Zenith - Astral Cavern"] = V3(-13802.84, -11569.7, 122.17),
+	["Everturn Forest - Astral Cavern"] = V3(2523.82, -126.48, -2498.27),
+	["Cryogenic Canal - Astral Cavern"] = V3(-1859.83, -262.67, 4012.63),
+}
+
+-- Rod catalog: name, zone, pos (exact spot) or tp (location name used as a hub), npc, how.
+local ROD_CATALOG: { any } = {
+	{ name = "Flimsy Rod", zone = "Moosewood", pos = V3(470, 151, 232), how = "Starter rod - you spawn with it" },
+	{ name = "Training Rod", zone = "Moosewood", pos = V3(465, 150, 230), npc = "Marc Merchant", how = "Merchant - 300 C$" },
+	{ name = "Plastic Rod", zone = "Moosewood", pos = V3(463.36, 150.53, 235.97), npc = "Marc Merchant", how = "Merchant - 900 C$" },
+	{ name = "Carbon Rod", zone = "Moosewood", pos = V3(463.36, 150.53, 235.97), npc = "Marc Merchant", how = "Merchant - 2,000 C$" },
+	{ name = "Fast Rod", zone = "Moosewood", pos = V3(463.36, 150.53, 235.97), npc = "Marc Merchant", how = "Merchant - 2,000 C$" },
+	{ name = "Long Rod", zone = "Moosewood", pos = V3(463.36, 150.53, 235.97), npc = "Marc Merchant", how = "Merchant - 4,500 C$" },
+	{ name = "Lucky Rod", zone = "Moosewood", pos = V3(463.36, 150.53, 235.97), npc = "Marc Merchant", how = "Merchant - 5,250 C$" },
+	{ name = "Steady Rod", zone = "Roslit Bay", pos = V3(-1499.41, 141.43, 750.98), npc = "Alfredrickus", how = "Blacksmith - 7,000 C$" },
+	{ name = "Fortune Rod", zone = "Roslit Bay", pos = V3(-1499.41, 141.43, 750.98), npc = "Alfredrickus", how = "Blacksmith - 12,750 C$" },
+	{ name = "Rapid Rod", zone = "Roslit Bay", pos = V3(-1499.41, 141.43, 750.98), npc = "Alfredrickus", how = "Merchant - 14,000 C$" },
+	{ name = "Magma Rod", zone = "Roslit Bay", pos = V3(-1850, 165, 160), npc = "Orc", how = "Quest: give the Orc a Pufferfish (teleport lands at the Orc)" },
+	{ name = "Cinder Block Rod", zone = "The Laboratory", pos = V3(-1970, 260, -530), how = "Hand-marked spot at The Laboratory (added 2026-09-06) - acquisition not catalogued" },
+	{ name = "Magnet Rod", zone = "Terrapin Island", pos = V3(-234.2, 141.85, 1955.3), how = "Shipwright - 15,000 C$" },
+	{ name = "Reinforced Rod", zone = "Desolate Deep", pos = V3(-990, -245, -2695), how = "Secret merchant - 20,000 C$" },
+	{ name = "Trident Rod", zone = "Desolate Deep", pos = V3(-1483, -225, -2207), how = "Complete Bestiary + 5 Enchant Relics - 150,000 C$ (the teleport bypasses the Enchant Relic door)" },
+	{ name = "Nocturnal Rod", zone = "Vertigo", pos = V3(-144.04, -515.3, 1144.86), how = "Merchant - 11,000 C$" },
+	{ name = "Aurora Rod", zone = "Vertigo", pos = V3(-144.04, -515.3, 1144.86), how = "Buy Aurora Totem (500k), activate during whirlpool - 90,000 C$" },
+	{ name = "Fungal Rod", zone = "Mushgrove Swamp", pos = V3(2588.54, 132.0, -725.91), npc = "Agaric", how = "Quest: show Agaric an Alligator (catchable at this spot)" },
+	{ name = "Rod of the Exalted One", zone = "Mushgrove Swamp", pos = V3(2232.82, -804.18, 1032.22), how = "Place 7 mutated Enchant Relics on the altar" },
+	{ name = "Kings Rod", zone = "Keeper\'s Altar (below the Statue)", pos = V3(1383.54, -807.31, -303.38), how = "Sold at the Keeper\'s Altar - ~100,000 C$" },
+	{ name = "Destiny Rod", zone = "The Arch", pos = V3(985.49, 131.32, -1234.51), npc = "Caleia", how = "Caleia - 190,000 C$ (needs 70% Bestiary)" },
+	{ name = "Sunken Rod", zone = "Forsaken Shores", pos = V3(-2494.0, 133.1, 1551.27), how = "Find a treasure map, repair it, dig up the chest" },
+	{ name = "Scurvy Rod", zone = "Forsaken Shores", pos = V3(-2825, 215, 1515), npc = "Jack Marrow", how = "Jack Marrow - 50,000 C$" },
+	{ name = "Rod of the Depths", zone = "The Depths", pos = V3(1705.52, -902.53, 1441.27), how = "Place relics on the altars + key - 750,000 C$" },
+	{ name = "Relic Rod", zone = "Archaeological Site", tp = "Mineshaft", how = "Cave puzzle at the dig site - 8,000 C$" },
+	{ name = "Stone Rod", zone = "Ancient Isle", pos = V3(5500, 143, -316), how = "Sold on the isle - 3,000 C$" },
+	{ name = "Phoenix Rod", zone = "Ancient Isle", pos = V3(5963.22, 269.62, 851.75), how = "Inside the cave - 40,000 C$" },
+	{ name = "Mythical Rod", zone = "Traveling Merchant (random spawn)", how = "110,000 C$ when the merchant is around" },
+	{ name = "Midas Rod", zone = "Traveling Merchant (random spawn)", how = "55,000 C$ when the merchant is around" },
+	{ name = "No-Life Rod", zone = "Anywhere", how = "Reach level 500" },
+	{ name = "Seraphic Rod", zone = "Anywhere", how = "Reach level 1,000" },
+	{ name = "Free Spirit Rod", zone = "Mineshaft", pos = V3(-314, -864, -81), how = "100% Bestiary + 200,000 C$" },
+	{ name = "Arctic Rod", zone = "Northern Summit", pos = V3(19575, 135, 5310), how = "Base-camp merchant table - 25,000 C$" },
+	{ name = "Avalanche Rod", zone = "Northern Summit", pos = V3(19771, 415, 5415), how = "Camp near Overgrowth Cave - 35,000 C$" },
+	{ name = "Crystalized Rod", zone = "Northern Summit", pos = V3(20296, 272, 5463), how = "35,000 C$ - needs 2 players + a Glass Diamond" },
+	{ name = "Ice Warpers Rod", zone = "Glacial Grotto", tp = "Glacial Grotto (Summit)", how = "Unlock the 6 levers - 65,000 C$" },
+	{ name = "Summit Rod", zone = "Northern Summit (peak)", pos = V3(20213.5, 736.7, 5713), how = "Crate at the top - 300,000 C$" },
+	{ name = "Heaven\'s Rod", zone = "Heaven (above the Summit)", tp = "Heaven", how = "Energy Crystals + buttons - 1,750,000 C$" },
+	{ name = "Champions Rod", zone = "Atlantis", pos = V3(-4259.02, -603.21, 1870.9), how = "Left of the Inn Keeper - 1,000,000 C$" },
+	{ name = "Depthseeker Rod", zone = "Atlantis", pos = V3(-4459.58, -605.66, 1866.08), how = "Merchant stall by the east bridge - 125,000 C$" },
+	{ name = "Tempest Rod", zone = "Atlantis", pos = V3(-4931.56, -595.24, 1852.3), how = "Mythological Clock room after the Sunken Trial - 1,850,000 C$" },
+	{ name = "Abyssal Specter Rod", zone = "Atlantis", pos = V3(-3802.18, -566.77, 1862.8), how = "Clock room after the Ethereal Abyss Trial - 1,004,269 C$" },
+	{ name = "Poseidon Rod", zone = "Poseidon\'s Temple (Atlantis)", pos = V3(-4078.5, -558.23, 895.9), how = "After Poseidon\'s trial - 450,000 C$" },
+	{ name = "Zeus Rod", zone = "Zeus\'s Rod Room (Atlantis)", pos = V3(-4275.86, -627.11, 2659.67), how = "After Zeus\'s trial - 500,000 C$" },
+	{ name = "Kraken Rod", zone = "Kraken Pool (Atlantis)", pos = V3(-4404.55, -996.26, 2053.8), how = "All 4 trials + 5 clocks - 950,000 C$" },
+	{ name = "Volcanic Rod", zone = "Volcanic Vents (Mariana\'s Veil)", pos = V3(-3175, -2030, 4020), how = "300,000 C$" },
+	{ name = "Challenger\'s Rod", zone = "Challenger\'s Deep (Mariana\'s Veil)", pos = V3(740, -3350, -1530), how = "400,000 C$" },
+	{ name = "Rod of the Zenith", zone = "Abyssal Zenith", pos = V3(-13629.56, -11035.21, 349.12), how = "700,000 C$" },
+	{ name = "Ethereal Prism Rod", zone = "Calm Zone Rainbow Pond (Mariana\'s Veil)", pos = V3(-4360, -11170, 3710), how = "3,500,000 C$" },
+	{ name = "Leviathan\'s Fang Rod", zone = "Veil of the Forsaken", how = "Defeat the Scylla boss - 1,000,000 C$ (no fixed spot - can\'t teleport)" },
+	{ name = "Precision Rod", zone = "Ancient Vault", tp = "Ancient Archives", how = "Craft - 7,000 C$ + materials" },
+	{ name = "Resourceful Rod", zone = "Ancient Vault", tp = "Ancient Archives", how = "Craft - 15,000 C$ + materials" },
+	{ name = "Wisdom Rod", zone = "Ancient Vault", tp = "Ancient Archives", how = "Craft - 50,000 C$ + materials" },
+	{ name = "Krampus\'s Rod", zone = "Ancient Vault", tp = "Ancient Archives", how = "Craft - 30,000 C$ + materials" },
+	{ name = "Seasons Rod", zone = "Ancient Vault", tp = "Ancient Archives", how = "Level 145 - craft, 35,000 C$ + materials" },
+	{ name = "Riptide Rod", zone = "Ancient Vault", tp = "Ancient Archives", how = "Level 200 - craft, 40,000 C$ + materials" },
+	{ name = "Voyager Rod", zone = "Ancient Vault", tp = "Ancient Archives", how = "Level 400 - craft, 30,000 C$ + materials" },
+	{ name = "The Lost Rod", zone = "Ancient Vault", tp = "Ancient Archives", how = "Level 450 - craft, 50,000 C$ + materials" },
+	{ name = "Celestial Rod", zone = "Ancient Vault", tp = "Ancient Archives", how = "Level 500 - craft, 100,000 C$ + materials" },
+	{ name = "Rod of the Eternal King", zone = "Ancient Vault", tp = "Ancient Archives", how = "Level 650 - craft, 250,000 C$ + materials" },
+	{ name = "Rod of the Forgotten Fang", zone = "Ancient Vault", tp = "Ancient Archives", how = "Level 750 - craft, 300,000 C$ + materials" },
+	{ name = "Rod of Time", zone = "Ancient Vault", tp = "Ancient Archives", how = "Craft - special materials, no C$" },
+	{ name = "Marrow Rod", zone = "Drylands", tp = "Ancient Archives", how = "Mysterious Marrow questline in the Drylands, then craft at the Ancient Archives" },
+	{ name = "Terrotrapper Rod", zone = "Drylands", how = "Obtained in the Drylands (walk there from behind the FischFest castle)" },
+	{ name = "Hades\' Soul Scythe", zone = "Hades\' Underworld of Indefinite", pos = V3(-7682.7, -4260.6, 363.0), how = "100% Bestiary + 25,000,000 C$" },
+}
+
+local ROD_SRC_LABEL = table.freeze({ exact = "exact spot", hub = "island hub (walk from there)", zone = "zone center (live lookup)" })
+
+-- Finds a spot by exact name, then case-insensitively; without a table it looks in locations, then in points of interest.
+local function resolveSpot(name: string, tbl: any?): any?
+	if tbl == nil then
+		return resolveSpot(name, LOCATIONS) or resolveSpot(name, POI)
+	end
+	local direct = tbl[name]
+	if direct ~= nil then
+		return direct
+	end
+	local lower = string.lower(name)
+	for key, value in tbl do
+		if string.lower(key) == lower then
+			return value
+		end
+	end
+	return nil
+end
+
+local function sortedNames(tbl: { [string]: any }): { string }
+	local names: { string } = {}
+	for name in tbl do
+		table.insert(names, name)
+	end
+	table.sort(names, function(a: string, b: string): boolean
+		return string.lower(a) < string.lower(b)
+	end)
+	return names
+end
+
+local function partPos(part: any): (number?, number?, number?)
+	local ok, p = pcall(function(): any
+		return part.Position
+	end)
+	if not ok or p == nil then
+		return nil, nil, nil
+	end
+	local x, y, z = p.X, p.Y, p.Z
+	if type(x) == "number" and type(y) == "number" and type(z) == "number" then
+		return x, y, z
+	end
+	return nil, nil, nil
+end
+
+-- Zone centers from workspace.zones.player (cached for 5 seconds).
+local zoneMap: { [string]: any } = {}
+local zoneMapAt = -1e9
+
+local function zoneName(zone: any): string
+	local value: any = zone:FindFirstChild("zonename")
+	if value ~= nil then
+		local ok, text = pcall(function(): any
+			return value.Value
+		end)
+		if ok and type(text) == "string" and text ~= "" then
+			return text
+		end
+	end
+	return zone.Name
+end
+
+local function zonePos(name: string): any?
+	if name == "" then
+		return nil
+	end
+	if os.clock() - zoneMapAt > 5 then
+		zoneMapAt = os.clock()
+		local map: { [string]: any } = {}
+		local zones: any = workspace:FindFirstChild("zones")
+		local player: any = if zones ~= nil then zones:FindFirstChild("player") else nil
+		if player ~= nil then
+			for _, zone in player:GetChildren() do
+				local x, y, z = partPos(zone)
+				if x ~= nil and y ~= nil and z ~= nil then
+					local zn = zoneName(zone)
+					if map[zn] == nil then
+						map[zn] = V3(x, y, z)
+					end
+				end
+			end
+		end
+		zoneMap = map
+	end
+	local want = string.lower(name)
+	local partial: any = nil
+	for key, value in zoneMap do
+		local lower = string.lower(key)
+		if lower == want then
+			return value
+		end
+		if partial == nil and (string.find(lower, want, 1, true) ~= nil or string.find(want, lower, 1, true) ~= nil) then
+			partial = value
+		end
+	end
+	return partial
+end
+
+-- Where a rod can be reached: exact spot, island hub or the live zone center.
+local function rodPos(rod: any): (any?, string?)
+	if rod.pos ~= nil then
+		return rod.pos, "exact"
+	end
+	local hub = resolveSpot(rod.tp or rod.zone)
+	if hub ~= nil then
+		return hub, "hub"
+	end
+	local zp = zonePos(rod.zone)
+	if zp ~= nil then
+		return zp, "zone"
+	end
+	return nil, nil
+end
+
+-- NPCs in the world (workspace.world.npcs, workspace.npcs and the NewNpc tag), cached for 10 seconds.
+local npcList: { any } = {}
+local npcAt = -1e9
+
+local function collectNpcs(): { any }
+	local out: { any } = {}
+	local seen: { [string]: boolean } = {}
+	local function addModel(model: any): ()
+		local x, y, z = nil, nil, nil
+		local hrp: any = model:FindFirstChild("HumanoidRootPart")
+		if hrp ~= nil then
+			x, y, z = partPos(hrp)
+		end
+		if x == nil then
+			local head: any = model:FindFirstChild("Head")
+			if head ~= nil then
+				x, y, z = partPos(head)
+			end
+		end
+		if x == nil then
+			for _, c in model:GetChildren() do
+				x, y, z = partPos(c)
+				if x ~= nil then
+					break
+				end
+			end
+		end
+		if x == nil or y == nil or z == nil then
+			return
+		end
+		local key = string.format("%s@%d,%d", model.Name, math.floor(x), math.floor(z))
+		if not seen[key] then
+			seen[key] = true
+			table.insert(out, { name = model.Name, pos = V3(x, y, z) })
+		end
+	end
+	local function walk(folder: any, depth: number): ()
+		if folder == nil or depth > 3 then
+			return
+		end
+		for _, child in folder:GetChildren() do
+			if child:FindFirstChild("Humanoid") ~= nil or child:FindFirstChild("HumanoidRootPart") ~= nil then
+				addModel(child)
+			elseif #child:GetChildren() > 0 then
+				walk(child, depth + 1)
+			end
+		end
+	end
+	local world: any = workspace:FindFirstChild("world")
+	walk(if world ~= nil then world:FindFirstChild("npcs") else nil, 1)
+	walk(workspace:FindFirstChild("npcs"), 1)
+	pcall(function()
+		local service: any = game:GetService("CollectionService")
+		for _, model in service:GetTagged("NewNpc") do
+			addModel(model)
+		end
+	end)
+	return out
+end
+
+local function npcSnapshot(): { any }
+	local now = os.clock()
+	if now - npcAt >= 10 then
+		npcAt = now
+		npcList = collectNpcs()
+	end
+	return npcList
+end
+
+-- Live check of a rod spot: the named NPC within 500 studs gives its real position; an NPC within 60 is "likely".
+local function rodLiveCheck(rod: any, pos: any?): (any?, string?)
+	local p: any = pos
+	if p == nil then
+		p = rodPos(rod)
+	end
+	if p == nil then
+		return nil, nil
+	end
+	local wanted: string? = if rod.npc ~= nil then string.lower(rod.npc) else nil
+	local nearest: number? = nil
+	local nearestName: string? = nil
+	local verified: any = nil
+	for _, npc in npcSnapshot() do
+		local dx, dy, dz = npc.pos.X - p.X, npc.pos.Y - p.Y, npc.pos.Z - p.Z
+		local d = math.sqrt(dx * dx + dy * dy + dz * dz)
+		if nearest == nil or d < nearest then
+			nearest = d
+			nearestName = npc.name
+		end
+		if wanted ~= nil and verified == nil and d <= 500 and string.find(string.lower(npc.name), wanted, 1, true) ~= nil then
+			verified = npc.pos
+		end
+	end
+	if verified ~= nil then
+		return verified, "verified - " .. rod.npc .. " on site"
+	end
+	if nearest ~= nil and nearest <= 60 then
+		return nil, string.format("likely - %s [%d]", nearestName or "?", math.floor(nearest))
+	end
+	return nil, "unverified (too far)"
+end
+
+local function wrapText(text: string, width: number): { string }
+	local lines: { string } = {}
+	local line = ""
+	for word in string.gmatch(text, "%S+") do
+		if line == "" then
+			line = word
+		elseif #line + 1 + #word <= width then
+			line ..= " " .. word
+		else
+			table.insert(lines, line)
+			line = word
+		end
+	end
+	if line ~= "" then
+		table.insert(lines, line)
+	end
+	return lines
+end
+
+local function rodDescribe(rod: any): { string }
+	local pos, src = rodPos(rod)
+	local _, live = rodLiveCheck(rod, pos)
+	local lines: { string } = { rod.name }
+	for _, l in wrapText("Where: " .. rod.zone, 54) do
+		table.insert(lines, l)
+	end
+	for _, l in wrapText("How: " .. rod.how, 54) do
+		table.insert(lines, l)
+	end
+	table.insert(lines, "Teleport: " .. (if src ~= nil then ROD_SRC_LABEL[src] else "n/a - no fixed spot"))
+	if live ~= nil then
+		table.insert(lines, "Live check: " .. live)
+	end
+	return lines
+end
+
+-- Teleports to a rod (the NPC's live position wins over the catalog spot).
+local function rodTeleport(rod: any): ()
+	local pos = rodPos(rod)
+	if pos == nil then
+		notice(rod.name .. " has no fixed spot (" .. rod.zone .. ")")
+		return
+	end
+	local live = rodLiveCheck(rod, pos)
+	if live ~= nil then
+		pos = live
+	end
+	teleportTo(rod.name, pos.X, pos.Y, pos.Z, 0, nil)
+end
+
+local function gotoPlayer(name: string): ()
+	local target: any = Players:FindFirstChild(name)
+	local char: any = if target ~= nil then target.Character else nil
+	if char == nil then
+		char = workspace:FindFirstChild(name)
+	end
+	local hrp: any = if char ~= nil then char:FindFirstChild("HumanoidRootPart") else nil
+	if hrp == nil then
+		notice("Player has no character")
+		return
+	end
+	local x, y, z = readPosition(hrp)
+	if x == nil or y == nil or z == nil then
+		notice("Can't read position")
+		return
+	end
+	teleportTo(name, x, y, z)
+end
+
+local playerPicker: any = nil
+local playerPickerKey = ""
+
+-- Rebuilds the player chips when someone joins or leaves.
+function scanPlayers(): ()
+	local lp: any = Players.LocalPlayer
+	local myName: string = if lp ~= nil then lp.Name else ""
+	local names: { string } = {}
+	for _, p in Players:GetChildren() do
+		local n: string = p.Name
+		if n ~= myName then
+			table.insert(names, n)
+		end
+	end
+	table.sort(names)
+	local key = table.concat(names, "|")
+	if playerPicker == nil or key == playerPickerKey then
+		return
+	end
+	playerPickerKey = key
+	local items: { any } = {}
+	for _, n in names do
+		table.insert(items, {
+			Name = n,
+			Callback = function()
+				gotoPlayer(n)
+			end,
+		})
+	end
+	playerPicker.Items = items
+end
+
+-- Adds chip lists (14 names each, alphabetical) that teleport to the spots of one table.
+local function addSpotGroups(tab: any, prefix: string, tbl: { [string]: any }): ()
+	local names = sortedNames(tbl)
+	local per = 14
+	local i = 1
+	while i <= #names do
+		local last = math.min(i + per - 1, #names)
+		local items: { any } = {}
+		for k = i, last do
+			local name: string = names[k]
+			local p: any = tbl[name]
+			table.insert(items, {
+				Name = name,
+				Callback = function()
+					teleportTo(name, p.X, p.Y, p.Z, 0, nil)
+				end,
+			})
+		end
+		local label = string.format("%s %s-%s", prefix, string.upper(string.sub(names[i], 1, 1)), string.upper(string.sub(names[last], 1, 1)))
+		tab:dropdown({ Name = label, Items = items, Layout = "chips", Accordion = "tp", MaxLabel = 26 })
+		i = last + 1
+	end
+end
+
+local function gotoTyped(): ()
+	local text: any = flags.gotoText
+	if type(text) ~= "string" then
+		notice("Type x, y, z first")
+		return
+	end
+	local nums: { number } = {}
+	for token in string.gmatch(text, "%-?%d+%.?%d*") do
+		local n = tonumber(token)
+		if n ~= nil then
+			table.insert(nums, n)
+		end
+	end
+	if #nums < 3 then
+		notice("Need three numbers: x, y, z")
+		return
+	end
+	teleportTo("coordinates", nums[1], nums[2], nums[3], 0, nil)
+end
+
+local teleports = ui:tab("Teleport")
+teleports:section({ Title = "SAVED POSITION" })
+teleports:note({ Lines = savedLines })
+teleports:action({ Name = "Save current position", Button = "Save", Callback = savePosition })
+teleports:action({ Name = "Go to saved position", Button = "Go", Callback = gotoSaved })
+teleports:section({ Title = "COORDINATES", Divider = true })
+teleports:input({ Name = "Type x, y, z (L = minus), Enter", Flag = "gotoText", MaxLen = 48, OnSubmit = gotoTyped })
+teleports:action({ Name = "Go to typed coordinates", Button = "Go", Callback = gotoTyped })
+teleports:section({ Title = "LOCATIONS", Divider = true })
+addSpotGroups(teleports, "Locations", LOCATIONS)
+teleports:section({ Title = "POINTS OF INTEREST", Divider = true })
+addSpotGroups(teleports, "POI", POI)
+playerPicker = teleports:dropdown({ Name = "Players", Items = {}, Layout = "chips", Accordion = "tp" })
+
+local rods = ui:tab("Rods")
+local rodNote: any = rods:note({ Lines = { "Tap a rod: it teleports and shows where and how to get it" } })
+do
+	local per = 14
+	local i = 1
+	while i <= #ROD_CATALOG do
+		local last = math.min(i + per - 1, #ROD_CATALOG)
+		local items: { any } = {}
+		for k = i, last do
+			local rod: any = ROD_CATALOG[k]
+			table.insert(items, {
+				Name = rod.name,
+				Callback = function()
+					rodNote.Lines = rodDescribe(rod)
+					rodTeleport(rod)
+				end,
+			})
+		end
+		rods:dropdown({ Name = string.format("Rods %d-%d", i, last), Items = items, Layout = "chips", Accordion = "rod", MaxLabel = 26 })
+		i = last + 1
+	end
+end
+end
+
+-- ───────────────────────── Chests (own scope) ─────────────────────────
+
+local stepChestRun: any, updateChestRows: any, drawChests: any, refreshChests: any
+do
+local CHEST_TEXT = Color3.fromRGB(255, 235, 120)
+
+-- All treasure chests right now (workspace.world.chests and workspace.world.ActiveChestsFolder).
+local function chestsNow(): { any }
+	local out: { any } = {}
+	local world: any = workspace:FindFirstChild("world")
+	if world == nil then
+		return out
+	end
+	for _, folderName in { "chests", "ActiveChestsFolder" } do
+		local folder: any = world:FindFirstChild(folderName)
+		if folder ~= nil then
+			for _, c in folder:GetChildren() do
+				local x, y, z = posOf(c)
+				if x ~= nil and y ~= nil and z ~= nil then
+					table.insert(out, { name = "Chest", x = x, y = y, z = z })
+				end
+			end
+		end
+	end
+	return out
+end
+
+local chestList: { any } = {}
+local chestRows: { any } = {}
+local espHrp: any = nil
+local espHrpAt = -1e9
+local chestCycle = 0
+
+function refreshChests(): ()
+	chestList = chestsNow()
+end
+
+local function chestTpNearest(): ()
+	local list = chestsNow()
+	if #list == 0 then
+		notice("No treasure chests up right now.")
+		return
+	end
+	local mx, my, mz = myPosition()
+	local best: any = nil
+	local bestD = 0.0
+	for _, c in list do
+		local d = 0.0
+		if mx ~= nil and my ~= nil and mz ~= nil then
+			local dx, dy, dz = c.x - mx, c.y - my, c.z - mz
+			d = math.sqrt(dx * dx + dy * dy + dz * dz)
+		end
+		if best == nil or d < bestD then
+			best = c
+			bestD = d
+		end
+	end
+	teleportTo("Chest", best.x, best.y + 3, best.z, 0, nil)
+end
+
+local function chestTpNext(): ()
+	local list = chestsNow()
+	if #list == 0 then
+		notice("No treasure chests up right now.")
+		return
+	end
+	chestCycle = chestCycle % #list + 1
+	local c: any = list[chestCycle]
+	teleportTo("Chest", c.x, c.y + 3, c.z, 0, nil)
+end
+
+-- Collect-all run: teleport to each chest, tap E, move on.
+local chestRun = { active = false, list = {} :: { any }, i = 1, stage = "tp", nextAt = 0.0, visited = 0 }
+
+local function chestRunStart(): ()
+	if flags.enabled == true then
+		notice("Stop Auto Fish to teleport")
+		return
+	end
+	chestRun.list = chestsNow()
+	chestRun.i = 1
+	chestRun.stage = "tp"
+	chestRun.nextAt = 0.0
+	chestRun.visited = 0
+	chestRun.active = #chestRun.list > 0
+	notice(if chestRun.active then string.format("Chest run: visiting %d chest(s)...", #chestRun.list) else "Chest run: no chests found.")
+end
+
+local function chestRunStop(): ()
+	if not chestRun.active then
+		return
+	end
+	chestRun.active = false
+	keyrelease(VK.E)
+	notice(string.format("Chest run stopped (%d visited).", chestRun.visited))
+end
+
+-- One step of the collect-all run (PostLocal). The teleport is applied for a moment, so the E tap waits for it to finish.
+function stepChestRun(now: number): ()
+	if not chestRun.active or now < chestRun.nextAt then
+		return
+	end
+	if chestRun.i > #chestRun.list then
+		chestRun.active = false
+		notice(string.format("Chest run done: %d chest(s) visited.", chestRun.visited))
+		return
+	end
+	local c: any = chestRun.list[chestRun.i]
+	if chestRun.stage == "tp" then
+		queueTeleport("Chest", c.x, c.y, c.z, 0, nil)
+		chestRun.stage = "wait"
+	elseif chestRun.stage == "wait" then
+		if tpJob == nil then
+			chestRun.stage = "press"
+			chestRun.nextAt = now + 0.15
+		end
+	else
+		tapKey(VK.E, 0.15)
+		chestRun.visited += 1
+		chestRun.i += 1
+		chestRun.stage = "tp"
+		chestRun.nextAt = now + 0.2
+	end
+end
+
+-- PostLocal: builds the ESP rows (distance, max distance filter, label) from the chest snapshot.
+function updateChestRows(now: number): ()
+	if flags.chestOn ~= true then
+		if #chestRows > 0 then
+			chestRows = {}
+		end
+		return
+	end
+	if espHrp ~= nil and espHrp.Parent == nil then
+		espHrp = nil
+	end
+	if espHrp == nil and now - espHrpAt >= 0.25 then
+		espHrpAt = now
+		local char: any = getCharacter()
+		espHrp = if char ~= nil then char:FindFirstChild("HumanoidRootPart") else nil
+	end
+	local mx, my, mz = nil, nil, nil
+	if espHrp ~= nil then
+		mx, my, mz = readPosition(espHrp)
+	end
+	local maxd: number = flags.chestMax or 0
+	local rows: { any } = {}
+	for _, c in chestList do
+		local d: number? = nil
+		if mx ~= nil and my ~= nil and mz ~= nil then
+			local dx, dy, dz = c.x - mx, c.y - my, c.z - mz
+			d = math.sqrt(dx * dx + dy * dy + dz * dz)
+		end
+		if not (maxd > 0 and d ~= nil and d > maxd) then
+			local label: string = c.name
+			if flags.chestDist == true and d ~= nil then
+				label = string.format("%s [%d]", c.name, math.floor(d))
+			end
+			table.insert(rows, { pos = vec(c.x, c.y, c.z), label = label })
+		end
+	end
+	chestRows = rows
+end
+
+-- Render: the label of every chest on screen.
+function drawChests(): ()
+	if flags.chestOn ~= true or #chestRows == 0 then
+		return
+	end
+	local cam: any = workspace.CurrentCamera
+	if cam == nil then
+		return
+	end
+	local textSize: number = flags.chestText or 14
+	for _, row in chestRows do
+		local sp: any, onScreen: any = cam:WorldToScreenPoint(row.pos)
+		if onScreen and sp ~= nil then
+			local sx: number = sp.X
+			local sy: number = sp.Y
+			DrawingImmediate.Text(vec(sx, sy - textSize / 2, 0), textSize, CHEST_TEXT, 1, row.label, true)
+		end
+	end
+end
+
+local chests = ui:tab("Chests")
+chests:section({ Title = "TREASURE CHEST ESP" })
+chests:toggle({ Name = "Show treasure chests", Flag = "chestOn", Default = false })
+chests:toggle({ Name = "Show distance", Flag = "chestDist", Default = true })
+chests:slider({ Name = "TEXT SIZE", Flag = "chestText", Min = 8, Max = 28, Default = 14, Step = 1, Suffix = "" })
+chests:slider({ Name = "MAX DISTANCE (0 = ALL)", Flag = "chestMax", Min = 0, Max = 5000, Default = 0, Step = 50, Suffix = "" })
+chests:section({ Title = "CHEST TELEPORT", Divider = true })
+chests:action({ Name = "Teleport to nearest chest", Button = "Go", Callback = chestTpNearest })
+chests:action({ Name = "Teleport to next chest", Button = "Go", Callback = chestTpNext })
+chests:action({ Name = "Collect all chests", Button = "Start", Callback = chestRunStart })
+chests:action({ Name = "Stop chest run", Button = "Stop", Callback = chestRunStop })
+
+table.insert(onUnload, function()
+	chestRun.active = false
+	keyrelease(VK.E)
+end)
+end
+
+-- ───────────────────────── World info, hunts, stats (own scope) ─────────────────────────
+
+-- Cooldown stamps in seconds: keep the heavy reads rare.
+local W = { gsAt = 0.0, clockAt = 0.0, scanAt = 0.0, huntAt = 0.0, saveAt = 0.0, lastTick = 0.0, waterAt = 0.0, resolveAt = 0.0, playersAt = 0.0, chestAt = 0.0 }
+
+local readGameStreak: any, trackStreak: any, onPostModel: any
+do
 -- ReplicatedStorage.world (GetService can return nil here, so look it up by name).
 local function getWorld(): any
 	local rs: any = game:FindFirstChild("ReplicatedStorage")
@@ -2182,9 +2827,6 @@ local function getWorld(): any
 	end
 	return if rs ~= nil then rs:FindFirstChild("world") else nil
 end
-
--- Cooldown stamps in seconds: keep the heavy reads rare.
-local W = { gsAt = 0.0, clockAt = 0.0, scanAt = 0.0, huntAt = 0.0, saveAt = 0.0, lastTick = 0.0, waterAt = 0.0, resolveAt = 0.0, playersAt = 0.0 }
 
 -- Workspace attributes that hold an active event (value = end time or true).
 local EVENT_ATTRS = table.freeze({
@@ -2209,7 +2851,6 @@ local EVENT_ATTRS = table.freeze({
 	TorrentialRain = "Torrential Rain",
 })
 
--- Known hunt names (matched by normalized key)
 local HUNT_KNOWN = table.freeze({
 	"Baby Bloop Fish", "Bloop Fish", "Profane Leviathan", "Elder Mossjaw", "Colossal Ancient Dragon",
 	"Colossal Blue Dragon", "Colossal Ethereal Dragon", "Dreadfin", "Flower Guardian", "Frostwyrm",
@@ -2222,7 +2863,6 @@ local HUNT_KNOWN = table.freeze({
 	"Great Hammerhead Shark", "Brine Storm", "Isonade",
 })
 
--- Alternative instance names that map to a known hunt
 local HUNT_ALIASES = table.freeze({
 	["orca"] = "Orca Migration",
 	["ancient orca"] = "Orca Migration",
@@ -2288,7 +2928,7 @@ end
 
 local classifyCache: { [string]: any } = {}
 
--- Cached classifyHunt: each distinct name is parsed only once (keeps ticks short).
+-- Cached classifyHuntRaw: each distinct name is parsed only once (keeps ticks short).
 local function classifyHunt(raw: string): string?
 	local c = classifyCache[raw]
 	if c == nil then
@@ -2298,48 +2938,6 @@ local function classifyHunt(raw: string): string?
 	return if c == false then nil else c
 end
 
--- Position of a part, or of a model's primary / first part.
-local function posOf(inst: any): (number?, number?, number?)
-	local target: any = inst
-	if inst.ClassName == "Folder" then
-		local queue: { any } = { inst }
-		local depths: { number } = { 0 }
-		local i = 1
-		while i <= #queue and i <= 60 do
-			local node = queue[i]
-			local depth = depths[i]
-			i += 1
-			for _, c in node:GetChildren() do
-				local cn = c.ClassName
-				if cn == "Part" or cn == "MeshPart" or cn == "UnionOperation" then
-					return readPosition(c)
-				end
-				if depth < 3 and (cn == "Folder" or cn == "Model") then
-					table.insert(queue, c)
-					table.insert(depths, depth + 1)
-				end
-			end
-		end
-		return nil, nil, nil
-	end
-	if inst.ClassName == "Model" then
-		local pp: any = inst.PrimaryPart
-		if pp ~= nil then
-			target = pp
-		else
-			for _, c in inst:GetChildren() do
-				local cn = c.ClassName
-				if cn == "Part" or cn == "MeshPart" or cn == "UnionOperation" then
-					target = c
-					break
-				end
-			end
-		end
-	end
-	return readPosition(target)
-end
-
--- Day / night text from the world cycle value.
 local function serverClock(): string
 	local world: any = getWorld()
 	local cyc: any = if world ~= nil then world:FindFirstChild("cycle") else nil
@@ -2354,9 +2952,7 @@ local worldState = {
 	hunts = { "Hunt: off" } :: { string },
 }
 local worldNote: any = nil
-local worldSeen: { [string]: boolean } = {}
 
--- Builds the World tab lines (time, 5 event slots, hunts) and swaps them in.
 local function publishWorld(): ()
 	local lines: { string } = { worldState.time }
 	for _, l in worldState.events do
@@ -2420,10 +3016,32 @@ local function scanWorld(): ()
 			end
 		end
 	end
+	-- workspace:GetAttribute is very slow in Severe (38 calls per scan used ~90% of the VM): read the attribute
+	-- list once and query only the names that exist.
+	local present: { [string]: boolean } = {}
+	local listed = false
+	local okAttrs, attrs = pcall(function(): any
+		return workspace:GetAttributes()
+	end)
+	if okAttrs and type(attrs) == "table" then
+		listed = true
+		for k, v in attrs :: any do
+			if type(k) == "string" then
+				present[k] = true
+			elseif type(v) == "string" then
+				present[v] = true
+			end
+		end
+	end
 	for key, display in EVENT_ATTRS do
-		local v: any = workspace:GetAttribute(key)
-		if v == nil then
-			v = workspace:GetAttribute(key .. "Active")
+		local v: any = nil
+		if listed then
+			if present[key] then
+				v = workspace:GetAttribute(key)
+			end
+			if v == nil and present[key .. "Active"] then
+				v = workspace:GetAttribute(key .. "Active")
+			end
 		end
 		if type(v) == "number" then
 			local endAt = toUnix(v)
@@ -2439,17 +3057,14 @@ local function scanWorld(): ()
 		end
 	end
 
-	local current: { [string]: boolean } = {}
 	local lines: { string } = { "", "", "", "", "" }
 	for i, name in names do
-		current[name] = true
 		local endAt = ends[name]
 		local left = if endAt ~= nil then math.max(0, endAt - unixNow) else nil
 		if i <= 5 then
 			lines[i] = if left ~= nil then string.format("%s  %d:%02d", name, math.floor(left / 60), math.floor(left % 60)) else name
 		end
 	end
-	worldSeen = current
 	if #names == 0 then
 		lines[1] = "Events: none"
 	end
@@ -2461,7 +3076,7 @@ local streakNode: any = nil
 local streakNodeAt = -1e9
 
 -- The game's own streak (workspace.PlayerStats.<name>.T.<name>.Stats.tracker_streak); nil when unreadable.
-local function readGameStreak(): number?
+function readGameStreak(): number?
 	local player: any = Players.LocalPlayer
 	if player == nil then
 		return nil
@@ -2489,8 +3104,8 @@ local function readGameStreak(): number?
 end
 
 -- Counts catches and losses from the game's own streak: +1 = caught, a drop = lost. Counted only while
--- Auto Fish runs (phase is not OFF); the first sample is just the baseline. Independent of the reel state machine.
-local function trackStreak(now: number): ()
+-- Auto Fish runs (phase is not OFF); the first sample is just the baseline.
+function trackStreak(now: number): ()
 	if now - W.gsAt < 0.1 then
 		return
 	end
@@ -2524,16 +3139,46 @@ local function trackStreak(now: number): ()
 	end
 end
 
-local huntFound: { [string]: any } = {} -- snapshot: replaced as a whole after every scan
-
+local huntFound: { [string]: any } = {}
 local huntOrder: { string } = {}
 local huntCursor = 0
-local huntActive = false -- hunt detection has published results that must be cleared when it is switched off
-local megaNames: { [string]: any } = {} -- cache: instance name -> hunt name (false when not a megalodon)
+local huntActive = false
+local megaNames: { [string]: any } = {}
 local MEGA_EXACT = table.freeze({ "Megalodon", "Ancient Megalodon" })
 
--- A Megalodon can spawn outside zones.fishing: exact names are looked up in workspace (no GetChildren on the
--- big root), the small active and active.bosses folders are scanned by name.
+local huntPicker: any = nil
+local huntPickerKey = ""
+
+-- Teleport offsets above the zone part of a hunt; other hunts use max(y + 10, 135).
+local HUNT_TP: any = table.freeze({
+	["Isonade"] = { 25.0, 135.0, 25.0 },
+	["Great Hammerhead Shark"] = { 0.0, 135.0, 0.0 },
+	["Great White Shark"] = { 0.0, 135.0, 0.0 },
+	["Whale Shark"] = { 0.0, 135.0, 0.0 },
+	["The Depths - Serpent"] = { 0.0, 50.0, 0.0 },
+})
+
+local function gotoHuntNamed(name: string): ()
+	local inst: any = huntFound[name]
+	if inst == nil then
+		notice("Hunt is gone")
+		return
+	end
+	local x, y, z = posOf(inst)
+	if x == nil or y == nil or z == nil then
+		notice("Hunt position unknown")
+		return
+	end
+	local off: any = HUNT_TP[name]
+	if off ~= nil then
+		teleportTo(name, x + off[1], y + off[2], z + off[3], 0, nil)
+	else
+		teleportTo(name, x, math.max(y + 10, 135), z, 0, nil)
+	end
+end
+
+-- A Megalodon can spawn outside zones.fishing: exact names are looked up in workspace, the small
+-- active and active.bosses folders are scanned by name.
 local function scanMegalodon(current: { [string]: any }): ()
 	local active: any = workspace:FindFirstChild("active")
 	local bosses: any = if active ~= nil then active:FindFirstChild("bosses") else nil
@@ -2571,39 +3216,6 @@ local function scanMegalodon(current: { [string]: any }): ()
 		end
 	end
 end
-local huntPicker: any = nil -- dropdown with one chip per detected hunt
-local huntPickerKey = ""
-local playerPicker: any = nil -- dropdown with one chip per other player in the server
-local playerPickerKey = ""
-
--- Teleport offsets above the zone part of a hunt (same heights as the reference script); other hunts use max(y + 10, 135).
-local HUNT_TP: any = table.freeze({
-	["Isonade"] = { 25.0, 135.0, 25.0 },
-	["Great Hammerhead Shark"] = { 0.0, 135.0, 0.0 },
-	["Great White Shark"] = { 0.0, 135.0, 0.0 },
-	["Whale Shark"] = { 0.0, 135.0, 0.0 },
-	["The Depths - Serpent"] = { 0.0, 50.0, 0.0 },
-})
-
--- Teleports to one detected hunt by name.
-local function gotoHuntNamed(name: string): ()
-	local inst: any = huntFound[name]
-	if inst == nil then
-		notice("Hunt is gone")
-		return
-	end
-	local x, y, z = posOf(inst)
-	if x == nil or y == nil or z == nil then
-		notice("Hunt position unknown")
-		return
-	end
-	local off: any = HUNT_TP[name]
-	if off ~= nil then
-		teleportTo(name, x + off[1], y + off[2], z + off[3], 0, nil)
-	else
-		teleportTo(name, x, math.max(y + 10, 135), z, 0, nil)
-	end
-end
 
 -- Looks for hunts and events among the children of Workspace.zones.fishing (they exist only while active).
 local function scanHunts(): ()
@@ -2626,7 +3238,7 @@ local function scanHunts(): ()
 		scanMegalodon(current)
 	end
 	local order: { string } = {}
-	for name, inst in current do
+	for name in current do
 		table.insert(order, name)
 		if huntFound[name] == nil then
 			notice(`Hunt: {name}`)
@@ -2674,7 +3286,6 @@ local function clearHunts(): ()
 	publishWorld()
 end
 
--- Teleports to the next detected hunt (each press moves to the next one).
 local function gotoHunt(): ()
 	if #huntOrder == 0 then
 		notice("No hunt detected")
@@ -2682,55 +3293,6 @@ local function gotoHunt(): ()
 	end
 	huntCursor = huntCursor % #huntOrder + 1
 	gotoHuntNamed(huntOrder[huntCursor])
-end
-
--- Teleports next to one player by name (same teleport as the location chips).
-local function gotoPlayer(name: string): ()
-	local target: any = Players:FindFirstChild(name)
-	local char: any = if target ~= nil then target.Character else nil
-	if char == nil then
-		char = workspace:FindFirstChild(name)
-	end
-	local hrp: any = if char ~= nil then char:FindFirstChild("HumanoidRootPart") else nil
-	if hrp == nil then
-		notice("Player has no character")
-		return
-	end
-	local x, y, z = readPosition(hrp)
-	if x == nil or y == nil or z == nil then
-		notice("Can't read position")
-		return
-	end
-	teleportTo(name, x, y, z)
-end
-
--- Rebuilds the player chips when someone joins or leaves.
-local function scanPlayers(): ()
-	local lp: any = Players.LocalPlayer
-	local myName: string = if lp ~= nil then lp.Name else ""
-	local names: { string } = {}
-	for _, p in Players:GetChildren() do
-		local n: string = p.Name
-		if n ~= myName then
-			table.insert(names, n)
-		end
-	end
-	table.sort(names)
-	local key = table.concat(names, "|")
-	if playerPicker == nil or key == playerPickerKey then
-		return
-	end
-	playerPickerKey = key
-	local items: { any } = {}
-	for _, n in names do
-		table.insert(items, {
-			Name = n,
-			Callback = function()
-				gotoPlayer(n)
-			end,
-		})
-	end
-	playerPicker.Items = items
 end
 
 -- Walk on water: makes the sea parts of the chosen zones solid (client-side CanCollide).
@@ -2774,23 +3336,8 @@ table.insert(onUnload, function()
 	end
 end)
 
--- Resets the session counters.
-local function resetStats(): ()
-	S.casts = 0
-	S.shakes = 0
-	S.caught = 0
-	S.lost = 0
-	S.activeSec = 0.0
-	S.catchSum = 0.0
-	S.streak = 0
-	S.bestStreak = 0
-	S.timeouts = 0
-	S.cycleAt = 0.0
-	notice("Stats reset")
-end
-
 -- Model thread (scans belong here, not in the macro tick): one heavy job per tick, each on its own cooldown.
-local function onPostModel(): ()
+function onPostModel(): ()
 	local now = os.clock()
 	local pg: any = getPlayerGui()
 	if flags.enabled == true and pg ~= nil and now - shakeScan.at >= 0.3 then
@@ -2827,6 +3374,11 @@ local function onPostModel(): ()
 		clearHunts()
 		return
 	end
+	if flags.chestOn == true and now - W.chestAt >= 1.5 then
+		W.chestAt = now
+		refreshChests()
+		return
+	end
 	if now - W.playersAt >= 2.0 then
 		W.playersAt = now
 		scanPlayers()
@@ -2834,52 +3386,6 @@ local function onPostModel(): ()
 	end
 end
 
--- Teleports to the coordinates typed in the Teleports tab (any text with three numbers).
-local function gotoTyped(): ()
-	local text: any = flags.gotoText
-	if type(text) ~= "string" then
-		notice("Type x, y, z first")
-		return
-	end
-	local nums: { number } = {}
-	for token in string.gmatch(text, "%-?%d+%.?%d*") do
-		local n = tonumber(token)
-		if n ~= nil then
-			table.insert(nums, n)
-		end
-	end
-	if #nums < 3 then
-		notice("Need three numbers: x, y, z")
-		return
-	end
-	teleportTo("coordinates", nums[1], nums[2], nums[3], 0, nil)
-end
-
-local teleports = ui:tab("Teleports")
-teleports:section({ Title = "SAVED POSITION" })
-teleports:note({ Lines = savedLines })
-teleports:action({ Name = "Save current position", Button = "Save", Callback = savePosition })
-teleports:action({ Name = "Go to saved position", Button = "Go", Callback = gotoSaved })
-teleports:section({ Title = "COORDINATES", Divider = true })
-teleports:input({ Name = "Type x, y, z (L = minus), Enter", Flag = "gotoText", MaxLen = 48, OnSubmit = gotoTyped })
-teleports:action({ Name = "Go to typed coordinates", Button = "Go", Callback = gotoTyped })
-teleports:section({ Title = "SPOTS", Divider = true })
-for _, group in TP_GROUPS do
-	local items: { any } = {}
-	for _, spot in group[2] do
-		local name: string, x: number, y: number, z: number = spot[1], spot[2], spot[3], spot[4]
-		table.insert(items, {
-			Name = name,
-			Callback = function()
-				teleportTo(name, x, y, z)
-			end,
-		})
-	end
-	teleports:dropdown({ Name = group[1], Items = items, Layout = "chips", Accordion = "tp" })
-end
-playerPicker = teleports:dropdown({ Name = "Players", Items = {}, Layout = "chips", Accordion = "tp" })
-
--- The Info tab stays last: add new tabs above this line.
 local worldTab = ui:tab("World")
 worldTab:toggle({ Name = "World scan (time, events)", Flag = "worldOn", Default = true })
 do
@@ -2896,7 +3402,25 @@ worldTab:section({ Title = "HUNTS (Workspace.zones.fishing)", Divider = true })
 worldTab:toggle({ Name = "Hunt detect", Flag = "huntOn", Default = false })
 worldTab:action({ Name = "Go to hunt (next)", Button = "Go", Callback = gotoHunt })
 huntPicker = worldTab:dropdown({ Name = "Teleport to hunt", Items = {}, Layout = "chips", Accordion = "hunt" })
+end
 
+-- Resets the session counters.
+local function resetStats(): ()
+	S.casts = 0
+	S.shakes = 0
+	S.caught = 0
+	S.lost = 0
+	S.nukes = 0
+	S.activeSec = 0.0
+	S.catchSum = 0.0
+	S.streak = 0
+	S.bestStreak = 0
+	S.timeouts = 0
+	S.cycleAt = 0.0
+	notice("Stats reset")
+end
+
+-- The Info tab stays last: add new tabs above this line.
 local info = ui:tab("Info")
 info:note({ Lines = infoLines })
 info:section({ Title = "TOOLS", Divider = true })
@@ -2913,7 +3437,6 @@ info:action({ Name = "Unload script", Button = "Unload", Callback = unload })
 
 -- ───────────────────────── Macro ─────────────────────────
 
--- Switches the phase and stamps the time.
 local function go(phase: string, now: number): ()
 	S.phase = phase
 	S.phaseAt = now
@@ -2943,10 +3466,508 @@ local function go(phase: string, now: number): ()
 	end
 end
 
+-- ───────────────────────── Nuke minigame (own scope) ─────────────────────────
+-- Same GUI detection, mover lock (scale / offset / rotation), prediction and Q / E taps as the Matcha AutoFish
+-- nuke handler. Times inside this block are in milliseconds.
+
+local am: any, nukePump: any, nukeFlush: any, nukeVisible: any, nukeBegin: any, nukeStep: any
+do
+local NUKE_REFRESH_MS = 200
+local NUKE_DEEP_MS = 1000
+local NUKE_NESTED_PER = 2
+local NUKE_DEADZONE_FRAC = 0.08
+local NUKE_TAP_INTERVAL_MS = 55
+local NUKE_TAP_HOLD_MS = 30
+local NUKE_PREDICTION = 10
+local NUKE_TIMEOUT_MS = 45000
+local NUKE_LOCK_TIMEOUT_MS = 10000
+local NUKE_KEY_Q = 81
+local NUKE_KEY_E = 69
+local NUKE_KEY_COOLDOWN_MS = 20
+local NUKE_NAMES = table.freeze({ "nuke", "bomb", "defuse" })
+local NUKE_CLASSES = table.freeze({
+	Frame = true,
+	ImageLabel = true,
+	ImageButton = true,
+	TextLabel = true,
+	TextButton = true,
+	ScrollingFrame = true,
+	CanvasGroup = true,
+})
+
+-- Guarded key taps: a key is not pressed again while it is held or cooling down.
+local nkHeld: { [number]: number } = {}
+local nkNext: { [number]: number } = {}
+
+function nukePump(nowMs: number): ()
+	for code, at in nkHeld do
+		if nowMs >= at then
+			nkHeld[code] = nil
+			keyrelease(code)
+		end
+	end
+end
+
+function nukeFlush(): ()
+	nukePump(math.huge)
+end
+
+local function nukeTap(code: number, holdMs: number, nowMs: number): boolean
+	if nkHeld[code] ~= nil then
+		return false
+	end
+	local nxt = nkNext[code]
+	if nxt ~= nil and nowMs < nxt then
+		return false
+	end
+	keypress(code)
+	nkHeld[code] = nowMs + holdMs
+	nkNext[code] = nowMs + holdMs + NUKE_KEY_COOLDOWN_MS
+	return true
+end
+
+table.insert(onUnload, nukeFlush)
+
+local function readParentOf(inst: any): any
+	return inst.Parent
+end
+
+local function readPropOf(inst: any, prop: string): any
+	return inst[prop]
+end
+
+local function kidsFn(inst: any): any
+	return inst:GetChildren()
+end
+
+local function kidsOf(inst: any): { any }
+	if inst == nil then
+		return {}
+	end
+	local ok, list = pcall(kidsFn, inst)
+	return if ok and type(list) == "table" then list else {}
+end
+
+local function liveAddr(inst: any): number
+	if inst == nil then
+		return 0
+	end
+	local ok, parent = pcall(readParentOf, inst)
+	if not ok or parent == nil then
+		return 0
+	end
+	return addressOf(inst)
+end
+
+-- Enabled / Visible of a gui: the property when it reads as a boolean, else the byte in memory.
+local function guiFlag(gui: any, prop: string, off: number): boolean
+	if gui == nil then
+		return false
+	end
+	local okParent, parent = pcall(readParentOf, gui)
+	if not okParent or parent == nil then
+		return false
+	end
+	local ok, v = pcall(readPropOf, gui, prop)
+	if ok and type(v) == "boolean" then
+		return v
+	end
+	local a = addressOf(gui)
+	if a == 0 or off == 0 then
+		return true
+	end
+	return readU8(a + off) ~= 0
+end
+
+local function nukeName(name: any): boolean
+	local lower = string.lower(tostring(name or ""))
+	for _, word in NUKE_NAMES do
+		if string.find(lower, word, 1, true) ~= nil then
+			return true
+		end
+	end
+	return false
+end
+
+am = {
+	gui = nil :: any,
+	guiAddr = 0,
+	guiClass = nil :: string?,
+	at = 0.0,
+	deepAt = 0.0,
+	kids = nil :: any,
+	nestIdx = 0,
+	ignoredAddr = 0,
+}
+
+local function nukeClear(): ()
+	am.gui = nil
+	am.guiAddr = 0
+	am.guiClass = nil
+end
+
+-- Looks for the nuke GUI: PlayerGui.NukeMinigame, else any child named like nuke / bomb / defuse (also one level deeper).
+local function nukeFind(nowMs: number, force: boolean): ()
+	if not force and nowMs - am.at < NUKE_REFRESH_MS then
+		return
+	end
+	if am.gui ~= nil and nowMs - am.at > 1000 then
+		nukeClear()
+	end
+	am.at = nowMs
+	local pg: any = getPlayerGui()
+	if pg == nil then
+		nukeClear()
+		return
+	end
+	local found: any = pg:FindFirstChild("NukeMinigame")
+	if found == nil and am.gui ~= nil then
+		local ok, parent = pcall(readParentOf, am.gui)
+		if ok and parent ~= nil then
+			found = am.gui
+		end
+	end
+	if found == nil and (force or nowMs - am.deepAt >= NUKE_DEEP_MS) then
+		am.deepAt = nowMs
+		am.kids = kidsOf(pg)
+		for _, kid in am.kids do
+			if nukeName(kid.Name) then
+				found = kid
+				break
+			end
+		end
+	end
+	local kids: any = nil
+	if found == nil then
+		kids = if am.deepAt == nowMs and am.kids ~= nil then am.kids else kidsOf(pg)
+	end
+	if found == nil and kids ~= nil and #kids > 0 then
+		for _ = 1, math.min(NUKE_NESTED_PER, #kids) do
+			am.nestIdx = (am.nestIdx % #kids) + 1
+			for _, c in kidsOf(kids[am.nestIdx]) do
+				if nukeName(c.Name) then
+					found = c
+					break
+				end
+			end
+			if found ~= nil then
+				break
+			end
+		end
+	end
+	if found ~= nil then
+		local addr = addressOf(found)
+		if am.ignoredAddr ~= 0 and addr == am.ignoredAddr then
+			nukeClear()
+			return
+		end
+		am.gui = found
+		am.guiAddr = addr
+		am.guiClass = found.ClassName
+	else
+		nukeClear()
+		am.ignoredAddr = 0
+	end
+end
+
+-- True while the nuke GUI is on screen (ScreenGui: Enabled, anything else: Visible).
+function nukeVisible(nowMs: number, force: boolean): boolean
+	nukeFind(nowMs, force)
+	if am.gui == nil then
+		return false
+	end
+	if am.guiClass == "ScreenGui" then
+		return guiFlag(am.gui, "Enabled", OFF.GuiEnabled)
+	end
+	return guiFlag(am.gui, "Visible", OFF.Visible)
+end
+
+-- Position units a mover can use: scale, offset (pixels) or rotation.
+local NUKE_UNITS: { any } = {
+	{
+		unit = "scale",
+		move = "scaleMove",
+		first = "scale0",
+		last = "lastScale",
+		read = function(addr: number): number?
+			if addr == 0 then
+				return nil
+			end
+			local v = readF32(addr + OFF.Position)
+			if sane(v, -2.0, 2.0) then
+				return v
+			end
+			return nil
+		end,
+	},
+	{
+		unit = "offset",
+		move = "offMove",
+		first = "off0",
+		last = "lastOff",
+		read = function(addr: number): number?
+			if addr == 0 then
+				return nil
+			end
+			local v = readI32(addr + OFF.Position + 4)
+			if math.abs(v) <= 4000 then
+				return v
+			end
+			return nil
+		end,
+	},
+	{
+		unit = "rot",
+		move = "rotMove",
+		first = "rot0",
+		last = "lastRot",
+		read = function(addr: number): number?
+			if addr == 0 or OFF.Rotation == 0 then
+				return nil
+			end
+			local v = readF32(addr + OFF.Rotation)
+			if sane(v, -360.0, 360.0) then
+				return v
+			end
+			return nil
+		end,
+	},
+}
+local NUKE_UNIT_BY_NAME: { [string]: any } = {}
+for _, un in NUKE_UNITS do
+	NUKE_UNIT_BY_NAME[un.unit] = un
+end
+
+-- Every GUI element below the nuke GUI that could be the moving marker (up to 48).
+local function nukeCandidates(root: any): { any }
+	local out: { any } = {}
+	local queue: { any } = { { inst = root, addr = addressOf(root) } }
+	local i = 1
+	while i <= #queue and #out < 48 and i <= 128 do
+		local node = queue[i]
+		i += 1
+		for _, c in kidsOf(node.inst) do
+			local class: string = c.ClassName
+			local addr = addressOf(c)
+			if addr ~= 0 then
+				if NUKE_CLASSES[class] then
+					table.insert(out, {
+						inst = c,
+						addr = addr,
+						parent = node.inst,
+						parentAddr = node.addr,
+						scaleMove = 0.0,
+						offMove = 0.0,
+						rotMove = 0.0,
+					})
+				end
+				table.insert(queue, { inst = c, addr = addr })
+			end
+		end
+	end
+	return out
+end
+
+local nk = {
+	gui = nil :: any,
+	candidates = {} :: { any },
+	locked = nil :: any,
+	unit = "scale",
+	target = 0.0,
+	halfRange = 0.5,
+	deadzone = 0.05,
+	beganAt = 0.0,
+	sampleStart = 0.0,
+	lastTapAt = 0.0,
+	lastPos = nil :: number?,
+	lastMoveAt = 0.0,
+	invalids = 0,
+	taps = 0,
+	marker = nil :: any,
+}
+
+-- Starts a nuke round: resets the state and collects the mover candidates.
+function nukeBegin(gui: any, nowMs: number): ()
+	nk.gui = gui
+	nk.locked = nil
+	nk.beganAt = nowMs
+	nk.sampleStart = nowMs
+	nk.lastTapAt = 0.0
+	nk.lastPos = nil
+	nk.lastMoveAt = nowMs
+	nk.invalids = 0
+	nk.taps = 0
+	local center: any = gui:FindFirstChild("Center")
+	local marker: any = if center ~= nil then center:FindFirstChild("Marker") else nil
+	nk.marker = marker
+	nk.candidates = nukeCandidates(gui)
+end
+
+-- Adds up how far every candidate moved in each unit.
+local function nukeSample(): ()
+	for _, cand in nk.candidates do
+		for _, un in NUKE_UNITS do
+			local v: number? = un.read(liveAddr(cand.inst))
+			if v ~= nil then
+				local last = cand[un.last]
+				if last ~= nil then
+					cand[un.move] += math.abs(v - last)
+				end
+				if cand[un.first] == nil then
+					cand[un.first] = v
+				end
+				cand[un.last] = v
+			end
+		end
+	end
+end
+
+-- After 250 ms of sampling: locks onto the candidate that moved the most (the marker counts double).
+local function nukeTryLock(nowMs: number): ()
+	if nowMs - nk.sampleStart < 250 then
+		return
+	end
+	local best: any = nil
+	local bestScore = 0.0
+	local bestUnit: string = "scale"
+	local markerNow = liveAddr(nk.marker)
+	for _, cand in nk.candidates do
+		local parentAddr = liveAddr(cand.parent)
+		local parentW = if parentAddr ~= 0 then math.abs(readI32(parentAddr + OFF.Size + 4)) else 0
+		local offScore = if cand.offMove > 1 then cand.offMove / math.max(80, parentW) else 0.0
+		local rotScore = cand.rotMove / 90.0
+		local unit = "scale"
+		local score: number = cand.scaleMove
+		if offScore > score then
+			unit = "offset"
+			score = offScore
+		end
+		if rotScore > score then
+			unit = "rot"
+			score = rotScore
+		end
+		if markerNow ~= 0 and cand.addr == markerNow then
+			score *= 2.0
+		end
+		if score > bestScore then
+			best = cand
+			bestScore = score
+			bestUnit = unit
+		end
+	end
+	if best == nil or bestScore < 0.004 then
+		return
+	end
+	nk.locked = best
+	nk.unit = bestUnit
+	local isMarker = markerNow ~= 0 and best.addr == markerNow
+	if bestUnit == "scale" then
+		nk.target = if isMarker then 0.5 else (best.scale0 or 0.5)
+		nk.halfRange = 0.5
+	elseif bestUnit == "offset" then
+		local parentAddr = liveAddr(best.parent)
+		local parentW = if parentAddr ~= 0 then math.abs(readI32(parentAddr + OFF.Size + 4)) else 0
+		nk.target = best.off0 or 0.0
+		nk.halfRange = if parentW > 40 then parentW / 2 else 200.0
+	else
+		nk.target = best.rot0 or 0.0
+		nk.halfRange = 30.0
+	end
+	nk.deadzone = NUKE_DEADZONE_FRAC * nk.halfRange
+	nk.lastPos = nil
+	nk.lastMoveAt = nowMs
+end
+
+local function nukeReadPos(): number?
+	local locked: any = nk.locked
+	return NUKE_UNIT_BY_NAME[nk.unit].read(liveAddr(locked.inst))
+end
+
+-- One nuke tick: lock onto the mover, predict where it goes and tap Q (positive error) or E (negative error).
+local function nukeUpdate(nowMs: number): ()
+	if nk.locked == nil then
+		nukeSample()
+		nukeTryLock(nowMs)
+		return
+	end
+	local pos = nukeReadPos()
+	if pos == nil then
+		nk.invalids += 1
+		if nk.invalids > 30 and nk.gui ~= nil then
+			nukeBegin(nk.gui, nowMs)
+		end
+		return
+	end
+	nk.invalids = 0
+	local err = pos - nk.target
+	local vel = if nk.lastPos ~= nil then pos - nk.lastPos else 0.0
+	nk.lastPos = pos
+	if math.abs(vel) > (nk.halfRange * 0.0005) then
+		nk.lastMoveAt = nowMs
+	end
+	if (nowMs - nk.lastMoveAt) > 1500 then
+		nk.locked = nil
+		nk.candidates = nukeCandidates(nk.gui)
+		nk.sampleStart = nowMs
+		return
+	end
+	local pred = err + vel * NUKE_PREDICTION
+	if math.abs(pred) <= nk.deadzone then
+		return
+	end
+	if (err * vel) < 0 and (math.abs(vel) * NUKE_PREDICTION) >= math.abs(err) then
+		return
+	end
+	local positive = pred > 0
+	local frac = math.min(1.0, math.abs(pred) / nk.halfRange)
+	local gap = math.max(25, NUKE_TAP_INTERVAL_MS * (1.35 - frac))
+	if (nowMs - nk.lastTapAt) < gap then
+		return
+	end
+	if nukeTap(if positive then NUKE_KEY_Q else NUKE_KEY_E, NUKE_TAP_HOLD_MS, nowMs) then
+		nk.lastTapAt = nowMs
+		nk.taps += 1
+	end
+end
+
+-- Leaves the nuke phase (success = the GUI closed by itself).
+local function nukeExit(success: boolean, now: number): ()
+	releaseMouse()
+	resetCtl()
+	nukeFlush()
+	if success then
+		S.nukes += 1
+	end
+	go("DONE", now)
+end
+
+-- NUKE phase tick.
+function nukeStep(now: number): ()
+	local nowMs = now * 1000
+	releaseMouse()
+	if not nukeVisible(nowMs, false) then
+		nukeExit(true, now)
+		return
+	end
+	if (nowMs - nk.beganAt) > NUKE_TIMEOUT_MS then
+		am.ignoredAddr = am.guiAddr
+		nukeExit(false, now)
+		return
+	end
+	if nk.locked == nil and (nowMs - nk.beganAt) > NUKE_LOCK_TIMEOUT_MS then
+		am.ignoredAddr = am.guiAddr
+		nukeExit(false, now)
+		return
+	end
+	nukeUpdate(nowMs)
+end
+end
+
+local nukeCrossAt = 0.0
 local pendingRec: any = nil
 
--- Settles one finished reel. `counted` = the streak events already
--- updated the counters (trackStreak), so only the fallback verdicts (progress) add to them here.
+-- Settles one finished reel. `counted` = the streak events already updated the counters (trackStreak),
+-- so only the fallback verdicts (progress) add to them here.
 local function finalizeReel(rec: any, caught: boolean, how: string, counted: boolean): ()
 	if caught then
 		if not counted then
@@ -2983,7 +4004,6 @@ local function verdict(rec: any, now: number, force: boolean): (boolean?, string
 	return nil, "", false
 end
 
--- Settles the pending reel as soon as a verdict exists.
 local function resolvePending(now: number): ()
 	local rec = pendingRec
 	if rec == nil or now - W.resolveAt < 0.1 then
@@ -3028,9 +4048,22 @@ local function step(now: number): ()
 	S.rod = if tool ~= nil then tool.Name else "none"
 
 	local reeling = readReel(pg)
-	if reeling and S.phase ~= "REEL" then
+	if reeling and S.phase ~= "REEL" and S.phase ~= "NUKE" then
 		releaseMouse()
 		go("REEL", now)
+	end
+
+	-- Nuke minigame: looked for every 50 ms while no reel is on screen
+	if S.phase ~= "NUKE" and not reeling and now - nukeCrossAt >= 0.05 then
+		nukeCrossAt = now
+		local ok, visible = pcall(nukeVisible, now * 1000, false)
+		if ok and visible == true then
+			releaseMouse()
+			resetCtl()
+			nukeFlush()
+			nukeBegin(am.gui, now * 1000)
+			go("NUKE", now)
+		end
 	end
 	local phase = S.phase
 
@@ -3051,7 +4084,12 @@ local function step(now: number): ()
 		end
 	end
 
-	if phase == "REEL" then
+	if phase == "NUKE" then
+		S.status = "Nuke minigame"
+		if not pcall(nukeStep, now) then
+			releaseMouse()
+		end
+	elseif phase == "REEL" then
 		if reeling then
 			S.reelGoneAt = 0
 			S.status = "Reeling"
@@ -3246,6 +4284,7 @@ local function refreshInfo(now: number): ()
 	infoLines[13] = string.format("Tick rate: %.0f Hz", S.hz)
 	local gs = S.gs
 	infoLines[14] = if gs ~= nil then `Game streak: {gs} (ours {S.streak})` else "Game streak: unreadable"
+	infoLines[15] = `Nukes survived: {S.nukes}`
 	hudLines[1] = S.status
 	hudLines[2] = string.format("Caught %d   Lost %d", S.caught, S.lost)
 end
@@ -3284,6 +4323,7 @@ local function syncEnabled(now: number): ()
 	else
 		releaseMouse()
 		resetCtl()
+		nukeFlush()
 		shakeScan.alt = false
 		S.phase = "OFF"
 		S.status = "Off"
@@ -3297,7 +4337,10 @@ local function onPostLocal(): ()
 	ui:update()
 	local now = os.clock()
 	flushKeys(now)
+	nukePump(now * 1000)
 	stepTeleport(now)
+	stepChestRun(now)
+	updateChestRows(now)
 	syncEnabled(now)
 	trackStreak(now)
 	resolvePending(now)
@@ -3362,6 +4405,7 @@ end
 -- Render: drawing only.
 local function onRender(): ()
 	ui:render()
+	drawChests()
 	if flags.hud == true then
 		drawHud()
 	end
