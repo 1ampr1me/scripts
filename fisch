@@ -1,7 +1,7 @@
 --!strict
 --!optimize 2
 
--- Fisch for Severe: auto cast, shake and reel with an info overlay, nuke minigame, chest ESP / auto collect,
+-- Fisch for Severe: auto cast, shake and reel with an info overlay, chest ESP / auto collect,
 -- teleports (locations, points of interest, rods, coordinates, players). Menu: IAMPR1MEUI.
 
 local Players = game:GetService("Players")
@@ -1589,7 +1589,6 @@ local infoLines: { string } = {
 	"Mouse release: --",
 	"Tick rate: --",
 	"Game streak: --",
-	"Nukes survived: 0",
 }
 local hudLines: { string } = { "Off", "Caught 0   Lost 0" }
 
@@ -1612,7 +1611,6 @@ local S = {
 	shakes = 0,
 	caught = 0,
 	lost = 0,
-	nukes = 0,
 	infoAt = 0.0,
 	power = -1.0,
 	progress = -1.0,
@@ -1727,8 +1725,6 @@ local ui: any = Lib.new({
 				return if S.shakeSeen then "Shake" else "Bite"
 			elseif ph == "REEL" then
 				return "Reel"
-			elseif ph == "NUKE" then
-				return "Nuke"
 			elseif ph == "DONE" then
 				return "Done"
 			elseif ph == "REEQUIP" then
@@ -3410,7 +3406,6 @@ local function resetStats(): ()
 	S.shakes = 0
 	S.caught = 0
 	S.lost = 0
-	S.nukes = 0
 	S.activeSec = 0.0
 	S.catchSum = 0.0
 	S.streak = 0
@@ -3466,504 +3461,6 @@ local function go(phase: string, now: number): ()
 	end
 end
 
--- ───────────────────────── Nuke minigame (own scope) ─────────────────────────
--- Same GUI detection, mover lock (scale / offset / rotation), prediction and Q / E taps as the Matcha AutoFish
--- nuke handler. Times inside this block are in milliseconds.
-
-local am: any, nukePump: any, nukeFlush: any, nukeVisible: any, nukeBegin: any, nukeStep: any
-do
-local NUKE_REFRESH_MS = 200
-local NUKE_DEEP_MS = 1000
-local NUKE_NESTED_PER = 2
-local NUKE_DEADZONE_FRAC = 0.08
-local NUKE_TAP_INTERVAL_MS = 55
-local NUKE_TAP_HOLD_MS = 30
-local NUKE_PREDICTION = 10
-local NUKE_TIMEOUT_MS = 45000
-local NUKE_LOCK_TIMEOUT_MS = 10000
-local NUKE_KEY_Q = 81
-local NUKE_KEY_E = 69
-local NUKE_KEY_COOLDOWN_MS = 20
-local NUKE_NAMES = table.freeze({ "nuke", "bomb", "defuse" })
-local NUKE_CLASSES = table.freeze({
-	Frame = true,
-	ImageLabel = true,
-	ImageButton = true,
-	TextLabel = true,
-	TextButton = true,
-	ScrollingFrame = true,
-	CanvasGroup = true,
-})
-
--- Guarded key taps: a key is not pressed again while it is held or cooling down.
-local nkHeld: { [number]: number } = {}
-local nkNext: { [number]: number } = {}
-
-function nukePump(nowMs: number): ()
-	for code, at in nkHeld do
-		if nowMs >= at then
-			nkHeld[code] = nil
-			keyrelease(code)
-		end
-	end
-end
-
-function nukeFlush(): ()
-	nukePump(math.huge)
-end
-
-local function nukeTap(code: number, holdMs: number, nowMs: number): boolean
-	if nkHeld[code] ~= nil then
-		return false
-	end
-	local nxt = nkNext[code]
-	if nxt ~= nil and nowMs < nxt then
-		return false
-	end
-	keypress(code)
-	nkHeld[code] = nowMs + holdMs
-	nkNext[code] = nowMs + holdMs + NUKE_KEY_COOLDOWN_MS
-	return true
-end
-
-table.insert(onUnload, nukeFlush)
-
-local function readParentOf(inst: any): any
-	return inst.Parent
-end
-
-local function readPropOf(inst: any, prop: string): any
-	return inst[prop]
-end
-
-local function kidsFn(inst: any): any
-	return inst:GetChildren()
-end
-
-local function kidsOf(inst: any): { any }
-	if inst == nil then
-		return {}
-	end
-	local ok, list = pcall(kidsFn, inst)
-	return if ok and type(list) == "table" then list else {}
-end
-
-local function liveAddr(inst: any): number
-	if inst == nil then
-		return 0
-	end
-	local ok, parent = pcall(readParentOf, inst)
-	if not ok or parent == nil then
-		return 0
-	end
-	return addressOf(inst)
-end
-
--- Enabled / Visible of a gui: the property when it reads as a boolean, else the byte in memory.
-local function guiFlag(gui: any, prop: string, off: number): boolean
-	if gui == nil then
-		return false
-	end
-	local okParent, parent = pcall(readParentOf, gui)
-	if not okParent or parent == nil then
-		return false
-	end
-	local ok, v = pcall(readPropOf, gui, prop)
-	if ok and type(v) == "boolean" then
-		return v
-	end
-	local a = addressOf(gui)
-	if a == 0 or off == 0 then
-		return true
-	end
-	return readU8(a + off) ~= 0
-end
-
-local function nukeName(name: any): boolean
-	local lower = string.lower(tostring(name or ""))
-	for _, word in NUKE_NAMES do
-		if string.find(lower, word, 1, true) ~= nil then
-			return true
-		end
-	end
-	return false
-end
-
-am = {
-	gui = nil :: any,
-	guiAddr = 0,
-	guiClass = nil :: string?,
-	at = 0.0,
-	deepAt = 0.0,
-	kids = nil :: any,
-	nestIdx = 0,
-	ignoredAddr = 0,
-}
-
-local function nukeClear(): ()
-	am.gui = nil
-	am.guiAddr = 0
-	am.guiClass = nil
-end
-
--- Looks for the nuke GUI: PlayerGui.NukeMinigame, else any child named like nuke / bomb / defuse (also one level deeper).
-local function nukeFind(nowMs: number, force: boolean): ()
-	if not force and nowMs - am.at < NUKE_REFRESH_MS then
-		return
-	end
-	if am.gui ~= nil and nowMs - am.at > 1000 then
-		nukeClear()
-	end
-	am.at = nowMs
-	local pg: any = getPlayerGui()
-	if pg == nil then
-		nukeClear()
-		return
-	end
-	local found: any = pg:FindFirstChild("NukeMinigame")
-	if found == nil and am.gui ~= nil then
-		local ok, parent = pcall(readParentOf, am.gui)
-		if ok and parent ~= nil then
-			found = am.gui
-		end
-	end
-	if found == nil and (force or nowMs - am.deepAt >= NUKE_DEEP_MS) then
-		am.deepAt = nowMs
-		am.kids = kidsOf(pg)
-		for _, kid in am.kids do
-			if nukeName(kid.Name) then
-				found = kid
-				break
-			end
-		end
-	end
-	local kids: any = nil
-	if found == nil then
-		kids = if am.deepAt == nowMs and am.kids ~= nil then am.kids else kidsOf(pg)
-	end
-	if found == nil and kids ~= nil and #kids > 0 then
-		for _ = 1, math.min(NUKE_NESTED_PER, #kids) do
-			am.nestIdx = (am.nestIdx % #kids) + 1
-			for _, c in kidsOf(kids[am.nestIdx]) do
-				if nukeName(c.Name) then
-					found = c
-					break
-				end
-			end
-			if found ~= nil then
-				break
-			end
-		end
-	end
-	if found ~= nil then
-		local addr = addressOf(found)
-		if am.ignoredAddr ~= 0 and addr == am.ignoredAddr then
-			nukeClear()
-			return
-		end
-		am.gui = found
-		am.guiAddr = addr
-		am.guiClass = found.ClassName
-	else
-		nukeClear()
-		am.ignoredAddr = 0
-	end
-end
-
--- True while the nuke GUI is on screen (ScreenGui: Enabled, anything else: Visible).
-function nukeVisible(nowMs: number, force: boolean): boolean
-	nukeFind(nowMs, force)
-	if am.gui == nil then
-		return false
-	end
-	if am.guiClass == "ScreenGui" then
-		return guiFlag(am.gui, "Enabled", OFF.GuiEnabled)
-	end
-	return guiFlag(am.gui, "Visible", OFF.Visible)
-end
-
--- Position units a mover can use: scale, offset (pixels) or rotation.
-local NUKE_UNITS: { any } = {
-	{
-		unit = "scale",
-		move = "scaleMove",
-		first = "scale0",
-		last = "lastScale",
-		read = function(addr: number): number?
-			if addr == 0 then
-				return nil
-			end
-			local v = readF32(addr + OFF.Position)
-			if sane(v, -2.0, 2.0) then
-				return v
-			end
-			return nil
-		end,
-	},
-	{
-		unit = "offset",
-		move = "offMove",
-		first = "off0",
-		last = "lastOff",
-		read = function(addr: number): number?
-			if addr == 0 then
-				return nil
-			end
-			local v = readI32(addr + OFF.Position + 4)
-			if math.abs(v) <= 4000 then
-				return v
-			end
-			return nil
-		end,
-	},
-	{
-		unit = "rot",
-		move = "rotMove",
-		first = "rot0",
-		last = "lastRot",
-		read = function(addr: number): number?
-			if addr == 0 or OFF.Rotation == 0 then
-				return nil
-			end
-			local v = readF32(addr + OFF.Rotation)
-			if sane(v, -360.0, 360.0) then
-				return v
-			end
-			return nil
-		end,
-	},
-}
-local NUKE_UNIT_BY_NAME: { [string]: any } = {}
-for _, un in NUKE_UNITS do
-	NUKE_UNIT_BY_NAME[un.unit] = un
-end
-
--- Every GUI element below the nuke GUI that could be the moving marker (up to 48).
-local function nukeCandidates(root: any): { any }
-	local out: { any } = {}
-	local queue: { any } = { { inst = root, addr = addressOf(root) } }
-	local i = 1
-	while i <= #queue and #out < 48 and i <= 128 do
-		local node = queue[i]
-		i += 1
-		for _, c in kidsOf(node.inst) do
-			local class: string = c.ClassName
-			local addr = addressOf(c)
-			if addr ~= 0 then
-				if NUKE_CLASSES[class] then
-					table.insert(out, {
-						inst = c,
-						addr = addr,
-						parent = node.inst,
-						parentAddr = node.addr,
-						scaleMove = 0.0,
-						offMove = 0.0,
-						rotMove = 0.0,
-					})
-				end
-				table.insert(queue, { inst = c, addr = addr })
-			end
-		end
-	end
-	return out
-end
-
-local nk = {
-	gui = nil :: any,
-	candidates = {} :: { any },
-	locked = nil :: any,
-	unit = "scale",
-	target = 0.0,
-	halfRange = 0.5,
-	deadzone = 0.05,
-	beganAt = 0.0,
-	sampleStart = 0.0,
-	lastTapAt = 0.0,
-	lastPos = nil :: number?,
-	lastMoveAt = 0.0,
-	invalids = 0,
-	taps = 0,
-	marker = nil :: any,
-}
-
--- Starts a nuke round: resets the state and collects the mover candidates.
-function nukeBegin(gui: any, nowMs: number): ()
-	nk.gui = gui
-	nk.locked = nil
-	nk.beganAt = nowMs
-	nk.sampleStart = nowMs
-	nk.lastTapAt = 0.0
-	nk.lastPos = nil
-	nk.lastMoveAt = nowMs
-	nk.invalids = 0
-	nk.taps = 0
-	local center: any = gui:FindFirstChild("Center")
-	local marker: any = if center ~= nil then center:FindFirstChild("Marker") else nil
-	nk.marker = marker
-	nk.candidates = nukeCandidates(gui)
-end
-
--- Adds up how far every candidate moved in each unit.
-local function nukeSample(): ()
-	for _, cand in nk.candidates do
-		for _, un in NUKE_UNITS do
-			local v: number? = un.read(liveAddr(cand.inst))
-			if v ~= nil then
-				local last = cand[un.last]
-				if last ~= nil then
-					cand[un.move] += math.abs(v - last)
-				end
-				if cand[un.first] == nil then
-					cand[un.first] = v
-				end
-				cand[un.last] = v
-			end
-		end
-	end
-end
-
--- After 250 ms of sampling: locks onto the candidate that moved the most (the marker counts double).
-local function nukeTryLock(nowMs: number): ()
-	if nowMs - nk.sampleStart < 250 then
-		return
-	end
-	local best: any = nil
-	local bestScore = 0.0
-	local bestUnit: string = "scale"
-	local markerNow = liveAddr(nk.marker)
-	for _, cand in nk.candidates do
-		local parentAddr = liveAddr(cand.parent)
-		local parentW = if parentAddr ~= 0 then math.abs(readI32(parentAddr + OFF.Size + 4)) else 0
-		local offScore = if cand.offMove > 1 then cand.offMove / math.max(80, parentW) else 0.0
-		local rotScore = cand.rotMove / 90.0
-		local unit = "scale"
-		local score: number = cand.scaleMove
-		if offScore > score then
-			unit = "offset"
-			score = offScore
-		end
-		if rotScore > score then
-			unit = "rot"
-			score = rotScore
-		end
-		if markerNow ~= 0 and cand.addr == markerNow then
-			score *= 2.0
-		end
-		if score > bestScore then
-			best = cand
-			bestScore = score
-			bestUnit = unit
-		end
-	end
-	if best == nil or bestScore < 0.004 then
-		return
-	end
-	nk.locked = best
-	nk.unit = bestUnit
-	local isMarker = markerNow ~= 0 and best.addr == markerNow
-	if bestUnit == "scale" then
-		nk.target = if isMarker then 0.5 else (best.scale0 or 0.5)
-		nk.halfRange = 0.5
-	elseif bestUnit == "offset" then
-		local parentAddr = liveAddr(best.parent)
-		local parentW = if parentAddr ~= 0 then math.abs(readI32(parentAddr + OFF.Size + 4)) else 0
-		nk.target = best.off0 or 0.0
-		nk.halfRange = if parentW > 40 then parentW / 2 else 200.0
-	else
-		nk.target = best.rot0 or 0.0
-		nk.halfRange = 30.0
-	end
-	nk.deadzone = NUKE_DEADZONE_FRAC * nk.halfRange
-	nk.lastPos = nil
-	nk.lastMoveAt = nowMs
-end
-
-local function nukeReadPos(): number?
-	local locked: any = nk.locked
-	return NUKE_UNIT_BY_NAME[nk.unit].read(liveAddr(locked.inst))
-end
-
--- One nuke tick: lock onto the mover, predict where it goes and tap Q (positive error) or E (negative error).
-local function nukeUpdate(nowMs: number): ()
-	if nk.locked == nil then
-		nukeSample()
-		nukeTryLock(nowMs)
-		return
-	end
-	local pos = nukeReadPos()
-	if pos == nil then
-		nk.invalids += 1
-		if nk.invalids > 30 and nk.gui ~= nil then
-			nukeBegin(nk.gui, nowMs)
-		end
-		return
-	end
-	nk.invalids = 0
-	local err = pos - nk.target
-	local vel = if nk.lastPos ~= nil then pos - nk.lastPos else 0.0
-	nk.lastPos = pos
-	if math.abs(vel) > (nk.halfRange * 0.0005) then
-		nk.lastMoveAt = nowMs
-	end
-	if (nowMs - nk.lastMoveAt) > 1500 then
-		nk.locked = nil
-		nk.candidates = nukeCandidates(nk.gui)
-		nk.sampleStart = nowMs
-		return
-	end
-	local pred = err + vel * NUKE_PREDICTION
-	if math.abs(pred) <= nk.deadzone then
-		return
-	end
-	if (err * vel) < 0 and (math.abs(vel) * NUKE_PREDICTION) >= math.abs(err) then
-		return
-	end
-	local positive = pred > 0
-	local frac = math.min(1.0, math.abs(pred) / nk.halfRange)
-	local gap = math.max(25, NUKE_TAP_INTERVAL_MS * (1.35 - frac))
-	if (nowMs - nk.lastTapAt) < gap then
-		return
-	end
-	if nukeTap(if positive then NUKE_KEY_Q else NUKE_KEY_E, NUKE_TAP_HOLD_MS, nowMs) then
-		nk.lastTapAt = nowMs
-		nk.taps += 1
-	end
-end
-
--- Leaves the nuke phase (success = the GUI closed by itself).
-local function nukeExit(success: boolean, now: number): ()
-	releaseMouse()
-	resetCtl()
-	nukeFlush()
-	if success then
-		S.nukes += 1
-	end
-	go("DONE", now)
-end
-
--- NUKE phase tick.
-function nukeStep(now: number): ()
-	local nowMs = now * 1000
-	releaseMouse()
-	if not nukeVisible(nowMs, false) then
-		nukeExit(true, now)
-		return
-	end
-	if (nowMs - nk.beganAt) > NUKE_TIMEOUT_MS then
-		am.ignoredAddr = am.guiAddr
-		nukeExit(false, now)
-		return
-	end
-	if nk.locked == nil and (nowMs - nk.beganAt) > NUKE_LOCK_TIMEOUT_MS then
-		am.ignoredAddr = am.guiAddr
-		nukeExit(false, now)
-		return
-	end
-	nukeUpdate(nowMs)
-end
-end
-
-local nukeCrossAt = 0.0
 local pendingRec: any = nil
 
 -- Settles one finished reel. `counted` = the streak events already updated the counters (trackStreak),
@@ -4048,23 +3545,11 @@ local function step(now: number): ()
 	S.rod = if tool ~= nil then tool.Name else "none"
 
 	local reeling = readReel(pg)
-	if reeling and S.phase ~= "REEL" and S.phase ~= "NUKE" then
+	if reeling and S.phase ~= "REEL" then
 		releaseMouse()
 		go("REEL", now)
 	end
 
-	-- Nuke minigame: looked for every 50 ms while no reel is on screen
-	if S.phase ~= "NUKE" and not reeling and now - nukeCrossAt >= 0.05 then
-		nukeCrossAt = now
-		local ok, visible = pcall(nukeVisible, now * 1000, false)
-		if ok and visible == true then
-			releaseMouse()
-			resetCtl()
-			nukeFlush()
-			nukeBegin(am.gui, now * 1000)
-			go("NUKE", now)
-		end
-	end
 	local phase = S.phase
 
 	-- Rod watchdog: re-equip only after the rod was missing for 3 checks in a row.
@@ -4084,12 +3569,7 @@ local function step(now: number): ()
 		end
 	end
 
-	if phase == "NUKE" then
-		S.status = "Nuke minigame"
-		if not pcall(nukeStep, now) then
-			releaseMouse()
-		end
-	elseif phase == "REEL" then
+	if phase == "REEL" then
 		if reeling then
 			S.reelGoneAt = 0
 			S.status = "Reeling"
@@ -4284,7 +3764,6 @@ local function refreshInfo(now: number): ()
 	infoLines[13] = string.format("Tick rate: %.0f Hz", S.hz)
 	local gs = S.gs
 	infoLines[14] = if gs ~= nil then `Game streak: {gs} (ours {S.streak})` else "Game streak: unreadable"
-	infoLines[15] = `Nukes survived: {S.nukes}`
 	hudLines[1] = S.status
 	hudLines[2] = string.format("Caught %d   Lost %d", S.caught, S.lost)
 end
@@ -4323,7 +3802,6 @@ local function syncEnabled(now: number): ()
 	else
 		releaseMouse()
 		resetCtl()
-		nukeFlush()
 		shakeScan.alt = false
 		S.phase = "OFF"
 		S.status = "Off"
@@ -4337,7 +3815,6 @@ local function onPostLocal(): ()
 	ui:update()
 	local now = os.clock()
 	flushKeys(now)
-	nukePump(now * 1000)
 	stepTeleport(now)
 	stepChestRun(now)
 	updateChestRows(now)
