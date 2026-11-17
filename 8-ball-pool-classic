@@ -1,0 +1,508 @@
+--!optimize 2
+-- 8 Ball ESP (Severe API)
+local RunService = game:GetService("RunService")
+
+local CFG = {
+	MAX_BOUNCES            = 3,
+	BALL_RADIUS            = 0.115,
+	TOP_Z                  = -4.62,
+	BOT_Z                  =  4.62,
+	RIGHT_X                =  2.20,
+	LEFT_X                 = -2.19,
+	TABLE_Y                = 0.5,
+	CACHE_REFRESH_INTERVAL = 3,   -- table / guide / pocket rescan (seconds)
+	BALL_REFRESH_INTERVAL  = 0.5, -- ball list rescan (seconds)
+	MIN_SHOT_ANGLE_COS     = 0.9,
+	SHOW_ALL_SHOTS         = false,
+	SHOW_BOUNDARIES        = false,
+	SHOW_POCKETS           = true,
+}
+
+-- Key codes: Windows VK (0x51 / 0x45) or Roblox KeyCode values (113 / 101); strings are matched by name
+local function isKeyDown(keys, vk, rbx, name)
+	for _, k in keys do
+		if k == vk or k == rbx then return true end
+		if type(k) == "string" and k:match("([^%.]+)$"):upper() == name then return true end
+	end
+	return false
+end
+
+local myType = nil
+
+local COLORS = {
+	SEG = {
+		Color3.fromRGB(80, 255, 100),
+		Color3.fromRGB(80, 210, 85),
+		Color3.fromRGB(80, 165, 65),
+		Color3.fromRGB(80, 110, 45),
+	},
+	MY    = Color3.fromRGB(80,  255, 100),
+	EN    = Color3.fromRGB(255, 70,  70),
+	EIGHT = Color3.fromRGB(255, 165, 0),
+	CUE   = Color3.fromRGB(255, 255, 255),
+	GREY  = Color3.fromRGB(180, 180, 180),
+	BDOT  = Color3.fromRGB(255, 220, 0),
+	GHOST = Color3.fromRGB(180, 80,  255),
+	AIM   = Color3.fromRGB(255, 140, 0),
+	POCK  = Color3.fromRGB(255, 255, 0),
+	BOUND = Color3.fromRGB(0,   255, 255),
+	ALT   = Color3.fromRGB(100, 100, 255),
+	BLACK = Color3.fromRGB(0,   0,   0),
+}
+
+-- Instance:IsA is not in the Severe docs, so parts are detected by ClassName
+local PART_CLASSES = { Part = true, MeshPart = true, UnionOperation = true, WedgePart = true, SpawnLocation = true }
+local CUE_NAMES = { cue = true, cueball = true, white = true, ball0 = true }
+
+-- Written by PostModel, read by PostLocal
+local cache = { tbl = nil, balls = nil, guides = nil, pockets = nil, list = nil, cue = nil }
+
+-- Written by PostLocal (full rebuild each tick), read by Render
+local snapshot = nil
+
+local function unit(v)
+	if vector.magnitude(v) < 0.0001 then return vector.zero end
+	return vector.normalize(v)
+end
+
+-- Workspace scan (PostModel only: GetChildren / GetDescendants / GetService are rejected in Render)
+
+local function findTable()
+	for _, name in { "Tables", "Map", "Game", "World", "" } do
+		local container = (name ~= "" and workspace:FindFirstChild(name)) or workspace
+		local t = container:FindFirstChild("Table1")
+			or container:FindFirstChild("Table")
+			or container:FindFirstChild("BilliardTable")
+		if t then return t end
+	end
+	for _, obj in workspace:GetChildren() do
+		if obj:FindFirstChild("Balls") then return obj end
+	end
+	return nil
+end
+
+local function findBalls(tbl)
+	return tbl:FindFirstChild("Balls")
+		or tbl:FindFirstChild("BallsFolder")
+		or tbl:FindFirstChild("balls")
+		or tbl:FindFirstChildOfClass("Folder")
+end
+
+local function findGuides(tbl)
+	local gf = tbl:FindFirstChild("Guides") or tbl:FindFirstChild("Guide")
+	if gf then
+		for _, name in { "HitPosition", "Hit", "AimPos", "Target" } do
+			local h = gf:FindFirstChild(name)
+			if h then return h end
+		end
+	end
+	for _, obj in tbl:GetDescendants() do
+		if PART_CLASSES[obj.ClassName] then
+			local n = obj.Name:lower()
+			if n == "hitposition" or n == "hit" or n == "aimpos" then return obj end
+		end
+	end
+	return nil
+end
+
+local function findCue(folder)
+	return folder:FindFirstChild("Cue")
+		or folder:FindFirstChild("CueBall")
+		or folder:FindFirstChild("White")
+		or folder:FindFirstChild("Ball0")
+end
+
+local function getPockets(tbl)
+	local found = {}
+	for _, obj in tbl:GetDescendants() do
+		if PART_CLASSES[obj.ClassName] then
+			local n = obj.Name:lower()
+			if n:find("pocket") or n:find("hole") or n:find("pot") then
+				table.insert(found, obj.Position)
+			end
+		end
+	end
+	if #found >= 4 then return found end
+	local y = CFG.TABLE_Y
+	return {
+		vector.create(CFG.LEFT_X,  y, CFG.TOP_Z),
+		vector.create(0,           y, CFG.TOP_Z),
+		vector.create(CFG.RIGHT_X, y, CFG.TOP_Z),
+		vector.create(CFG.LEFT_X,  y, CFG.BOT_Z),
+		vector.create(0,           y, CFG.BOT_Z),
+		vector.create(CFG.RIGHT_X, y, CFG.BOT_Z),
+	}
+end
+
+-- Ball entries keep the part and the parsed name; position is refreshed in PostLocal
+local function buildList(folder)
+	local list = {}
+	for _, b in folder:GetChildren() do
+		if PART_CLASSES[b.ClassName] then
+			local n = b.Name:lower()
+			table.insert(list, {
+				part = b,
+				cue  = CUE_NAMES[n] == true,
+				num  = tonumber(n:match("%d+")),
+				pos  = vector.zero,
+			})
+		end
+	end
+	return list
+end
+
+local tblAt, listAt = 0, 0
+RunService.PostModel:Connect(function()
+	if not isrbxactive() then return end
+	local now = os.clock()
+
+	if now >= tblAt then
+		tblAt = now + CFG.CACHE_REFRESH_INTERVAL
+		local tbl = findTable()
+		if tbl then
+			if tbl ~= cache.tbl or not cache.pockets then
+				cache.pockets = getPockets(tbl)
+			end
+			cache.balls  = findBalls(tbl)
+			cache.guides = findGuides(tbl)
+		else
+			cache.balls, cache.guides, cache.pockets = nil, nil, nil
+		end
+		cache.tbl = tbl
+		listAt = 0
+	end
+
+	if now >= listAt then
+		listAt = now + CFG.BALL_REFRESH_INTERVAL
+		if cache.balls then
+			cache.cue  = findCue(cache.balls)
+			cache.list = buildList(cache.balls)
+		else
+			cache.cue, cache.list = nil, nil
+		end
+	end
+end)
+
+-- Game logic (pure math on vectors)
+
+local function traceWall(startPos, dir)
+	local px, pz = startPos.X, startPos.Z
+	local dx, dz = dir.X, dir.Z
+	local tMin   = 999999
+
+	local function check(wall, dc, pc)
+		if math.abs(dc) < 0.0001 then return end
+		local t = (wall - pc) / dc
+		if t > 0.001 and t < tMin then tMin = t end
+	end
+	check(CFG.TOP_Z,   dz, pz)
+	check(CFG.BOT_Z,   dz, pz)
+	check(CFG.RIGHT_X, dx, px)
+	check(CFG.LEFT_X,  dx, px)
+
+	local endX    = px + dx * tMin
+	local endZ    = pz + dz * tMin
+	local hitWall = tMin < 999999
+
+	local ndx, ndz = dx, dz
+	if hitWall then
+		if math.abs(endZ - CFG.TOP_Z) < 0.05 or math.abs(endZ - CFG.BOT_Z) < 0.05 then
+			ndz = -dz
+		end
+		if math.abs(endX - CFG.LEFT_X) < 0.05 or math.abs(endX - CFG.RIGHT_X) < 0.05 then
+			ndx = -dx
+		end
+	end
+	return vector.create(endX, startPos.Y, endZ), unit(vector.create(ndx, 0, ndz)), hitWall
+end
+
+local function ghostBall(targetPos, pocketPos)
+	return targetPos + unit(targetPos - pocketPos) * (CFG.BALL_RADIUS * 2)
+end
+
+local function isPathClear(active, fromPos, toPos, skipA, skipB)
+	local dir  = unit(toPos - fromPos)
+	local dist = vector.magnitude(toPos - fromPos)
+	local BR   = CFG.BALL_RADIUS * 2
+	for _, b in active do
+		if b ~= skipA and b ~= skipB then
+			local rel  = b.pos - fromPos
+			local proj = vector.dot(rel, dir)
+			if proj > BR and proj < dist - BR then
+				local px = rel.X - dir.X * proj
+				local pz = rel.Z - dir.Z * proj
+				if math.sqrt(px * px + pz * pz) < BR then
+					return false
+				end
+			end
+		end
+	end
+	return true
+end
+
+local function ballColor(e)
+	if e.cue then return COLORS.CUE, "CUE" end
+	local num = e.num
+	if num == 8 then return COLORS.EIGHT, "8" end
+	if not num then return COLORS.GREY, "?" end
+	if not myType then return COLORS.GREY, tostring(num) end
+	if myType == "solid"  and num >= 1 and num <= 7  then return COLORS.MY, num .. "+" end
+	if myType == "stripe" and num >= 9 and num <= 15 then return COLORS.MY, num .. "+" end
+	return COLORS.EN, num .. "x"
+end
+
+local function isMyBall(e)
+	if e.cue then return false end
+	local num = e.num
+	if not num or not myType then return true end
+	if myType == "solid"  and num >= 1 and num <= 7  then return true end
+	if myType == "stripe" and num >= 9 and num <= 15 then return true end
+	return false
+end
+
+local function closestBall(active, pos)
+	local best, bestDist = nil, math.huge
+	for _, e in active do
+		if not e.cue then
+			local d = vector.magnitude(e.pos - pos)
+			if d < bestDist and d <= 4 then
+				bestDist = d
+				best = e
+			end
+		end
+	end
+	return best
+end
+
+local function findShots(active, cue, pockets)
+	local cPos = cue.pos
+	local best, bestScore = nil, math.huge
+	local shots = {}
+	local minAng = math.acos(CFG.MIN_SHOT_ANGLE_COS)
+
+	for _, ball in active do
+		if ball ~= cue and isMyBall(ball) then
+			local bPos = ball.pos
+			for _, pocket in pockets do
+				local gPos = ghostBall(bPos, pocket)
+				if isPathClear(active, cPos, gPos, cue, ball)
+					and isPathClear(active, bPos, pocket, cue, ball) then
+					local cueToGhost   = unit(gPos - cPos)
+					local ballToPocket = unit(pocket - bPos)
+					local ang     = math.acos(math.clamp(vector.dot(cueToGhost, ballToPocket), -1, 1))
+					local penalty = 0
+					if ang > math.pi / 2 then
+						penalty = (ang - math.pi / 2) * 5
+					elseif ang < minAng then
+						penalty = (minAng - ang) * 10
+					end
+					local distToGhost  = vector.magnitude(gPos - cPos)
+					local distToPocket = vector.magnitude(pocket - bPos)
+					local score = distToGhost + distToPocket * 0.5 + penalty
+					local shot = {
+						ballPos    = bPos,
+						ghostPos   = gPos,
+						pocketPos  = pocket,
+						ball       = ball,
+						score      = score,
+						dist       = distToGhost + distToPocket,
+						difficulty = penalty > 0 and "Hard" or "Easy",
+					}
+					table.insert(shots, shot)
+					if score < bestScore then
+						bestScore = score
+						best = shot
+					end
+				end
+			end
+		end
+	end
+	return best, shots
+end
+
+-- Draw list (built in PostLocal, drawn in Render)
+
+local camera = nil
+local frame  = nil
+
+local function addLine(a, b, color, thickness, opacity)
+	local s1, v1 = camera:WorldToScreenPoint(a)
+	local s2, v2 = camera:WorldToScreenPoint(b)
+	if not (v1 and v2) then return end
+	table.insert(frame, {
+		k  = 1,
+		a  = vector.create(s1.X,     s1.Y,     0),
+		b  = vector.create(s2.X,     s2.Y,     0),
+		sa = vector.create(s1.X + 1, s1.Y + 1, 0),
+		sb = vector.create(s2.X + 1, s2.Y + 1, 0),
+		c  = color,
+		o  = opacity or 1,
+		t  = thickness or 2,
+	})
+end
+
+local function addDot(pos, color, radius, opacity)
+	local s, v = camera:WorldToScreenPoint(pos)
+	if not v then return end
+	table.insert(frame, { k = 2, p = vector.create(s.X, s.Y, 0), c = color, r = radius or 5, o = opacity or 1 })
+end
+
+local function addLabel(pos, text, color, yOff)
+	local s, v = camera:WorldToScreenPoint(pos)
+	if not v then return end
+	table.insert(frame, { k = 3, p = vector.create(s.X - 6, s.Y - (yOff or 20), 0), text = text, c = color })
+end
+
+local function addBounces(startPos, dirV3)
+	local pos    = startPos
+	local dir    = unit(vector.create(dirV3.X, 0, dirV3.Z))
+	local bounce = 0
+	pos = pos + dir * (CFG.BALL_RADIUS * 2.2)
+	while bounce <= CFG.MAX_BOUNCES do
+		local endPos, newDir, hitWall = traceWall(pos, dir)
+		addLine(pos, endPos, COLORS.SEG[math.min(bounce + 1, #COLORS.SEG)], 2)
+		if hitWall and bounce < CFG.MAX_BOUNCES then
+			addDot(endPos, COLORS.BDOT, 4)
+			pos    = endPos
+			dir    = newDir
+			bounce += 1
+		else
+			break
+		end
+	end
+end
+
+local function buildShots()
+	local list, pockets, guides = cache.list, cache.pockets, cache.guides
+	if not (cache.tbl and cache.balls and pockets and guides and list) then return end
+
+	-- Refresh positions, skip balls that left the table
+	local active, cue = {}, nil
+	for _, e in list do
+		if e.part.Parent then
+			e.pos = e.part.Position
+			table.insert(active, e)
+			if e.part == cache.cue then cue = e end
+		end
+	end
+	if not cue or not guides.Parent then return end
+	local cPos = cue.pos
+
+	if CFG.SHOW_BOUNDARIES then
+		local y  = CFG.TABLE_Y
+		local tl = vector.create(CFG.LEFT_X,  y, CFG.TOP_Z)
+		local tr = vector.create(CFG.RIGHT_X, y, CFG.TOP_Z)
+		local bl = vector.create(CFG.LEFT_X,  y, CFG.BOT_Z)
+		local br = vector.create(CFG.RIGHT_X, y, CFG.BOT_Z)
+		addLine(tl, tr, COLORS.BOUND, 1, 0.5)
+		addLine(tr, br, COLORS.BOUND, 1, 0.5)
+		addLine(br, bl, COLORS.BOUND, 1, 0.5)
+		addLine(bl, tl, COLORS.BOUND, 1, 0.5)
+	end
+
+	if CFG.SHOW_POCKETS then
+		for _, p in pockets do
+			addDot(p, COLORS.POCK, 12, 0.4)
+		end
+	end
+
+	for _, e in active do
+		local col, lbl = ballColor(e)
+		addDot(e.pos, col, 6)
+		addLabel(e.pos, lbl, col)
+	end
+
+	local bestShot, allShots = findShots(active, cue, pockets)
+
+	if CFG.SHOW_ALL_SHOTS then
+		for _, shot in allShots do
+			if shot ~= bestShot then
+				addLine(cPos,         shot.ghostPos,  COLORS.ALT, 1, 0.35)
+				addLine(shot.ballPos, shot.pocketPos, COLORS.ALT, 1, 0.35)
+			end
+		end
+	end
+
+	if bestShot then
+		addLine(cPos,              bestShot.ghostPos,  COLORS.AIM,  2)
+		addDot(bestShot.ghostPos,  COLORS.GHOST, 8)
+		addLine(bestShot.ballPos,  bestShot.pocketPos, COLORS.POCK, 2.5)
+
+		local td   = unit(bestShot.pocketPos - bestShot.ballPos)
+		local perp = vector.create(-td.Z, 0, td.X)
+		addLine(
+			bestShot.ballPos + perp * CFG.BALL_RADIUS,
+			bestShot.ballPos - perp * CFG.BALL_RADIUS,
+			COLORS.GREY, 1
+		)
+		addDot(bestShot.pocketPos, COLORS.POCK, 8)
+
+		local info = string.format("Dist: %.1f | %s", bestShot.dist, bestShot.difficulty)
+		addLabel(bestShot.ballPos, info, COLORS.AIM, 35)
+	end
+
+	-- Bounce prediction from the aim guide
+	local impactPos = guides.Position
+	if math.abs(impactPos.X) <= (CFG.RIGHT_X + CFG.BALL_RADIUS)
+		and math.abs(impactPos.Z) <= (CFG.BOT_Z + CFG.BALL_RADIUS) then
+		local target = closestBall(active, impactPos)
+		if target then
+			local tPos  = target.pos
+			local dirV3 = unit(tPos - impactPos)
+			if vector.magnitude(dirV3) > 0.001 then
+				addDot(tPos, COLORS.CUE, 5)
+				addBounces(tPos, dirV3)
+			end
+		end
+	end
+end
+
+local wasQ, wasE = false, false
+RunService.PostLocal:Connect(function()
+	if not isrbxactive() then return end
+
+	-- Q = solids, E = stripes
+	local keys  = getpressedkeys()
+	local qDown = isKeyDown(keys, 0x51, 113, "Q")
+	if qDown and not wasQ then myType = "solid" end
+	wasQ = qDown
+	local eDown = isKeyDown(keys, 0x45, 101, "E")
+	if eDown and not wasE then myType = "stripe" end
+	wasE = eDown
+
+	camera = workspace.CurrentCamera
+	if not camera then return end
+
+	frame = {}
+
+	local typeStr  = myType == "solid"  and "SOLIDS 1-7  [Q=Solids / E=Stripes]"
+		or myType == "stripe" and "STRIPES 9-15  [Q=Solids / E=Stripes]"
+		or "NOT SET -- press Q (solids) or E (stripes)"
+	local hudColor = myType == "solid"  and Color3.fromRGB(80, 255, 100)
+		or myType == "stripe" and Color3.fromRGB(255, 180, 50)
+		or Color3.fromRGB(200, 200, 200)
+	table.insert(frame, { k = 4, p = vector.create(15, 15, 0), text = "8-Ball | " .. typeStr, c = hudColor })
+
+	buildShots()
+
+	-- Swap only after the frame is fully built
+	snapshot = frame
+end)
+
+RunService.Render:Connect(function()
+	local f = snapshot
+	if not f or not isrbxactive() then return end
+	for _, c in f do
+		local k = c.k
+		if k == 1 then
+			DrawingImmediate.Polyline({ c.sa, c.sb }, COLORS.BLACK, c.o * 0.4, c.t + 1)
+			DrawingImmediate.Polyline({ c.a, c.b }, c.c, c.o, c.t)
+		elseif k == 2 then
+			DrawingImmediate.FilledCircle(c.p, c.r, c.c, c.o)
+		elseif k == 3 then
+			DrawingImmediate.OutlinedText(c.p, 13, c.c, 1, c.text, true)
+		else
+			DrawingImmediate.OutlinedText(c.p, 15, c.c, 1, c.text, false)
+		end
+	end
+end)
