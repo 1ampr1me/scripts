@@ -1188,7 +1188,7 @@ do
 	local function shakeFast(pg: any): boolean
 		local gui = pg:FindFirstChild("shakeui")
 		local zone = if gui ~= nil then gui:FindFirstChild("safezone") else nil
-		return zone ~= nil and zone:FindFirstChild("button") ~= nil
+		return zone ~= nil and (zone:FindFirstChild("button") ~= nil or zone:FindFirstChild("default") ~= nil)
 	end
 
 	-- Model thread: bounded search for a renamed shake gui or button.
@@ -1643,6 +1643,7 @@ local S = {
 	attrAt = 0.0,
 	attrReeling = false,
 	attrLearned = false,
+	cancelAt = 0.0,
 }
 
 local function notice(text: string): ()
@@ -3443,6 +3444,7 @@ local function go(phase: string, now: number): ()
 	elseif phase == "SHAKE" then
 		S.shakeSeen = false
 		S.lastShakeAt = 0
+		S.cancelAt = 0
 	elseif phase == "REEL" then
 		resetCtl()
 		ctl.resyncs = 0
@@ -3674,6 +3676,14 @@ local function step(now: number): ()
 			return
 		end
 		S.status = "Casting"
+		if S.castPressAt == 0 and type(mousemoveabs) == "function" then
+			-- Park the cursor in the lower middle so the cast click never lands on the menu
+			local cam = workspace.CurrentCamera
+			if cam ~= nil then
+				local v = cam.ViewportSize
+				mousemoveabs(math.floor(v.X * 0.5), math.floor(v.Y * 0.75))
+			end
+		end
 		holdMouse()
 		if S.castPressAt == 0 then
 			S.castPressAt = now
@@ -3713,6 +3723,22 @@ local function step(now: number): ()
 			end
 		else
 			S.status = "Waiting for a bite"
+		end
+		-- Cast not accepted (state stays 3 while casted): click once to cancel the line, then cast again
+		if S.cancelAt ~= 0 then
+			if now - S.cancelAt >= 0.15 then
+				S.cancelAt = 0
+				go("CAST", now)
+				return
+			end
+		elseif tool ~= nil and not S.shakeSeen and waited >= CAST_TIMEOUT then
+			local values: any = tool:FindFirstChild("values")
+			local stateNode: any = if values ~= nil then values:FindFirstChild("state") else nil
+			if stateNode ~= nil and stateNode.Value == 3 and isCasted(tool) then
+				holdMouse()
+				S.cancelAt = now
+				return
+			end
 		end
 		-- A cast that never produced a reel keeps values.casted set, so recasting directly would loop back here:
 		-- the rod is re-equipped instead, which resets the line.
