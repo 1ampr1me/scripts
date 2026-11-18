@@ -1,0 +1,53 @@
+--!strict
+--!optimize 2
+
+local RunService = game:GetService("RunService")
+
+-- Config (frozen constants)
+local CONFIG = table.freeze({
+	TrafficName = "Traffic", -- Workspace child that holds the cars
+	ScanInterval = 0.5, -- seconds between full passes (matches the original task.wait(0.5))
+})
+
+-- Re-run protection: a new execution invalidates the old connection
+_G.TrafficNoCollideRun = (_G.TrafficNoCollideRun or 0) + 1
+local runId: number = _G.TrafficNoCollideRun
+
+local function alive(): boolean
+	return _G.TrafficNoCollideRun == runId
+end
+
+-- Disables collision on every BasePart inside a car; writes only when the value is still true
+local function disableCollision(car: Instance)
+	for _, obj in car:GetDescendants() do
+		if obj:IsA("BasePart") and obj.CanCollide then
+			obj.CanCollide = false
+		end
+	end
+end
+
+local nextScan: number = 0
+local connection: any = nil
+
+connection = RunService.PostLocal:Connect(function()
+	if not alive() then
+		connection:Disconnect()
+		return
+	end
+
+	local now: number = os.clock()
+	if now < nextScan then
+		return
+	end
+	nextScan = now + CONFIG.ScanInterval
+
+	-- FindFirstChild instead of WaitForChild: WaitForChild would block the callback
+	local traffic = workspace:FindFirstChild(CONFIG.TrafficName)
+	if not traffic then
+		return
+	end
+
+	for _, car in traffic:GetChildren() do
+		disableCollision(car)
+	end
+end)
