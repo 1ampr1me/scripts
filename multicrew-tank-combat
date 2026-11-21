@@ -7,7 +7,8 @@ if _G.TankESP and _G.TankESP.stop then
 	pcall(_G.TankESP.stop)
 end
 
-type ModuleDef = { part: any, hx: number, hy: number, hz: number, kind: string }
+type Rack = { ammoObj: any }
+type ModuleDef = { part: any, hx: number, hy: number, hz: number, kind: string, rack: Rack?, hpObj: any, live: boolean }
 
 type Entry = {
 	inst: any,
@@ -32,9 +33,14 @@ type Entry = {
 	rlT: number,
 	distM: number,
 	distText: string,
+	ammoT: number,
+	rlShell: string,
+	rlLabel: string,
+	muz: any,
+	muzTries: number,
 }
 
-type MslTarget = { anchor: any, label: string, threat: boolean, distM: number, text: string }
+type MslTarget = { anchor: any, label: string, col: Color3, incoming: boolean, distM: number, text: string }
 type RingPool = { list: { any }, used: number, sides: number, thick: number }
 
 type Point = { X: number, Y: number }
@@ -61,15 +67,19 @@ local HELI_SIDES: number = 32
 local MSL_RATE: number = 0.1
 local MSL_POOL: number = 14
 local MSL_MOVE2: number = 4
-local INBOUND_RANGE: number = 300 * STUD_PER_M -- SAM inbound radius, 300 m expressed in studs
+local INBOUND_RANGE: number = 1000 * STUD_PER_M -- incoming radius, 1000 m expressed in studs
+local INCOMING_COS: number = 0.96
 local MSL_MAX_M: number = 5000
 local INBOUND_HOLD: number = 1
 local INBOUND_COOL: number = 5
 local MAX_TARGETS: number = 48
-local MAX_MODULES: number = 24
+local MAX_MODULES: number = 40
 local CACHE_RATE: number = 1
 local OCC_RATE: number = 2
 local RELOAD_RATE: number = 0.3
+local AMMO_RATE: number = 0.3
+local AIM_R: number = 7 * STUD_PER_M
+local AIM_R2: number = AIM_R * AIM_R
 local REQ_TRIES: number = 5
 local CAM_RATE: number = 1
 local SCREEN_RATE: number = 0.25
@@ -107,6 +117,17 @@ local Col = table.freeze({
 	Missile = Color3.fromRGB(255, 170, 40),
 	Threat = Color3.fromRGB(255, 40, 40),
 })
+
+local MSL_COL: { [string]: Color3 } = table.freeze({
+	AA = Color3.fromRGB(255, 60, 60),
+	ATGM = Color3.fromRGB(255, 170, 40),
+	AGM = Color3.fromRGB(255, 120, 40),
+	Rocket = Color3.fromRGB(255, 220, 80),
+	Bomb = Color3.fromRGB(255, 60, 60),
+})
+local MOD_ON: { [string]: string } = table.freeze({ eng = "ModEngine", ammo = "ModAmmo", barrel = "ModBarrel", track = "ModTrack" })
+local MOD_COL: { [string]: string } = table.freeze({ eng = "EngineColor", ammo = "AmmoColor", barrel = "BarrelColor", track = "TracksColor" })
+local MOD_KINDS: { string } = table.freeze({ "eng", "ammo", "barrel", "track" })
 
 local RELOAD_TEXT: { string } = table.freeze({ "READY", "RELOADING", "EMPTY" })
 local RELOAD_COL: { Color3 } = table.freeze({
@@ -169,18 +190,24 @@ local Config: { [string]: any } = {
 	Missile = false,
 	OccupiedOnly = false,
 	TeamCheck = true,
+	TeamCount = true,
+	AimedAt = true,
 	MaxDist = 3200,
 
 	ModOutline = true,
 	ModFilled = false,
 	ModEngine = true,
 	ModAmmo = true,
+	ModBarrel = false,
+	ModTrack = false,
 	ModMaxDist = 1000,
 	EngineColor = PALETTE[1],
 	AmmoColor = PALETTE[2],
+	BarrelColor = PALETTE[3],
+	TracksColor = PALETTE[5],
 }
 
-local ColorIdx: { [string]: number } = { EngineColor = 1, AmmoColor = 2 }
+local ColorIdx: { [string]: number } = { EngineColor = 1, AmmoColor = 2, BarrelColor = 3, TracksColor = 5 }
 
 local MAIN_ROWS: { { key: string, label: string } } = {
 	{ key = "Enabled", label = "Tank ESP" },
@@ -192,6 +219,8 @@ local MAIN_ROWS: { { key: string, label: string } } = {
 	{ key = "Heli", label = "Helicopter ESP" },
 	{ key = "OccupiedOnly", label = "Occupied Only" },
 	{ key = "TeamCheck", label = "Team Check" },
+	{ key = "TeamCount", label = "Team Count" },
+	{ key = "AimedAt", label = "Aimed At You" },
 }
 
 local MISC_ROWS: { { key: string, label: string } } = {
@@ -203,6 +232,8 @@ local MOD_ROWS: { { key: string, label: string, color: string? } } = {
 	{ key = "ModFilled", label = "Filled" },
 	{ key = "ModEngine", label = "Engine", color = "EngineColor" },
 	{ key = "ModAmmo", label = "Ammo", color = "AmmoColor" },
+	{ key = "ModBarrel", label = "Barrel", color = "BarrelColor" },
+	{ key = "ModTrack", label = "Tracks", color = "TracksColor" },
 }
 
 local running: boolean = true
@@ -254,8 +285,8 @@ local ord: { number } = table.create(8, 0)
 local stack: { number } = table.create(18, 0)
 local hullX: { number } = table.create(9, 0)
 local hullY: { number } = table.create(9, 0)
-local polysEng: { { Point } } = {}
-local polysAmmo: { { Point } } = {}
+local polysByKind: { [string]: { { Point } } } = { eng = {}, ammo = {}, barrel = {}, track = {} }
+local TeamText: string = ""
 
 local function v2(x: number, y: number): vector
 	return vector.create(x, y, 0)
@@ -589,13 +620,108 @@ local function readAttr(inst: any, name: string): any
 	return nil
 end
 
+local function getValue(o: any): any
+	return o.Value
+end
+
+local function getCF(o: any): any
+	return o.CFrame
+end
+
+local function readNum(o: any): number?
+	if not o then
+		return nil
+	end
+	local ok, v = pcall(getValue, o)
+	if ok then
+		return tonumber(v)
+	end
+	return nil
+end
+
+-- Muzzle may be a part, or an ObjectValue chain (up to 4 links).
+local function linkPart(o: any): any
+	for _ = 1, 4 do
+		if not o then
+			return nil
+		end
+		local okc, cf = pcall(getCF, o)
+		if okc and cf then
+			return o
+		end
+		local okv, v = pcall(getValue, o)
+		if okv and v then
+			o = v
+		else
+			o = o:FindFirstChild("Muzzle")
+		end
+	end
+	return nil
+end
+
+-- Round type: external table roundtypes.lua (optional), then prefix match, then name heuristic.
+local RT: { [string]: string } = {}
+do
+	local ok, src = pcall(readfile, "roundtypes.lua")
+	if ok and type(src) == "string" then
+		local f = loadstring(src)
+		if f then
+			pcall(f)
+		end
+		local g: any = _G
+		if type(g.SahurRoundTypes) == "table" then
+			RT = g.SahurRoundTypes
+		end
+	end
+end
+local rtCache: { [string]: string } = {}
+local function roundType(nm: string): string
+	local c = rtCache[nm]
+	if c then
+		return c
+	end
+	local s: string? = RT[nm]
+	if not s then
+		for k, v in RT do
+			if #k >= 4 and string.sub(nm, 1, #k) == k then
+				s = v
+				break
+			end
+		end
+	end
+	if not s then
+		local u = string.upper(nm)
+		if string.find(u, "APFSDS") or string.find(u, "^3BM") or string.find(u, "^M8[23]%d") then
+			s = "APFSDS"
+		elseif string.find(u, "HEAT") or string.find(u, "^3BK") then
+			s = "HEAT"
+		elseif string.find(u, "APDS") then
+			s = "APDS"
+		elseif string.find(u, "HESH") then
+			s = "HESH"
+		elseif string.find(u, "^3OF") or string.find(u, "HE") then
+			s = "HE"
+		elseif string.find(u, "SMOKE") then
+			s = "SMOKE"
+		else
+			s = string.sub(u, 1, 8)
+		end
+	end
+	local r: string = s :: string
+	rtCache[nm] = r
+	return r
+end
+
 local function collectModules(veh: any): { ModuleDef }
 	local out: { ModuleDef } = {}
 	local dm = child(veh, "DamageModules")
 	if not dm then
 		return out
 	end
+	local hpFolder = child(child(veh, "Values"), "DamageModule")
 	for _, mdl in dm:GetChildren() do
+		local ammoObj = mdl:FindFirstChild("AmmoValue")
+		local rack: Rack? = if ammoObj then { ammoObj = ammoObj } else nil
 		for _, p in mdl:GetChildren() do
 			local nm: string = p.Name
 			local kind: string? = nil
@@ -603,14 +729,87 @@ local function collectModules(veh: any): { ModuleDef }
 				kind = "eng"
 			elseif string.match(nm, "^AmmoModel%d+$") then
 				kind = "ammo"
+			elseif string.match(nm, "^Turret%d+Barrel$") then
+				kind = "barrel"
+			elseif nm == "LeftTrack" or nm == "RightTrack" then
+				kind = "track"
 			end
 			if kind then
 				local sz = p.Size
-				out[#out + 1] = { part = p, hx = sz.X * 0.5, hy = sz.Y * 0.5, hz = sz.Z * 0.5, kind = kind }
+				local isAmmo = kind == "ammo"
+				out[#out + 1] = {
+					part = p, hx = sz.X * 0.5, hy = sz.Y * 0.5, hz = sz.Z * 0.5, kind = kind,
+					rack = if isAmmo then rack else nil,
+					hpObj = if isAmmo and hpFolder then hpFolder:FindFirstChild(nm) else nil,
+					live = true,
+				}
 			end
 		end
 	end
 	return out
+end
+
+-- Rack hidden when AmmoValue <= 0 or part HP <= 0; read at AMMO_RATE, not per frame.
+local function refreshAmmo(e: Entry, now: number): ()
+	if now - e.ammoT < AMMO_RATE then
+		return
+	end
+	e.ammoT = now
+	for _, m in e.mods do
+		if m.kind == "ammo" then
+			local live = true
+			local r = m.rack
+			if r then
+				local a = readNum(r.ammoObj) or 0
+				if a <= 0 then
+					live = false
+				end
+			end
+			if live and m.hpObj then
+				local h = readNum(m.hpObj)
+				if h and h <= 0 then
+					live = false
+				end
+			end
+			m.live = live
+		end
+	end
+end
+
+local function countTeams(): ()
+	local my: string? = if LocalPlayer then readTeamName(LocalPlayer) else nil
+	local a, en = 0, 0
+	if my then
+		for _, plr in Players:GetChildren() do
+			local tn = readTeamName(plr)
+			if tn then
+				if tn == my then
+					a += 1
+				else
+					en += 1
+				end
+			end
+		end
+	end
+	TeamText = "ALLY " .. a .. " | ENEMY " .. en
+end
+
+-- Gun axis (muzzle look, sign fixed relative to hull) passes within AIM_R of the camera.
+local function aimedAtCam(e: Entry, massPos: vector, camPos: vector): boolean
+	local ok, mcf = pcall(getCF, e.muz)
+	if not ok or not mcf then
+		return false
+	end
+	local mp: vector = mcf.Position
+	local lk: vector = mcf.LookVector
+	local dir: vector = lk * (if vector.dot(lk, mp - massPos) < 0 then -1 else 1)
+	local toCam: vector = camPos - mp
+	local along = vector.dot(toCam, dir)
+	if along <= 0 then
+		return false
+	end
+	local perp: vector = toCam - dir * along
+	return vector.dot(perp, perp) <= AIM_R2
 end
 
 local function buildEntry(veh: any): Entry?
@@ -644,6 +843,11 @@ local function buildEntry(veh: any): Entry?
 		rlT = 0,
 		distM = -1,
 		distText = "",
+		ammoT = 0,
+		rlShell = "",
+		rlLabel = "",
+		muz = nil,
+		muzTries = 0,
 	}
 end
 
@@ -715,14 +919,18 @@ local function rebuildCache(): ()
 				e.mods = collectModules(veh)
 			end
 
-			-- Turrets may load after the hull, so the gun is searched only while Reload Status is on.
-			if Config.ReloadStatus and not e.gun and e.gunTries < 5 then
+			-- Turrets may load after the hull, so the gun is searched only while Reload Status / Aimed At is on.
+			if (Config.ReloadStatus or Config.AimedAt) and not e.gun and e.gunTries < 5 then
 				e.gunTries += 1
 				local gun = findMainGun(veh)
 				if gun then
 					e.gun = gun
 					e.loaded = child(gun, "CurrentlyLoaded")
 				end
+			end
+			if Config.AimedAt and e.gun and not e.muz and e.muzTries < 5 then
+				e.muzTries += 1
+				e.muz = linkPart(child(e.gun, "Muzzle")) or linkPart(child(e.gun, "CurrentMuzzle"))
 			end
 
 			e.ally = nil
@@ -1223,7 +1431,7 @@ local function resolveMslContainers(now: number): ()
 	MslContainers = list
 end
 
--- A projectile counts as flying when it moved between scans; a SAM heading at the camera raises the inbound warning.
+-- A projectile counts as flying when it moved between scans; any projectile heading at the camera (cos > INCOMING_COS, within INBOUND_RANGE) is incoming.
 local function scanMissiles(now: number, camPos: vector): ()
 	if #MslContainers == 0 or now - lastMslResolveT > 5 then
 		resolveMslContainers(now)
@@ -1261,17 +1469,25 @@ local function scanMissiles(now: number, camPos: vector): ()
 				continue
 			end
 			local mv: vector = pos - prev
-			if vector.dot(mv, mv) <= MSL_MOVE2 then
+			local mv2 = vector.dot(mv, mv)
+			if mv2 <= MSL_MOVE2 then
 				continue
 			end
-			out[#out + 1] = { anchor = anchor, label = cat.label, threat = cat.threat, distM = -1, text = "" }
 
-			if cat.threat and cat.label == "AA" then
-				local toMe: vector = camPos - pos
-				if vector.dot(toMe, toMe) < INBOUND_RANGE * INBOUND_RANGE and vector.dot(mv, toMe) > 0 then
+			local toMe: vector = camPos - pos
+			local dl2 = vector.dot(toMe, toMe)
+			local incoming = false
+			if dl2 > 1 and dl2 < INBOUND_RANGE * INBOUND_RANGE then
+				local dv = vector.dot(mv, toMe)
+				if dv > 0 and dv * dv > INCOMING_COS * INCOMING_COS * mv2 * dl2 then
+					incoming = true
 					threatNear = true
 				end
 			end
+			out[#out + 1] = {
+				anchor = anchor, label = cat.label, col = MSL_COL[cat.label] or Col.Missile,
+				incoming = incoming, distM = -1, text = "",
+			}
 		end
 	end
 	for key in MslPrev do
@@ -1285,7 +1501,7 @@ local function scanMissiles(now: number, camPos: vector): ()
 		InboundUntil = now + INBOUND_HOLD
 		if now - lastInboundNote >= INBOUND_COOL then
 			lastInboundNote = now
-			pcall(send_notification, "SAM inbound")
+			pcall(send_notification, "Missile inbound")
 		end
 	end
 end
@@ -1305,7 +1521,8 @@ local function buildFrame(now: number): ()
 	local maxSq: number = maxStud * maxStud
 	local modStud: number = Config.ModMaxDist * STUD_PER_M
 	local modSq: number = modStud * modStud
-	local modsOn: boolean = (Config.ModOutline or Config.ModFilled) and (Config.ModEngine or Config.ModAmmo)
+	local modsOn: boolean = (Config.ModOutline or Config.ModFilled)
+		and (Config.ModEngine or Config.ModAmmo or Config.ModBarrel or Config.ModTrack)
 	local heliOn: boolean = Config.Heli
 	local occOnly: boolean = Config.OccupiedOnly
 	local teamChk: boolean = Config.TeamCheck
@@ -1314,14 +1531,18 @@ local function buildFrame(now: number): ()
 	local showClass: boolean = Config.Class
 	local showDist: boolean = Config.Distance
 	local showReload: boolean = Config.ReloadStatus
-	local wantOcc: boolean = showName or occOnly
-	local engColor: Color3 = Config.EngineColor
-	local ammoColor: Color3 = Config.AmmoColor
+	local aimOn: boolean = Config.AimedAt
+	local wantOcc: boolean = showName or occOnly or aimOn
 
 	writeBuf.n = 0
 	local count: number = 0
 	local modCount: number = 0
 	local rings: number = 0
+	local bannerOn: boolean = false
+
+	if Config.TeamCount and TeamText ~= "" then
+		pushText(math.floor(vpW * 0.5), 8, Col.Name, TeamText, 18)
+	end
 
 	-- Missile ESP can run with Tank ESP off, so the vehicle list is simply empty then.
 	local list: { Entry } = if Config.Enabled then Active else NO_ACTIVE
@@ -1343,8 +1564,9 @@ local function buildFrame(now: number): ()
 		local pos: vector = cf.Position
 		local rel: vector = pos - camPos
 		local d2: number = vector.dot(rel, rel)
-		-- Squared-distance culling, sqrt only for survivors.
-		if d2 > maxSq or vector.dot(rel, camLook) <= 0 then
+		-- Squared-distance culling, sqrt only for survivors. A tank behind the camera is not drawn but is still checked for Aimed At.
+		local front: boolean = vector.dot(rel, camLook) > 0
+		if d2 > maxSq or (not front and not aimOn) then
 			continue
 		end
 
@@ -1355,6 +1577,17 @@ local function buildFrame(now: number): ()
 			e.occupied = occ == true or occ == "true"
 		end
 		if occOnly and not e.occupied then
+			continue
+		end
+
+		local aimedAtMe: boolean = false
+		if aimOn and not isHeli and e.occupied and e.muz and alive(e.muz) then
+			aimedAtMe = aimedAtCam(e, pos, camPos)
+			if aimedAtMe then
+				bannerOn = true
+			end
+		end
+		if not front then
 			continue
 		end
 
@@ -1407,6 +1640,10 @@ local function buildFrame(now: number): ()
 					local shell = lv.Value
 					if type(shell) == "string" and shell ~= "" and shell ~= "Unloaded" then
 						e.rl = 1
+						if shell ~= e.rlShell then
+							e.rlShell = shell
+							e.rlLabel = "READY " .. roundType(shell)
+						end
 					else
 						e.rl = 3
 					end
@@ -1450,34 +1687,43 @@ local function buildFrame(now: number): ()
 				pushText(cx, yy, Col.Class, cls)
 				yy -= STEP
 			end
-			-- Reload status is the topmost label.
 			if showReload and e.gun and e.rl > 0 then
-				pushText(cx, yy, RELOAD_COL[e.rl], RELOAD_TEXT[e.rl])
+				local rtxt = if e.rl == 1 and e.rlLabel ~= "" then e.rlLabel else RELOAD_TEXT[e.rl]
+				pushText(cx, yy, RELOAD_COL[e.rl], rtxt)
+				yy -= STEP
+			end
+			if aimedAtMe then
+				pushText(cx, yy, Col.Threat, "AIMED AT YOU")
 			end
 		end
 
 		if modsOn and d2 <= modSq then
-			table.clear(polysEng)
-			table.clear(polysAmmo)
+			if Config.ModAmmo then
+				refreshAmmo(e, now)
+			end
+			for _, pl in polysByKind do
+				table.clear(pl)
+			end
 			for _, m in e.mods do
 				if modCount >= MAX_MODULES then
 					break
 				end
-				local isEng = m.kind == "eng"
-				if ((isEng and Config.ModEngine) or (not isEng and Config.ModAmmo)) and alive(m.part) then
+				local k = m.kind
+				if Config[MOD_ON[k]] and (k ~= "ammo" or m.live) and alive(m.part) then
 					local mcf = m.part.CFrame
 					local poly = projectPolygon(
 						cam, mcf.Position, mcf.RightVector, mcf.UpVector, mcf.LookVector, m.hx, m.hy, m.hz
 					)
 					if poly then
 						modCount += 1
-						local plist = if isEng then polysEng else polysAmmo
-						plist[#plist + 1] = poly
+						local pl = polysByKind[k]
+						pl[#pl + 1] = poly
 					end
 				end
 			end
-			pushModules(polysEng, engColor)
-			pushModules(polysAmmo, ammoColor)
+			for _, k in MOD_KINDS do
+				pushModules(polysByKind[k], Config[MOD_COL[k]])
+			end
 		end
 	end
 
@@ -1509,26 +1755,30 @@ local function buildFrame(now: number): ()
 				end
 				if distM ~= t.distM then
 					t.distM = distM
-					t.text = t.label .. "  " .. distM .. "m"
+					t.text = (if t.incoming then "INCOMING " else "") .. t.label .. "  " .. distM .. "m"
 				end
-				local col: Color3 = if t.threat then Col.Threat else Col.Missile
+				local col: Color3 = if t.incoming then Col.Threat else t.col
 				mslN += 1
 				local ring = getRing(MslPool, mslN)
 				ring.Position = Vector2.new(x, y)
-				ring.Radius = 6
+				ring.Radius = if t.incoming then 9 else 6
 				ring.Color = col
 				ring.Visible = true
 				pushText(x, y - 18, col, t.text)
 			end
 		end
 		if now < InboundUntil then
-			pushText(math.floor(vpW * 0.5), math.floor(vpH * 0.12), Col.Threat, "!! SAM INBOUND !!", 22)
+			pushText(math.floor(vpW * 0.5), math.floor(vpH * 0.12), Col.Threat, "!! MISSILE INBOUND !!", 22)
 		end
 	elseif #MslTargets > 0 then
 		MslTargets = {}
 		table.clear(MslPrev)
 	end
 	finishRings(MslPool, mslN)
+
+	if bannerOn then
+		pushText(math.floor(vpW * 0.5), math.floor(vpH * 0.07), Col.Threat, "!! AIMED AT YOU !!", 22)
+	end
 
 	TargetCount = count
 	Front = writeBuf
@@ -1808,15 +2058,20 @@ local function onPostLocal(): ()
 	processKeys()
 
 	local espOn: boolean = Config.Enabled
-	if not espOn and not Config.Missile then
+	if not espOn and not Config.Missile and not Config.TeamCount then
 		Front = EMPTY
 		TargetCount = 0
 		hideAllRings()
 		return
 	end
-	if espOn and now - lastCacheT >= CACHE_RATE then
+	if now - lastCacheT >= CACHE_RATE then
 		lastCacheT = now
-		rebuildCache()
+		if espOn then
+			rebuildCache()
+		end
+		if Config.TeamCount then
+			countTeams()
+		end
 	end
 	buildFrame(now)
 end
