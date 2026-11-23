@@ -1660,6 +1660,7 @@ do
 		"hud", "fromSaved", "trackGain", "worldOn", "huntOn",
 		"walkWater", "walkOcean", "walkDesolate", "walkDepths",
 		"chestOn", "chestDist", "chestText", "chestMax",
+		"instaReel",
 	})
 	local SETTINGS_FILE = "fisch_settings.json"
 	local settingsSnap: { [string]: any } = {}
@@ -1759,6 +1760,68 @@ local function unload(): ()
 end
 G.FischKill = unload
 
+-- ───────────────────────── Insta reel (SevereGC) ─────────────────────────
+
+local insta: any = { gc = nil, loading = false, busy = false, dead = false }
+do
+	local GC_URL = "https://raw.githubusercontent.com/Interception-m/severe-gc-shit/refs/heads/main/sev_gc_shit.lua"
+	local INSTA_EFFICIENCY = 100 -- lower it for fishes that break at this speed
+	local KEYS = { "progressefficiency", "progressLossMultiplier" }
+	local VALUES = { progressefficiency = INSTA_EFFICIENCY, progressLossMultiplier = 0 }
+	local FIND_OPTS = { MinKeys = 20 }
+	local WRITE_OPTS = { SameType = true }
+	local FIND_EVERY = 1.0 -- seconds between table searches
+	local WRITE_EVERY = 0.03 -- seconds between value writes
+
+	-- One continuous worker while the toggle is on (not tied to a single reel)
+	function insta.run(): ()
+		if insta.gc == nil or insta.busy or insta.dead then
+			return
+		end
+		insta.busy = true
+		task.spawn(function()
+			local gc: any = insta.gc
+			local targets: { any } = {}
+			local findAt = 0.0
+			while flags.instaReel == true and not insta.dead do
+				local now = os.clock()
+				if now - findAt >= FIND_EVERY then
+					findAt = now
+					targets = gc.find(KEYS, FIND_OPTS)
+				end
+				for _, t in targets do
+					gc.setmany(t, VALUES, WRITE_OPTS)
+				end
+				task.wait(WRITE_EVERY)
+			end
+			insta.busy = false
+		end)
+	end
+
+	-- Loads the GC library and derives the memory layout once, then starts the worker
+	function insta.preload(): ()
+		if insta.gc ~= nil then
+			insta.run()
+			return
+		end
+		if insta.loading then
+			return
+		end
+		insta.loading = true
+		task.spawn(function()
+			local lib: any = loadstring(game:HttpGet(GC_URL, true))()
+			lib.attach()
+			insta.gc = lib
+			insta.loading = false
+			insta.run()
+		end)
+	end
+
+	table.insert(onUnload, function()
+		insta.dead = true
+	end)
+end
+
 local fishing = ui:tab("Fishing")
 fishing:toggle({ Name = "Auto Fish", Flag = "enabled", Default = false, Key = "F1" })
 -- Only read when Auto Fish is switched on; flipping this toggle alone does nothing.
@@ -1781,6 +1844,17 @@ fishing:section({ Title = "TRACKER", Divider = true })
 fishing:slider({ Name = "TRACKER STRENGTH", Flag = "trackGain", Min = 50, Max = 300, Default = 100, Step = 5, Suffix = "%" })
 fishing:section({ Title = "ROD", Divider = true })
 fishing:toggle({ Name = "Auto equip rod (T)", Flag = "autoEquip", Default = true })
+fishing:section({ Title = "INSTA REEL", Divider = true })
+fishing:toggle({
+	Name = "Insta reel",
+	Flag = "instaReel",
+	Default = false,
+	OnChange = function(v: any)
+		if v == true then
+			insta.preload()
+		end
+	end,
+})
 fishing:section({ Title = "WALK ON WATER", Divider = true })
 fishing:toggle({ Name = "Walk on water", Flag = "walkWater", Default = false })
 fishing:dropdown({
@@ -3457,6 +3531,9 @@ local function go(phase: string, now: number): ()
 		S.badTicks = 0
 		S.ups0 = S.ups
 		S.downs0 = S.downs
+		if flags.instaReel == true then
+			insta.run()
+		end
 	elseif phase == "REEQUIP" then
 		S.reequipLeft = 2
 		S.reequipAt = 0
@@ -3804,6 +3881,9 @@ local function syncEnabled(now: number): ()
 	if on then
 		S.rodMissing = 0
 		S.rodCheckAt = now
+		if flags.instaReel == true then
+			insta.preload()
+		end
 		local startChar: any = getCharacter()
 		if flags.autoEquip == true and (startChar == nil or findTool(startChar) == nil) then
 			equipRod()
