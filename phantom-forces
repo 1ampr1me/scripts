@@ -1,0 +1,267 @@
+local gc = loadstring(game:HttpGet("https://raw.githubusercontent.com/Interception-m/severe-gc-shit/refs/heads/main/sev_gc_shit.lua", true))()
+
+local G = _G
+if G.PF_Cleanup then G.PF_Cleanup() end
+
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local vec = vector.create
+local floor = math.floor
+local clock = os.clock
+local ZERO = vector.create(0, 0, 0)
+
+-- Keep re-reads this table every cycle, so the slider changes the value live
+local aimWalk = { aimwalkspeedmult = 2 }
+
+-- Each entry in `sets` is one gc.set call; `recoil` features zero the gun recoil sub-tables instead
+local features = {
+    { name = "Unlock guns + attachments", sets = { { unlockrank = 0 }, { unlockkills = 0 } } },
+    { name = "No recoil", recoil = true, sets = {} },
+    { name = "No spread", sets = { { hipfirespread = 0 } } },
+    { name = "Instant reload", sets = { { timescale = 0 } } },
+    { name = "Aim walk speed", sets = { aimWalk } },
+}
+
+local queue = {}
+local running = true
+local vp = Workspace.CurrentCamera.ViewportSize
+
+local function toggle(f)
+    if f.busy then return end
+    f.busy = true
+    f.on = not f.on
+    queue[#queue + 1] = f
+end
+
+toggle(features[1])
+
+-- Zero every number/vector inside a remote table (recursive), remembering the originals for undo
+local function zeroTable(t, depth, saved, seen)
+    local addr = gc.address(t)
+    if seen[addr] then return end
+    seen[addr] = true
+
+    local zeros, prev = {}, {}
+    for k, v in t do
+        local tv = type(v)
+        if tv == "number" then
+            if v ~= 0 then zeros[k], prev[k] = 0, v end
+        elseif tv == "vector" then
+            if v ~= ZERO then zeros[k], prev[k] = ZERO, v end
+        elseif tv == "table" and depth > 1 and gc.isremote(v) then
+            zeroTable(v, depth - 1, saved, seen)
+        end
+    end
+
+    if next(zeros) then
+        local rec = saved[addr]
+        if not rec then
+            rec = { t = t, prev = {} }
+            saved[addr] = rec
+        end
+        -- keep only the first (original) value of each key
+        for k, v in prev do
+            if rec.prev[k] == nil then rec.prev[k] = v end
+        end
+        gc.setmany(t, zeros, { SameType = true })
+    end
+end
+
+local function restore(saved)
+    for _, rec in saved do
+        gc.setmany(rec.t, rec.prev, { SameType = true })
+    end
+end
+
+-- Render event forbids task.spawn and CurrentCamera, so all work happens in this loop
+task.spawn(function()
+    while running do
+        vp = Workspace.CurrentCamera.ViewportSize
+
+        local f = table.remove(queue, 1)
+        if f then
+            if f.on then
+                f.undos = {}
+                for _, values in f.sets do
+                    local _, _, _, undo = gc.set(values, { Keep = 1 })
+                    table.insert(f.undos, undo)
+                end
+                if f.recoil then
+                    f.saved = {}
+                    f.nextPass = 0
+                end
+            else
+                for _, undo in f.undos do undo() end
+                f.undos = nil
+                if f.saved then
+                    restore(f.saved)
+                    f.saved = nil
+                end
+            end
+            f.busy = false
+        end
+
+        -- Gun data tables hold a `recoil` sub-table of 16 spring tables; rescan to catch new guns
+        for _, cf in features do
+            if cf.on and cf.saved and clock() >= cf.nextPass then
+                local seen, n = {}, 0
+                for _, t in gc.find({ "recoil", "hipfirespread" }) do
+                    local sub = t.recoil
+                    if gc.isremote(sub) and gc.typeof(sub) == "table" then
+                        for k, v in sub do
+                            if gc.isremote(v) and gc.typeof(v) == "table" and not string.find(tostring(k), "Recovery") then
+                                zeroTable(v, 3, cf.saved, seen)
+                            end
+                        end
+                    end
+                    n += 1
+                    if n % 20 == 0 then task.wait() end
+                end
+                cf.nextPass = clock() + 10
+            end
+        end
+
+        task.wait(0.05)
+    end
+end)
+
+local T = {
+    Bg = Color3.fromRGB(15, 15, 17),
+    TextMain = Color3.fromRGB(255, 255, 255),
+    TextRow = Color3.fromRGB(166, 166, 172),
+    TextOff = Color3.fromRGB(94, 94, 101),
+    TextDim = Color3.fromRGB(72, 72, 78),
+    Chip = Color3.fromRGB(23, 23, 26),
+    Track = Color3.fromRGB(26, 26, 30),
+    PillBg = Color3.fromRGB(28, 28, 32),
+    PillLine = Color3.fromRGB(60, 60, 66),
+    PillBgOff = Color3.fromRGB(20, 20, 23),
+    PillLineOff = Color3.fromRGB(38, 38, 43),
+    Knob = Color3.fromRGB(245, 245, 247),
+    KnobOff = Color3.fromRGB(96, 96, 104),
+    White = Color3.new(1, 1, 1),
+}
+
+local W, HEADER_H, ROW_H, SLIDER_H = 260, 38, 28, 56
+local PANEL_H = HEADER_H + 1 + #features * ROW_H + 3 + SLIDER_H + 9
+
+local UI = { X = 200, Y = 100, Visible = true, Dragging = false, OffX = 0, OffY = 0 }
+local mouseWas, shiftWas, sliderActive = false, false, false
+local overMenu = false
+
+local function RoundRect(x, y, w, h, r, color)
+    if r <= 3 then
+        DrawingImmediate.FilledRectangle(vec(x + 1, y, 0), vec(w - 2, h, 0), color, 1)
+        DrawingImmediate.FilledRectangle(vec(x, y + 1, 0), vec(w, h - 2, 0), color, 1)
+        return
+    end
+    DrawingImmediate.FilledRectangle(vec(x + r, y, 0), vec(w - 2 * r, h, 0), color, 1)
+    DrawingImmediate.FilledRectangle(vec(x, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
+    DrawingImmediate.FilledRectangle(vec(x + w - r, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
+    DrawingImmediate.FilledCircle(vec(x + r, y + r, 0), r, color, 1)
+    DrawingImmediate.FilledCircle(vec(x + w - r, y + r, 0), r, color, 1)
+    DrawingImmediate.FilledCircle(vec(x + r, y + h - r, 0), r, color, 1)
+    DrawingImmediate.FilledCircle(vec(x + w - r, y + h - r, 0), r, color, 1)
+end
+
+local function DrawPill(x, y, w, h, on)
+    RoundRect(x, y, w, h, 5, on and T.PillLine or T.PillLineOff)
+    RoundRect(x + 1, y + 1, w - 2, h - 2, 4, on and T.PillBg or T.PillBgOff)
+    local knob = 10
+    local kx = on and (x + w - knob - 4) or (x + 4)
+    RoundRect(kx, y + (h - knob) / 2, knob, knob, 3, on and T.Knob or T.KnobOff)
+end
+
+local function DrawToggleRow(x, y, w, h, label, on, clicked, mp)
+    DrawingImmediate.Text(vec(x + 10, y + h / 2 - 6, 0), 13, on and T.TextRow or T.TextOff, 1, label, false)
+    DrawPill(x + w - 42, y + (h - 18) / 2, 32, 18, on)
+    return clicked and mp.x >= x and mp.x <= x + w and mp.y >= y and mp.y <= y + h
+end
+
+local function DrawSlider(x, y, w, label, value, minV, maxV, clicked, ldown, mp)
+    DrawingImmediate.Text(vec(x + 10, y + 9, 0), 11, T.TextDim, 1, label, false)
+    RoundRect(x + w - 55, y + 9, 45, 14, 4, T.Chip)
+    DrawingImmediate.Text(vec(x + w - 32.5, y + 10, 0), 11, T.TextMain, 1, string.format("%.1fx", value), true)
+
+    local tX, tW, tC = x + 10, w - 20, y + 43
+    if clicked and mp.x >= tX - 6 and mp.x <= tX + tW + 6 and mp.y >= tC - 10 and mp.y <= tC + 10 then
+        sliderActive = true
+    end
+    if not ldown then sliderActive = false end
+    if sliderActive then
+        local rel = math.clamp((mp.x - tX) / tW, 0, 1)
+        value = math.clamp(floor((minV + rel * (maxV - minV)) * 10 + 0.5) / 10, minV, maxV)
+    end
+
+    RoundRect(tX, tC - 2, tW, 4, 2, T.Track)
+    local frac = (value - minV) / (maxV - minV)
+    RoundRect(tX + floor(tW * frac) - 5, tC - 5, 10, 10, 3, T.Knob)
+    return value
+end
+
+local conn = RunService.Render:Connect(function()
+    local keys = isrbxactive() and getpressedkeys() or {}
+    local shift = table.find(keys, "RightShift") ~= nil
+    if shift and not shiftWas then UI.Visible = not UI.Visible end
+    shiftWas = shift
+
+    local mp = getmouseposition()
+    local ldown = isleftpressed()
+    local clicked = ldown and not mouseWas
+    mouseWas = ldown
+
+    if not UI.Visible then
+        overMenu = false
+        UI.Dragging = false
+        sliderActive = false
+        return
+    end
+
+    local ux, uy = UI.X, UI.Y
+    overMenu = mp.x >= ux and mp.x <= ux + W and mp.y >= uy and mp.y <= uy + PANEL_H
+    -- overMenu is true while the cursor is over the menu: plug click blocking here
+
+    if ldown then
+        if not UI.Dragging then
+            if not sliderActive and mp.x >= ux and mp.x <= ux + W and mp.y >= uy and mp.y <= uy + HEADER_H then
+                UI.Dragging, UI.OffX, UI.OffY = true, mp.x - ux, mp.y - uy
+            end
+        else
+            UI.X = math.clamp(mp.x - UI.OffX, 0, vp.x - W)
+            UI.Y = math.clamp(mp.y - UI.OffY, 0, vp.y - PANEL_H)
+            ux, uy = UI.X, UI.Y
+        end
+    else
+        UI.Dragging = false
+    end
+
+    RoundRect(ux, uy, W, PANEL_H, 10, T.Bg)
+    DrawingImmediate.FilledRectangle(vec(ux + 18, uy + 18, 0), vec(6, 6, 0), T.White, 1)
+    DrawingImmediate.Text(vec(ux + 30, uy + 14, 0), 13, T.TextMain, 1, "SEVERE | PF", false)
+    DrawingImmediate.Text(vec(ux + 31, uy + 14, 0), 13, T.TextMain, 1, "SEVERE | PF", false) -- second pass = bolder title
+    DrawingImmediate.Text(vec(ux + W - 26, uy + 13, 0), 14, T.TextDim, 1, "x", false)
+    if clicked and mp.x >= ux + W - 28 and mp.x <= ux + W and mp.y >= uy and mp.y <= uy + HEADER_H then
+        UI.Visible = false
+        return
+    end
+
+    local yo = uy + HEADER_H + 1
+    for _, f in features do
+        if DrawToggleRow(ux + 8, yo, W - 16, ROW_H, f.name, f.on == true, clicked, mp) then toggle(f) end
+        yo += ROW_H
+    end
+    yo += 3
+
+    aimWalk.aimwalkspeedmult = DrawSlider(ux + 8, yo, W - 16, "AIM WALK MULT", aimWalk.aimwalkspeedmult, 1, 4, clicked, ldown, mp)
+end)
+
+G.PF_Cleanup = function()
+    running = false
+    conn:Disconnect()
+    for _, f in features do
+        if f.undos then
+            for _, undo in f.undos do undo() end
+        end
+        if f.saved then restore(f.saved) end
+    end
+end
