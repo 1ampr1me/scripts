@@ -14,12 +14,22 @@ local ZERO = vector.create(0, 0, 0)
 local aimWalk = { aimwalkspeedmult = 2 }
 
 -- Each entry in `sets` is one gc.set call; `recoil` features zero the gun recoil sub-tables instead
+-- `slider` shows a slider under the row while the feature is on
 local features = {
-    { name = "Unlock guns + attachments", sets = { { unlockrank = 0 }, { unlockkills = 0 } } },
+    { name = "Unlock guns + attachments", sets = {
+        { unlockrank = 0 }, { unlockkills = 0 }, { unlockkils = 0 },
+        { hideunlessowned = false }, { exclusiveunlock = false },
+    } },
     { name = "No recoil", recoil = true, sets = {} },
-    { name = "No spread", sets = { { hipfirespread = 0 } } },
+    { name = "No spread", sets = { { hipfirespread = 0 }, { hipfirestability = 20, hipfirespreadrecover = 100 } } },
     { name = "Instant reload", sets = { { timescale = 0 } } },
-    { name = "Aim walk speed", sets = { aimWalk } },
+    -- All four keys exist together in every gun table
+    { name = "Instant equip", sets = { { equiptime = 0, unequiptime = 0, equipspeed = 100, unequipspeed = 100 } } },
+    -- aimspeed alone also matches altaimdata entries (alt sights)
+    { name = "Fast ADS", sets = { { aimspeed = 100 }, { unaimspeed = 100, magnifyspeed = 100, unmagnifyspeed = 100 } } },
+    { name = "No sway", sets = { { idleswayampaimmult = 0, idleswayamphipmult = 0 }, { nosway = true } } },
+    { name = "Aim walk speed", sets = { aimWalk },
+        slider = { t = aimWalk, key = "aimwalkspeedmult", label = "AIM WALK MULT", min = 1, max = 4 } },
 }
 
 local queue = {}
@@ -82,8 +92,10 @@ task.spawn(function()
         if f then
             if f.on then
                 f.undos = {}
+                -- Slider features re-apply every 1 s to stay live, the rest every 5 s to save CPU
+                local keep = f.slider and 1 or 5
                 for _, values in f.sets do
-                    local _, _, _, undo = gc.set(values, { Keep = 1 })
+                    local _, _, _, undo = gc.set(values, { Keep = keep })
                     table.insert(f.undos, undo)
                 end
                 if f.recoil then
@@ -143,7 +155,8 @@ local T = {
 }
 
 local W, HEADER_H, ROW_H, SLIDER_H = 260, 38, 28, 56
-local PANEL_H = HEADER_H + 1 + #features * ROW_H + 3 + SLIDER_H + 9
+-- Recomputed every frame: grows by SLIDER_H for each enabled slider feature
+local PANEL_H = HEADER_H + 1 + #features * ROW_H + 9
 
 local UI = { X = 200, Y = 100, Visible = true, Dragging = false, OffX = 0, OffY = 0 }
 local mouseWas, shiftWas, sliderActive = false, false, false
@@ -155,9 +168,9 @@ local function RoundRect(x, y, w, h, r, color)
         DrawingImmediate.FilledRectangle(vec(x, y + 1, 0), vec(w, h - 2, 0), color, 1)
         return
     end
+    -- Two overlapping rectangles + 4 corner circles (6 draw calls)
     DrawingImmediate.FilledRectangle(vec(x + r, y, 0), vec(w - 2 * r, h, 0), color, 1)
-    DrawingImmediate.FilledRectangle(vec(x, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
-    DrawingImmediate.FilledRectangle(vec(x + w - r, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
+    DrawingImmediate.FilledRectangle(vec(x, y + r, 0), vec(w, h - 2 * r, 0), color, 1)
     DrawingImmediate.FilledCircle(vec(x + r, y + r, 0), r, color, 1)
     DrawingImmediate.FilledCircle(vec(x + w - r, y + r, 0), r, color, 1)
     DrawingImmediate.FilledCircle(vec(x + r, y + h - r, 0), r, color, 1)
@@ -217,6 +230,11 @@ local conn = RunService.Render:Connect(function()
         return
     end
 
+    PANEL_H = HEADER_H + 1 + #features * ROW_H + 9
+    for _, f in features do
+        if f.slider and f.on then PANEL_H += SLIDER_H end
+    end
+
     local ux, uy = UI.X, UI.Y
     overMenu = mp.x >= ux and mp.x <= ux + W and mp.y >= uy and mp.y <= uy + PANEL_H
     -- overMenu is true while the cursor is over the menu: plug click blocking here
@@ -249,10 +267,13 @@ local conn = RunService.Render:Connect(function()
     for _, f in features do
         if DrawToggleRow(ux + 8, yo, W - 16, ROW_H, f.name, f.on == true, clicked, mp) then toggle(f) end
         yo += ROW_H
+        local s = f.slider
+        -- Slider is drawn only while its feature is on
+        if s and f.on then
+            s.t[s.key] = DrawSlider(ux + 8, yo, W - 16, s.label, s.t[s.key], s.min, s.max, clicked, ldown, mp)
+            yo += SLIDER_H
+        end
     end
-    yo += 3
-
-    aimWalk.aimwalkspeedmult = DrawSlider(ux + 8, yo, W - 16, "AIM WALK MULT", aimWalk.aimwalkspeedmult, 1, 4, clicked, ldown, mp)
 end)
 
 G.PF_Cleanup = function()
