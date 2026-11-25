@@ -28,11 +28,16 @@ local localName: string = localPlayer.Name
 
 local alive = true -- set to false by the cleanup function; stops every loop and thread
 
+-- Menu library (IAMPR1MEUI)
+local UI_URL = "https://raw.githubusercontent.com/1ampr1me/libraries/056da49f13d19b48444b67e409c08b39ae9985be/main-uilib"
+local UI: any = (loadstring(game:HttpGet(UI_URL)) :: any)()
+local T = UI.Theme
+
 -- ───────────────────────── Config ─────────────────────────
 
 -- Timers (seconds)
 local REBUILD_RATE = 1 -- ESP entity list rescan (GetChildren / attributes)
-local LOGIC_RATE = 0.03 -- ESP positions, distances, key binds
+local LOGIC_RATE = 0.03 -- ESP positions, distances
 local SLOW_RATE = 1 -- camera, character, viewport
 local BUY_RATE = 1 -- pause between auto-buy passes
 local BUY_DWELL = 1 -- seconds spent standing on a button so the purchase registers
@@ -206,38 +211,6 @@ local RESTRICT_GROUPS: { RestrictGroup } = table.freeze({
 	}),
 })
 
--- Menu theme and sizes
-local T = table.freeze({
-	W = 290, -- panel width
-	Bg = Color3.fromRGB(15, 15, 17),
-	Divider = Color3.fromRGB(26, 26, 30),
-	TextMain = Color3.fromRGB(255, 255, 255),
-	TextRow = Color3.fromRGB(166, 166, 172),
-	TextOff = Color3.fromRGB(94, 94, 101),
-	TextDim = Color3.fromRGB(72, 72, 78),
-	Chip = Color3.fromRGB(23, 23, 26),
-	Track = Color3.fromRGB(26, 26, 30),
-	PillBg = Color3.fromRGB(28, 28, 32),
-	PillLine = Color3.fromRGB(60, 60, 66),
-	PillBgOff = Color3.fromRGB(20, 20, 23),
-	PillLineOff = Color3.fromRGB(38, 38, 43),
-	Knob = Color3.fromRGB(245, 245, 247),
-	KnobOff = Color3.fromRGB(96, 96, 104),
-	White = Color3.new(1, 1, 1),
-})
-
-local TAB_NAMES: { string } = table.freeze({ "ESP", "Farm", "Teleports", "Restrict" })
-
-local HEADER_H: number = 38 -- title bar (drag handle)
-local TAB_H: number = 26 -- tab bar
-local MAIN_ROW_H: number = 28 -- normal row
-local DROP_ROW_H: number = 24 -- row inside a dropdown
-local DROP_GAP: number = 1
-local SLIDER_ROW_H: number = 56
-local CHIP_H: number = 22 -- compact two-column chip
-local CHIP_GAP: number = 4
-local DROP_TOP_GAP: number = 6 -- space between a dropdown header and its content
-
 -- ───────────────────────── State ─────────────────────────
 
 -- Mutable toggles (the menu writes here, the logic reads from here)
@@ -268,29 +241,6 @@ end
 local state = {
 	maxDistance = 2000, -- ESP is hidden beyond this many studs
 }
-
-local UIState = {
-	X = 200,
-	Y = 100,
-	Visible = true,
-	Dragging = false,
-	DragOffset = { x = 0, y = 0 },
-	Tab = 1,
-	VehiclesOpen = false,
-	BasesOpen = false,
-	OpenGroup = "", -- Restrict tab accordion: title of the open group
-	PanelH = 320, -- measured by the last drawn frame
-}
-
--- Mouse snapshot sampled in PostLocal, consumed in Render
-local input = { mx = 0, my = 0, down = false, clicked = false }
-
-local RShiftWasDown: boolean = false
-local EnterWasDown: boolean = false
-local F1WasDown: boolean = false
-local EMPTY_KEYS: { any } = {}
-table.freeze(EMPTY_KEYS)
-local SliderActive: boolean = false
 
 local camera: Inst = nil
 local localRoot: Inst = nil
@@ -1178,437 +1128,161 @@ local function startAction(fn: () -> ()): ()
 	end)
 end
 
--- ───────────────────────── Menu drawing ─────────────────────────
+-- ───────────────────────── Menu ─────────────────────────
 
--- Checks whether a point is inside a rectangle.
-local function inRect(px: number, py: number, x: number, y: number, w: number, h: number): boolean
-	return px >= x and px <= x + w and py >= y and py <= y + h
+-- Callbacks run in PostLocal (ui:update), drawing runs in Render (ui:render).
+local ui = UI.new({
+	Title = "SEVERE | WAR TYCOON",
+	Key = "RightShift",
+	KeyLabel = "RShift",
+	Flags = {},
+	Stats = { { Label = "Shown:", Value = function(): string return tostring(markerCount) end } },
+})
+
+local function requestRebuild(): ()
+	forceRebuild = true
 end
 
--- Cuts a label to maxLen characters.
-local function shortLabel(s: string, maxLen: number): string
-	if #s > maxLen then
-		return string.sub(s, 1, maxLen - 1) .. "."
-	end
-	return s
+-- ESP tab
+local espTab = ui:tab("ESP")
+espTab:toggle({ Name = "ESP", Flag = "enabled", Store = toggles, OnChange = requestRebuild })
+espTab:toggle({ Name = "Show distance", Flag = "showDistance", Store = toggles })
+espTab:toggle({ Name = "Show team", Flag = "showTeam", Store = toggles, OnChange = requestRebuild })
+espTab:toggle({ Name = "Show own items", Flag = "showOwn", Store = toggles, Gap = 3 })
+espTab:slider({
+	Name = "DRAW RANGE",
+	Flag = "maxDistance",
+	Store = state,
+	Min = RANGE_MIN,
+	Max = RANGE_MAX,
+	Step = 10,
+	Suffix = " st",
+})
+espTab:section({ Title = "TARGETS", Divider = true })
+
+local vehicleItems: { any } = {}
+for _, cat in CATEGORIES do
+	table.insert(vehicleItems, { Name = cat.label, Flag = cat.key, Swatch = cat.color })
 end
+espTab:dropdown({ Name = "Vehicles", Items = vehicleItems, All = "All vehicles", Store = toggles, OnChange = requestRebuild })
 
--- Filled rounded rectangle; immediate mode has no rounding, so it is built from rectangles and corner circles.
-local function RoundRect(x: number, y: number, w: number, h: number, r: number, color: Color3)
-	if r <= 3 then
-		DrawingImmediate.FilledRectangle(vec(x + 1, y, 0), vec(w - 2, h, 0), color, 1)
-		DrawingImmediate.FilledRectangle(vec(x, y + 1, 0), vec(w, h - 2, 0), color, 1)
-		return
-	end
-	if r <= 6 then
-		-- three stacked rectangles shape the corner (about half the draw calls of real circles)
-		local i1 = floor(r * 0.6 + 0.5)
-		local i2 = math.max(1, floor(r * 0.25 + 0.5))
-		local t = floor(r * 0.6)
-		DrawingImmediate.FilledRectangle(vec(x + i1, y, 0), vec(w - 2 * i1, h, 0), color, 1)
-		DrawingImmediate.FilledRectangle(vec(x + i2, y + 1, 0), vec(w - 2 * i2, h - 2, 0), color, 1)
-		DrawingImmediate.FilledRectangle(vec(x, y + t, 0), vec(w, h - 2 * t, 0), color, 1)
-		return
-	end
-	DrawingImmediate.FilledRectangle(vec(x + r, y, 0), vec(w - 2 * r, h, 0), color, 1)
-	DrawingImmediate.FilledRectangle(vec(x, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
-	DrawingImmediate.FilledRectangle(vec(x + w - r, y + r, 0), vec(r, h - 2 * r, 0), color, 1)
-	DrawingImmediate.FilledCircle(vec(x + r, y + r, 0), r, color, 1)
-	DrawingImmediate.FilledCircle(vec(x + w - r, y + r, 0), r, color, 1)
-	DrawingImmediate.FilledCircle(vec(x + r, y + h - r, 0), r, color, 1)
-	DrawingImmediate.FilledCircle(vec(x + w - r, y + h - r, 0), r, color, 1)
-end
-
--- Toggle pill with a 1px outline and a square knob (right = on, left = off).
-local function DrawPill(x: number, y: number, w: number, h: number, on: boolean)
-	RoundRect(x, y, w, h, 5, on and T.PillLine or T.PillLineOff)
-	RoundRect(x + 1, y + 1, w - 2, h - 2, 4, on and T.PillBg or T.PillBgOff)
-	local knob: number = 10
-	local kx: number = on and (x + w - knob - 4) or (x + 4)
-	RoundRect(kx, y + (h - knob) / 2, knob, knob, 3, on and T.Knob or T.KnobOff)
-end
-
--- Draws one toggle row (optional color swatch). Returns true if the row was clicked.
-local function DrawToggleRow(
-	x: number,
-	y: number,
-	w: number,
-	h: number,
-	label: string,
-	enabled: boolean,
-	clicked: boolean,
-	mp: vector,
-	swatch: Color3?
-): boolean
-	local labelX: number = x + 10
-	if swatch then
-		DrawingImmediate.FilledRectangle(vec(x + 10, y + h / 2 - 3, 0), vec(6, 6, 0), swatch, 1)
-		labelX = x + 22
-	end
-	DrawingImmediate.Text(vec(labelX, y + h / 2 - 6, 0), 13, enabled and T.TextRow or T.TextOff, 1, label, false)
-
-	local pillW: number = 32
-	local pillH: number = 18
-	DrawPill(x + w - pillW - 10, y + (h - pillH) / 2, pillW, pillH, enabled)
-
-	return clicked and inRect(mp.x, mp.y, x, y, w, h)
-end
-
--- Draws a row with a small button on the right. Returns true if the button was clicked.
-local function DrawActionRow(
-	x: number,
-	y: number,
-	w: number,
-	h: number,
-	label: string,
-	btnText: string,
-	clicked: boolean,
-	mp: vector
-): boolean
-	DrawingImmediate.Text(vec(x + 10, y + h / 2 - 6, 0), 13, T.TextRow, 1, label, false)
-
-	local bw: number = 64
-	local bh: number = 18
-	local bx: number = x + w - bw - 10
-	local by: number = y + (h - bh) / 2
-	local hover = inRect(mp.x, mp.y, bx, by, bw, bh)
-	RoundRect(bx, by, bw, bh, 5, T.PillLine)
-	RoundRect(bx + 1, by + 1, bw - 2, bh - 2, 4, if hover then T.PillLine else T.PillBg)
-	DrawingImmediate.Text(vec(bx + bw / 2, by + 3, 0), 12, T.TextMain, 1, btnText, true)
-
-	return clicked and hover
-end
-
--- Draws a compact chip (optional on/off indicator, label). Returns true if it was clicked.
-local function DrawChip(
-	x: number,
-	y: number,
-	w: number,
-	h: number,
-	label: string,
-	on: boolean?,
-	clicked: boolean,
-	mp: vector
-): boolean
-	local hover = inRect(mp.x, mp.y, x, y, w, h)
-	RoundRect(x, y, w, h, 5, if hover then T.PillLine else T.Chip)
-	local labelX = x + 10
-	if on ~= nil then
-		DrawingImmediate.FilledRectangle(vec(x + 8, y + h / 2 - 3, 0), vec(6, 6, 0), if on then T.Knob else T.PillLineOff, 1)
-		labelX = x + 20
-	end
-	DrawingImmediate.Text(vec(labelX, y + h / 2 - 6, 0), 11, if on == false then T.TextOff else T.TextRow, 1, label, false)
-	return clicked and hover
-end
-
--- Draws a collapsible section header (label, counter, arrow). Returns true if clicked.
-local function DrawDropdownHeader(
-	x: number,
-	y: number,
-	w: number,
-	h: number,
-	label: string,
-	countText: string,
-	open: boolean,
-	clicked: boolean,
-	mp: vector
-): boolean
-	local hover = inRect(mp.x, mp.y, x, y, w, h)
-	if hover or open then
-		RoundRect(x, y, w, h, 6, T.Chip)
-	end
-	DrawingImmediate.Text(vec(x + 10, y + h / 2 - 6, 0), 13, T.TextMain, 1, label, false)
-	DrawingImmediate.Text(vec(x + w - 46, y + h / 2 - 6, 0), 12, T.TextDim, 1, countText, true)
-
-	local cx: number = x + w - 16
-	local cy: number = y + h / 2
-	if open then
-		DrawingImmediate.FilledTriangle(vec(cx - 5, cy - 3, 0), vec(cx + 5, cy - 3, 0), vec(cx, cy + 3, 0), T.Knob, 1)
-	else
-		DrawingImmediate.FilledTriangle(vec(cx - 3, cy - 5, 0), vec(cx - 3, cy + 5, 0), vec(cx + 3, cy, 0), T.Knob, 1)
-	end
-
-	return clicked and hover
-end
-
--- Draws the tab bar; returns the index of the clicked tab (0 if none).
-local function DrawTabs(x: number, y: number, w: number, clicked: boolean, mp: vector): number
-	local count = #TAB_NAMES
-	local gap: number = 4
-	local tabW: number = (w - gap * (count - 1)) / count
-	local hit = 0
-	for i, name in TAB_NAMES do
-		local tx = x + (i - 1) * (tabW + gap)
-		local active = UIState.Tab == i
-		local hover = inRect(mp.x, mp.y, tx, y, tabW, TAB_H)
-		if active or hover then
-			RoundRect(tx, y, tabW, TAB_H, 6, T.Chip)
-		end
-		DrawingImmediate.Text(vec(tx + tabW / 2, y + TAB_H / 2 - 6, 0), 12, if active then T.TextMain else T.TextOff, 1, name, true)
-		if clicked and hover then
-			hit = i
-		end
-	end
-	return hit
-end
-
--- Draws a slider row; returns the new value and keeps dragging while the button is held.
-local function DrawSliderRow(
-	x: number,
-	y: number,
-	w: number,
-	label: string,
-	value: number,
-	minV: number,
-	maxV: number,
-	suffix: string,
-	clicked: boolean,
-	ldown: boolean,
-	mp: vector
-): number
-	DrawingImmediate.Text(vec(x + 10, y + 9, 0), 11, T.TextDim, 1, label, false)
-
-	local valStr = tostring(floor(value)) .. suffix
-	RoundRect(x + w - 55, y + 9, 45, 14, 4, T.Chip)
-	DrawingImmediate.Text(vec(x + w - 32.5, y + 10, 0), 11, T.TextMain, 1, valStr, true)
-
-	local tX: number = x + 10
-	local tW: number = w - 20
-	local tC: number = y + 43 -- vertical center of the track
-
-	if clicked and inRect(mp.x, mp.y, tX - 6, tC - 10, tW + 12, 20) then
-		SliderActive = true
-	end
-	if not ldown then
-		SliderActive = false
-	end
-
-	if SliderActive then
-		local rel = math.clamp((mp.x - tX) / tW, 0, 1)
-		value = floor((minV + rel * (maxV - minV)) / 10 + 0.5) * 10
-		value = math.clamp(value, minV, maxV)
-	end
-
-	RoundRect(tX, tC - 2, tW, 4, 2, T.Track)
-
-	local frac: number = math.clamp((value - minV) / (maxV - minV), 0, 1)
-	local thumbX: number = tX + floor(tW * frac) - 5
-	RoundRect(thumbX, tC - 5, 10, 10, 3, T.Knob)
-
-	return value
-end
-
--- Draws a small dim section label.
-local function DrawLabel(x: number, y: number, text: string): ()
-	DrawingImmediate.Text(vec(x + 18, y, 0), 11, T.TextDim, 1, text, false)
-end
-
--- ESP tab: master switches, range slider, vehicle dropdown.
-local function drawEspTab(ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
-	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "ESP", toggles.enabled, clicked, mp, nil) then
-		toggles.enabled = not toggles.enabled
-		forceRebuild = true
-	end
-	yo += MAIN_ROW_H
-
-	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Show distance", toggles.showDistance, clicked, mp, nil) then
-		toggles.showDistance = not toggles.showDistance
-	end
-	yo += MAIN_ROW_H
-
-	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Show team", toggles.showTeam, clicked, mp, nil) then
-		toggles.showTeam = not toggles.showTeam
-		forceRebuild = true
-	end
-	yo += MAIN_ROW_H
-
-	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Show own items", toggles.showOwn, clicked, mp, nil) then
-		toggles.showOwn = not toggles.showOwn
-	end
-	yo += MAIN_ROW_H + 3
-
-	state.maxDistance = DrawSliderRow(
-		ux + 8, yo, uw - 16, "DRAW RANGE", state.maxDistance, RANGE_MIN, RANGE_MAX, " st", clicked, input.down, mp
-	)
-	yo += SLIDER_ROW_H + 9
-
-	DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
-	DrawLabel(ux, yo + 12, "TARGETS")
-	yo += 30
-
-	local onCount = 0
-	for _, cat in CATEGORIES do
-		if toggles[cat.key] then
-			onCount += 1
-		end
-	end
-	if DrawDropdownHeader(ux + 8, yo, uw - 16, MAIN_ROW_H, "Vehicles", `{onCount}/{CATEGORY_COUNT}`, UIState.VehiclesOpen, clicked, mp) then
-		UIState.VehiclesOpen = not UIState.VehiclesOpen
-	end
-	yo += MAIN_ROW_H
-
-	if UIState.VehiclesOpen then
-		yo += DROP_TOP_GAP
-		local allOn = onCount == CATEGORY_COUNT
-		if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, "All vehicles", allOn, clicked, mp, T.White) then
-			for _, cat in CATEGORIES do
-				toggles[cat.key] = not allOn
-			end
-			forceRebuild = true
-		end
-		yo += DROP_ROW_H + DROP_GAP
-
-		for _, cat in CATEGORIES do
-			if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, cat.label, toggles[cat.key], clicked, mp, cat.color) then
-				toggles[cat.key] = not toggles[cat.key]
-				forceRebuild = true
-			end
-			yo += DROP_ROW_H + DROP_GAP
-		end
-		yo += 4
-	end
-	return yo
-end
-
--- Farm tab: auto buy and collect money.
-local function drawFarmTab(ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
-	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Auto buy [F1]", toggles.autoBuy, clicked, mp, nil) then
-		toggles.autoBuy = not toggles.autoBuy
-		if toggles.autoBuy then
+-- Farm tab
+local farmTab = ui:tab("Farm")
+farmTab:toggle({
+	Name = "Auto buy",
+	Key = "F1",
+	Flag = "autoBuy",
+	Store = toggles,
+	OnChange = function(value: boolean)
+		if value then
 			lastCollectAt = os.clock()
 		end
-	end
-	yo += MAIN_ROW_H
-
-	if DrawActionRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Collect money [Enter]", "Collect", clicked, mp) then
+	end,
+})
+farmTab:action({
+	Name = "Collect money",
+	Key = "Return",
+	KeyLabel = "Enter",
+	Button = "Collect",
+	Callback = function()
 		collectQueued = true
-	end
-	yo += MAIN_ROW_H
-
-	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Infinite ammo", toggles.infAmmo, clicked, mp, nil) then
-		toggles.infAmmo = not toggles.infAmmo
-		if toggles.infAmmo then
+	end,
+})
+farmTab:toggle({
+	Name = "Infinite ammo",
+	Flag = "infAmmo",
+	Store = toggles,
+	OnChange = function(value: boolean)
+		if value then
 			lastAmmoAt = -math.huge -- apply right away
 		end
-	end
-	yo += MAIN_ROW_H + 6
+	end,
+})
+farmTab:note({
+	Before = 6,
+	Lines = {
+		`Auto buy collects money every {COLLECT_EVERY}s`,
+		"and keeps buying afterwards.",
+		"Infinite ammo stays until you rejoin.",
+	},
+})
 
-	DrawLabel(ux, yo, `Auto buy collects money every {COLLECT_EVERY}s`)
-	DrawLabel(ux, yo + 14, "and keeps buying afterwards.")
-	DrawLabel(ux, yo + 28, "Infinite ammo stays until you rejoin.")
-	yo += 48
-	return yo
-end
-
--- Teleports tab: map locations, own base / deposit, every base.
-local function drawTeleportTab(ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
-	DrawLabel(ux, yo + 2, "MAP")
-	yo += 20
-	for _, loc in MAP_LOCATIONS do
-		if DrawActionRow(ux + 8, yo, uw - 16, MAIN_ROW_H, loc.name, "Go", clicked, mp) then
+-- Teleports tab
+local tpTab = ui:tab("Teleports")
+tpTab:section({ Title = "MAP" })
+for _, loc in MAP_LOCATIONS do
+	tpTab:action({
+		Name = loc.name,
+		Button = "Go",
+		Callback = function()
 			pendingTeleport = loc.pos
-		end
-		yo += MAIN_ROW_H
-	end
-
-	DrawingImmediate.FilledRectangle(vec(ux + 12, yo + 4, 0), vec(uw - 24, 1, 0), T.Divider, 1)
-	DrawLabel(ux, yo + 14, "MY TYCOON")
-	yo += 32
-	if DrawActionRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "My base", "Go", clicked, mp) then
-		pendingTeleport = "base"
-	end
-	yo += MAIN_ROW_H
-	if DrawActionRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "My oil deposit", "Go", clicked, mp) then
-		pendingTeleport = "deposit"
-	end
-	yo += MAIN_ROW_H + 4
-
-	if DrawDropdownHeader(ux + 8, yo, uw - 16, MAIN_ROW_H, "Bases", `{#BASES}`, UIState.BasesOpen, clicked, mp) then
-		UIState.BasesOpen = not UIState.BasesOpen
-	end
-	yo += MAIN_ROW_H
-
-	if UIState.BasesOpen then
-		yo += DROP_TOP_GAP
-		local cw: number = (uw - 32 - CHIP_GAP) / 2
-		for i, base in BASES do
-			local col = (i - 1) % 2
-			local row = floor((i - 1) / 2)
-			local cx = ux + 16 + col * (cw + CHIP_GAP)
-			local cy = yo + row * (CHIP_H + CHIP_GAP)
-			if DrawChip(cx, cy, cw, CHIP_H, base.name, nil, clicked, mp) then
-				pendingTeleport = base.pos
-			end
-		end
-		yo += floor((#BASES + 1) / 2) * (CHIP_H + CHIP_GAP) + 4
-	end
-	return yo
+		end,
+	})
 end
+tpTab:section({ Title = "MY TYCOON", Divider = true })
+tpTab:action({
+	Name = "My base",
+	Button = "Go",
+	Callback = function()
+		pendingTeleport = "base"
+	end,
+})
+tpTab:action({
+	Name = "My oil deposit",
+	Button = "Go",
+	Gap = 4,
+	Callback = function()
+		pendingTeleport = "deposit"
+	end,
+})
+local baseItems: { any } = {}
+for _, base in BASES do
+	table.insert(baseItems, {
+		Name = base.name,
+		Callback = function()
+			pendingTeleport = base.pos
+		end,
+	})
+end
+tpTab:dropdown({ Name = "Bases", Items = baseItems, Layout = "chips" })
 
--- Restrict tab: ON = auto buy skips that button.
-local function drawRestrictTab(ux: number, yo: number, uw: number, clicked: boolean, mp: vector): number
-	DrawLabel(ux, yo + 2, "ON = auto buy skips this button")
-	yo += 20
-
-	local total = 0
-	local skipped = 0
-	for _, group in RESTRICT_GROUPS do
-		for _, key in group.keys do
-			total += 1
-			if restricted[key] then
-				skipped += 1
-			end
-		end
-	end
-	local allOn = skipped == total
-	if DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, "Restrict all", allOn, clicked, mp, nil) then
+-- Restrict tab: ON = auto buy skips that button
+local restrictTab = ui:tab("Restrict")
+restrictTab:section({ Title = "ON = auto buy skips this button" })
+restrictTab:toggle({
+	Name = "Restrict all",
+	Gap = 2,
+	Get = function(): boolean
 		for _, group in RESTRICT_GROUPS do
 			for _, key in group.keys do
-				restricted[key] = not allOn
-			end
-		end
-	end
-	yo += MAIN_ROW_H + 2
-
-	local cw: number = (uw - 32 - CHIP_GAP) / 2
-	for _, group in RESTRICT_GROUPS do
-		local open = UIState.OpenGroup == group.title
-		local count = 0
-		for _, key in group.keys do
-			if restricted[key] then
-				count += 1
-			end
-		end
-		local size = #group.keys
-
-		if DrawDropdownHeader(ux + 8, yo, uw - 16, MAIN_ROW_H, group.title, `{count}/{size}`, open, clicked, mp) then
-			UIState.OpenGroup = if open then "" else group.title
-		end
-		yo += MAIN_ROW_H
-
-		if open then
-			yo += DROP_TOP_GAP
-			local groupAll = count == size
-			if DrawToggleRow(ux + 16, yo, uw - 32, DROP_ROW_H, `All {group.title}`, groupAll, clicked, mp, T.White) then
-				for _, key in group.keys do
-					restricted[key] = not groupAll
+				if not restricted[key] then
+					return false
 				end
 			end
-			yo += DROP_ROW_H + DROP_GAP + 2
-
-			for i, key in group.keys do
-				local col = (i - 1) % 2
-				local row = floor((i - 1) / 2)
-				local cx = ux + 16 + col * (cw + CHIP_GAP)
-				local cy = yo + row * (CHIP_H + CHIP_GAP)
-				if DrawChip(cx, cy, cw, CHIP_H, shortLabel(group.names[i], 19), restricted[key] == true, clicked, mp) then
-					restricted[key] = not restricted[key]
-				end
-			end
-			yo += floor((size + 1) / 2) * (CHIP_H + CHIP_GAP) + 4
 		end
+		return true
+	end,
+	Set = function(value: boolean)
+		for _, group in RESTRICT_GROUPS do
+			for _, key in group.keys do
+				restricted[key] = value
+			end
+		end
+	end,
+})
+for _, group in RESTRICT_GROUPS do
+	local items: { any } = {}
+	for i, key in group.keys do
+		table.insert(items, { Name = group.names[i], Flag = key })
 	end
-	return yo
+	restrictTab:dropdown({
+		Name = group.title,
+		Items = items,
+		All = `All {group.title}`,
+		Layout = "chips",
+		Store = restricted,
+		Accordion = "restrict",
+	})
 end
 
 -- Draws the red admin warning at the top center of the screen.
@@ -1638,120 +1312,7 @@ local function drawEsp(): ()
 	end
 end
 
--- Draws the menu, handles dragging and every click (uses only the input snapshot, no memory calls).
-local function drawMenu(): ()
-	local clicked: boolean = input.clicked
-	input.clicked = false
-	local ldown: boolean = input.down
-	local mx: number = input.mx
-	local my: number = input.my
-	local mp: vector = vec(mx, my, 0)
-
-	-- Dragging by the title bar
-	if ldown then
-		if not UIState.Dragging then
-			if UIState.Visible and not SliderActive and inRect(mx, my, UIState.X, UIState.Y, T.W, HEADER_H) then
-				UIState.Dragging = true
-				UIState.DragOffset.x = mx - UIState.X
-				UIState.DragOffset.y = my - UIState.Y
-			end
-		else
-			UIState.X = math.clamp(mx - UIState.DragOffset.x, 0, math.max(0, viewW - T.W))
-			UIState.Y = math.clamp(my - UIState.DragOffset.y, 0, math.max(0, viewH - UIState.PanelH))
-		end
-	else
-		UIState.Dragging = false
-	end
-
-	if not UIState.Visible then
-		return
-	end
-
-	local ux: number = UIState.X
-	local uy: number = UIState.Y
-	local uw: number = T.W
-
-	RoundRect(ux, uy, uw, UIState.PanelH, 10, T.Bg)
-
-	-- Header + close "x"
-	DrawingImmediate.FilledRectangle(vec(ux + 18, uy + 18, 0), vec(6, 6, 0), T.White, 1)
-	DrawingImmediate.Text(vec(ux + 30, uy + 14, 0), 13, T.TextMain, 1, "SEVERE | WAR TYCOON", false)
-	DrawingImmediate.Text(vec(ux + 31, uy + 14, 0), 13, T.TextMain, 1, "SEVERE | WAR TYCOON", false) -- second pass = bolder title
-	DrawingImmediate.Text(vec(ux + uw - 26, uy + 13, 0), 14, T.TextDim, 1, "x", false)
-	if clicked and inRect(mx, my, ux + uw - 28, uy, 28, HEADER_H) then
-		UIState.Visible = false
-		return
-	end
-
-	local tab = DrawTabs(ux + 8, uy + HEADER_H, uw - 16, clicked, mp)
-	if tab ~= 0 then
-		UIState.Tab = tab
-	end
-
-	local yo: number = uy + HEADER_H + TAB_H + 8
-	local current = UIState.Tab
-	if current == 1 then
-		yo = drawEspTab(ux, yo, uw, clicked, mp)
-	elseif current == 2 then
-		yo = drawFarmTab(ux, yo, uw, clicked, mp)
-	elseif current == 3 then
-		yo = drawTeleportTab(ux, yo, uw, clicked, mp)
-	else
-		yo = drawRestrictTab(ux, yo, uw, clicked, mp)
-	end
-	yo += 6
-
-	-- Footer
-	DrawingImmediate.FilledRectangle(vec(ux + 12, yo, 0), vec(uw - 24, 1, 0), T.Divider, 1)
-	DrawingImmediate.Text(vec(ux + 18, yo + 11, 0), 11, T.TextDim, 1, "Shown:", false)
-	DrawingImmediate.Text(vec(ux + 62, yo + 11, 0), 11, T.TextRow, 1, tostring(markerCount), false)
-	DrawingImmediate.Text(vec(ux + 114, yo + 11, 0), 11, T.TextDim, 1, "Hide menu:", false)
-	DrawingImmediate.Text(vec(ux + 188, yo + 11, 0), 11, T.TextMain, 1, "RShift", false)
-	UIState.PanelH = yo + 32 - uy
-end
-
 -- ───────────────────────── Loops ─────────────────────────
-
--- Samples the mouse once per frame (a click stays flagged until Render consumes it).
-local function sampleInput(): ()
-	local mouse = getmouseposition()
-	local down: boolean = isrbxactive() and isleftpressed()
-	if down and not input.down then
-		input.clicked = true
-	end
-	input.down = down
-	input.mx = mouse.x
-	input.my = mouse.y
-end
-
--- Handles RightShift (menu) and Enter (collect money).
-local function handleKeys(): ()
-	-- No key reads while Roblox is not the active window (RightShift in another app must not toggle the menu)
-	local keys: { any } = if isrbxactive() then getpressedkeys() else EMPTY_KEYS
-	local rshift: boolean = table.find(keys, "RightShift") ~= nil or table.find(keys, 0xA1) ~= nil
-	if rshift and not RShiftWasDown then
-		UIState.Visible = not UIState.Visible
-	end
-	RShiftWasDown = rshift
-
-	local enter: boolean = table.find(keys, "Return") ~= nil
-		or table.find(keys, "Enter") ~= nil
-		or table.find(keys, 0x0D) ~= nil
-	if enter and not EnterWasDown then
-		collectQueued = true
-	end
-	EnterWasDown = enter
-
-	-- F1 toggles auto buy
-	local f1: boolean = table.find(keys, "F1") ~= nil or table.find(keys, 0x70) ~= nil
-	if f1 and not F1WasDown then
-		toggles.autoBuy = not toggles.autoBuy
-		if toggles.autoBuy then
-			lastCollectAt = os.clock()
-		end
-	end
-	F1WasDown = f1
-end
 
 -- Starts the next queued action when nothing else is running.
 local function dispatchActions(now: number): ()
@@ -1801,7 +1362,7 @@ local postConn = RunService.PostLocal:Connect(function()
 	end
 	local now = os.clock()
 
-	sampleInput()
+	ui:update()
 
 	if now - lastSlow >= SLOW_RATE then
 		lastSlow = now
@@ -1823,7 +1384,6 @@ local postConn = RunService.PostLocal:Connect(function()
 
 	if now - lastLogic >= LOGIC_RATE then
 		lastLogic = now
-		handleKeys()
 		refreshPositions(now)
 	end
 
@@ -1837,13 +1397,14 @@ local renderConn = RunService.Render:Connect(function()
 	end
 	drawEsp()
 	drawAdminWarning()
-	drawMenu()
+	ui:render()
 end)
 
 G.WarTycoonCleanup = function()
 	alive = false
 	postConn:Disconnect()
 	renderConn:Disconnect()
+	ui:destroy()
 end
 
 print("[WT] loaded")
