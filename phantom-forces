@@ -1,20 +1,21 @@
 local gc = loadstring(game:HttpGet("https://raw.githubusercontent.com/Interception-m/severe-gc-shit/refs/heads/main/sev_gc_shit.lua", true))()
+local UI = loadstring(game:HttpGet("https://raw.githubusercontent.com/1ampr1me/libraries/056da49f13d19b48444b67e409c08b39ae9985be/main-uilib", true))()
 
 local G = _G
 if G.PF_Cleanup then G.PF_Cleanup() end
 
 local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
-local vec = vector.create
-local floor = math.floor
 local clock = os.clock
 local ZERO = vector.create(0, 0, 0)
+
+-- Pause after the LAST click before the batch is applied (gc scans are slow, so clicks are collected first)
+local DEBOUNCE = 0.8
 
 -- Keep re-reads this table every cycle, so the slider changes the value live
 local aimWalk = { aimwalkspeedmult = 2 }
 
 -- Each entry in `sets` is one gc.set call; `recoil` features zero the gun recoil sub-tables instead
--- `slider` shows a slider under the row while the feature is on
+-- `slider` features re-apply every 1 s so the slider stays live
 local features = {
     { name = "Unlock guns + attachments", sets = {
         { unlockrank = 0 }, { unlockkills = 0 }, { unlockkils = 0 },
@@ -28,22 +29,24 @@ local features = {
     -- aimspeed alone also matches altaimdata entries (alt sights)
     { name = "Fast ADS", sets = { { aimspeed = 100 }, { unaimspeed = 100, magnifyspeed = 100, unmagnifyspeed = 100 } } },
     { name = "No sway", sets = { { idleswayampaimmult = 0, idleswayamphipmult = 0 }, { nosway = true } } },
-    { name = "Aim walk speed", sets = { aimWalk },
-        slider = { t = aimWalk, key = "aimwalkspeedmult", label = "AIM WALK MULT", min = 1, max = 4 } },
+    { name = "Aim walk speed", sets = { aimWalk }, slider = true },
 }
 
-local queue = {}
+local byName = {}
+for _, f in features do byName[f.name] = f end
+
 local running = true
-local vp = Workspace.CurrentCamera.ViewportSize
+local applying = false
+-- pending[feature] = desired state; f.on = state actually applied via gc
+local pending = {}
+local lastChange = 0
 
-local function toggle(f)
-    if f.busy then return end
-    f.busy = true
-    f.on = not f.on
-    queue[#queue + 1] = f
+local function onToggle(value, flag)
+    local f = byName[flag]
+    if not f then return end
+    pending[f] = value
+    lastChange = clock()
 end
-
-toggle(features[1])
 
 -- Zero every number/vector inside a remote table (recursive), remembering the originals for undo
 local function zeroTable(t, depth, saved, seen)
@@ -83,53 +86,112 @@ local function restore(saved)
     end
 end
 
--- Render event forbids task.spawn and CurrentCamera, so all work happens in this loop
-task.spawn(function()
-    while running do
-        vp = Workspace.CurrentCamera.ViewportSize
+local function enable(f)
+    f.undos = {}
+    local keep = f.slider and 1 or 5
+    for _, values in f.sets do
+        local _, _, _, undo = gc.set(values, { Keep = keep })
+        table.insert(f.undos, undo)
+    end
+    if f.recoil then
+        f.saved = {}
+        f.nextPass = 0
+    end
+end
 
-        local f = table.remove(queue, 1)
-        if f then
-            if f.on then
-                f.undos = {}
-                -- Slider features re-apply every 1 s to stay live, the rest every 5 s to save CPU
-                local keep = f.slider and 1 or 5
-                for _, values in f.sets do
-                    local _, _, _, undo = gc.set(values, { Keep = keep })
-                    table.insert(f.undos, undo)
-                end
-                if f.recoil then
-                    f.saved = {}
-                    f.nextPass = 0
-                end
-            else
-                for _, undo in f.undos do undo() end
-                f.undos = nil
-                if f.saved then
-                    restore(f.saved)
-                    f.saved = nil
+local function disable(f)
+    if f.undos then
+        for _, undo in f.undos do undo() end
+        f.undos = nil
+    end
+    if f.saved then
+        restore(f.saved)
+        f.saved = nil
+    end
+end
+
+-- Gun data tables hold a `recoil` sub-table of 16 spring tables; rescan to catch new guns
+local function recoilPass(cf)
+    local seen, n, found = {}, 0, 0
+    for _, t in gc.find({ "recoil", "hipfirespread" }) do
+        found += 1
+        local sub = t.recoil
+        if gc.isremote(sub) and gc.typeof(sub) == "table" then
+            for k, v in sub do
+                if gc.isremote(v) and gc.typeof(v) == "table" and not string.find(tostring(k), "Recovery") then
+                    zeroTable(v, 3, cf.saved, seen)
                 end
             end
-            f.busy = false
+        end
+        n += 1
+        if n % 20 == 0 then task.wait() end
+    end
+    -- nothing found (gc busy / guns not loaded yet) -> retry soon instead of waiting 10 s
+    cf.nextPass = clock() + (found == 0 and 1 or 10)
+end
+
+-- Menu: UI library requires ui:update() in PostLocal and ui:render() in Render
+local ui = UI.new({ Title = "SEVERE | PF", Key = "RightShift", Width = 260, X = 200, Y = 100,
+    Stat = { Label = "GC", Value = function()
+        if applying then return "applying" end
+        local n = 0
+        for _ in pending do n += 1 end
+        if n > 0 then return "wait " .. n end
+        return "idle"
+    end },
+})
+
+local tab = ui:tab("Gun mods")
+for i, f in features do
+    tab:toggle({ Name = f.name, Flag = f.name, Default = i == 1, OnChange = onToggle })
+    if f.slider then
+        tab:slider({ Name = "AIM WALK MULT", Flag = "aimwalkspeedmult", Store = aimWalk,
+            Min = 1, Max = 4, Step = 0.1, Suffix = "x", Default = 2,
+            Show = function() return ui.Flags[f.name] == true end })
+    end
+end
+
+-- "Unlock guns + attachments" is on by default: queue it for the first batch
+pending[features[1]] = true
+lastChange = 0
+
+local connLocal = RunService.PostLocal:Connect(function() ui:update() end)
+local connRender = RunService.Render:Connect(function() ui:render() end)
+
+-- Worker: waits until clicks stop for DEBOUNCE seconds, then applies the whole batch in one pass
+task.spawn(function()
+    while running do
+        if next(pending) and clock() - lastChange >= DEBOUNCE then
+            local batch = pending
+            pending = {}
+            applying = true
+            -- recoil first and scanned right away, before the Keep loops of other features start loading gc
+            for _, f in features do
+                local want = batch[f]
+                if f.recoil and want ~= nil and want ~= (f.on == true) then
+                    f.on = want
+                    if want then
+                        enable(f)
+                        recoilPass(f)
+                    else
+                        disable(f)
+                    end
+                end
+            end
+            for _, f in features do
+                local want = batch[f]
+                -- on->off->on within the window is a net no-op, skipped here
+                if not f.recoil and want ~= nil and want ~= (f.on == true) then
+                    f.on = want
+                    if want then enable(f) else disable(f) end
+                end
+            end
+            applying = false
         end
 
-        -- Gun data tables hold a `recoil` sub-table of 16 spring tables; rescan to catch new guns
         for _, cf in features do
             if cf.on and cf.saved and clock() >= cf.nextPass then
-                local seen, n = {}, 0
-                for _, t in gc.find({ "recoil", "hipfirespread" }) do
-                    local sub = t.recoil
-                    if gc.isremote(sub) and gc.typeof(sub) == "table" then
-                        for k, v in sub do
-                            if gc.isremote(v) and gc.typeof(v) == "table" and not string.find(tostring(k), "Recovery") then
-                                zeroTable(v, 3, cf.saved, seen)
-                            end
-                        end
-                    end
-                    n += 1
-                    if n % 20 == 0 then task.wait() end
-                end
-                cf.nextPass = clock() + 10
+                recoilPass(cf)
             end
         end
 
@@ -137,148 +199,11 @@ task.spawn(function()
     end
 end)
 
-local T = {
-    Bg = Color3.fromRGB(15, 15, 17),
-    TextMain = Color3.fromRGB(255, 255, 255),
-    TextRow = Color3.fromRGB(166, 166, 172),
-    TextOff = Color3.fromRGB(94, 94, 101),
-    TextDim = Color3.fromRGB(72, 72, 78),
-    Chip = Color3.fromRGB(23, 23, 26),
-    Track = Color3.fromRGB(26, 26, 30),
-    PillBg = Color3.fromRGB(28, 28, 32),
-    PillLine = Color3.fromRGB(60, 60, 66),
-    PillBgOff = Color3.fromRGB(20, 20, 23),
-    PillLineOff = Color3.fromRGB(38, 38, 43),
-    Knob = Color3.fromRGB(245, 245, 247),
-    KnobOff = Color3.fromRGB(96, 96, 104),
-    White = Color3.new(1, 1, 1),
-}
-
-local W, HEADER_H, ROW_H, SLIDER_H = 260, 38, 28, 56
--- Recomputed every frame: grows by SLIDER_H for each enabled slider feature
-local PANEL_H = HEADER_H + 1 + #features * ROW_H + 9
-
-local UI = { X = 200, Y = 100, Visible = true, Dragging = false, OffX = 0, OffY = 0 }
-local mouseWas, shiftWas, sliderActive = false, false, false
-local overMenu = false
-
-local function RoundRect(x, y, w, h, r, color)
-    if r <= 3 then
-        DrawingImmediate.FilledRectangle(vec(x + 1, y, 0), vec(w - 2, h, 0), color, 1)
-        DrawingImmediate.FilledRectangle(vec(x, y + 1, 0), vec(w, h - 2, 0), color, 1)
-        return
-    end
-    -- Two overlapping rectangles + 4 corner circles (6 draw calls)
-    DrawingImmediate.FilledRectangle(vec(x + r, y, 0), vec(w - 2 * r, h, 0), color, 1)
-    DrawingImmediate.FilledRectangle(vec(x, y + r, 0), vec(w, h - 2 * r, 0), color, 1)
-    DrawingImmediate.FilledCircle(vec(x + r, y + r, 0), r, color, 1)
-    DrawingImmediate.FilledCircle(vec(x + w - r, y + r, 0), r, color, 1)
-    DrawingImmediate.FilledCircle(vec(x + r, y + h - r, 0), r, color, 1)
-    DrawingImmediate.FilledCircle(vec(x + w - r, y + h - r, 0), r, color, 1)
-end
-
-local function DrawPill(x, y, w, h, on)
-    RoundRect(x, y, w, h, 5, on and T.PillLine or T.PillLineOff)
-    RoundRect(x + 1, y + 1, w - 2, h - 2, 4, on and T.PillBg or T.PillBgOff)
-    local knob = 10
-    local kx = on and (x + w - knob - 4) or (x + 4)
-    RoundRect(kx, y + (h - knob) / 2, knob, knob, 3, on and T.Knob or T.KnobOff)
-end
-
-local function DrawToggleRow(x, y, w, h, label, on, clicked, mp)
-    DrawingImmediate.Text(vec(x + 10, y + h / 2 - 6, 0), 13, on and T.TextRow or T.TextOff, 1, label, false)
-    DrawPill(x + w - 42, y + (h - 18) / 2, 32, 18, on)
-    return clicked and mp.x >= x and mp.x <= x + w and mp.y >= y and mp.y <= y + h
-end
-
-local function DrawSlider(x, y, w, label, value, minV, maxV, clicked, ldown, mp)
-    DrawingImmediate.Text(vec(x + 10, y + 9, 0), 11, T.TextDim, 1, label, false)
-    RoundRect(x + w - 55, y + 9, 45, 14, 4, T.Chip)
-    DrawingImmediate.Text(vec(x + w - 32.5, y + 10, 0), 11, T.TextMain, 1, string.format("%.1fx", value), true)
-
-    local tX, tW, tC = x + 10, w - 20, y + 43
-    if clicked and mp.x >= tX - 6 and mp.x <= tX + tW + 6 and mp.y >= tC - 10 and mp.y <= tC + 10 then
-        sliderActive = true
-    end
-    if not ldown then sliderActive = false end
-    if sliderActive then
-        local rel = math.clamp((mp.x - tX) / tW, 0, 1)
-        value = math.clamp(floor((minV + rel * (maxV - minV)) * 10 + 0.5) / 10, minV, maxV)
-    end
-
-    RoundRect(tX, tC - 2, tW, 4, 2, T.Track)
-    local frac = (value - minV) / (maxV - minV)
-    RoundRect(tX + floor(tW * frac) - 5, tC - 5, 10, 10, 3, T.Knob)
-    return value
-end
-
-local conn = RunService.Render:Connect(function()
-    local keys = isrbxactive() and getpressedkeys() or {}
-    local shift = table.find(keys, "RightShift") ~= nil
-    if shift and not shiftWas then UI.Visible = not UI.Visible end
-    shiftWas = shift
-
-    local mp = getmouseposition()
-    local ldown = isleftpressed()
-    local clicked = ldown and not mouseWas
-    mouseWas = ldown
-
-    if not UI.Visible then
-        overMenu = false
-        UI.Dragging = false
-        sliderActive = false
-        return
-    end
-
-    PANEL_H = HEADER_H + 1 + #features * ROW_H + 9
-    for _, f in features do
-        if f.slider and f.on then PANEL_H += SLIDER_H end
-    end
-
-    local ux, uy = UI.X, UI.Y
-    overMenu = mp.x >= ux and mp.x <= ux + W and mp.y >= uy and mp.y <= uy + PANEL_H
-    -- overMenu is true while the cursor is over the menu: plug click blocking here
-
-    if ldown then
-        if not UI.Dragging then
-            if not sliderActive and mp.x >= ux and mp.x <= ux + W and mp.y >= uy and mp.y <= uy + HEADER_H then
-                UI.Dragging, UI.OffX, UI.OffY = true, mp.x - ux, mp.y - uy
-            end
-        else
-            UI.X = math.clamp(mp.x - UI.OffX, 0, vp.x - W)
-            UI.Y = math.clamp(mp.y - UI.OffY, 0, vp.y - PANEL_H)
-            ux, uy = UI.X, UI.Y
-        end
-    else
-        UI.Dragging = false
-    end
-
-    RoundRect(ux, uy, W, PANEL_H, 10, T.Bg)
-    DrawingImmediate.FilledRectangle(vec(ux + 18, uy + 18, 0), vec(6, 6, 0), T.White, 1)
-    DrawingImmediate.Text(vec(ux + 30, uy + 14, 0), 13, T.TextMain, 1, "SEVERE | PF", false)
-    DrawingImmediate.Text(vec(ux + 31, uy + 14, 0), 13, T.TextMain, 1, "SEVERE | PF", false) -- second pass = bolder title
-    DrawingImmediate.Text(vec(ux + W - 26, uy + 13, 0), 14, T.TextDim, 1, "x", false)
-    if clicked and mp.x >= ux + W - 28 and mp.x <= ux + W and mp.y >= uy and mp.y <= uy + HEADER_H then
-        UI.Visible = false
-        return
-    end
-
-    local yo = uy + HEADER_H + 1
-    for _, f in features do
-        if DrawToggleRow(ux + 8, yo, W - 16, ROW_H, f.name, f.on == true, clicked, mp) then toggle(f) end
-        yo += ROW_H
-        local s = f.slider
-        -- Slider is drawn only while its feature is on
-        if s and f.on then
-            s.t[s.key] = DrawSlider(ux + 8, yo, W - 16, s.label, s.t[s.key], s.min, s.max, clicked, ldown, mp)
-            yo += SLIDER_H
-        end
-    end
-end)
-
 G.PF_Cleanup = function()
     running = false
-    conn:Disconnect()
+    connLocal:Disconnect()
+    connRender:Disconnect()
+    ui:destroy()
     for _, f in features do
         if f.undos then
             for _, undo in f.undos do undo() end
