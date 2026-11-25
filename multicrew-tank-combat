@@ -54,6 +54,9 @@ local RunService: any = game:GetService("RunService")
 local LocalPlayer: any = Players.LocalPlayer
 local Workspace: any = workspace
 
+local UI_URL: string = "https://raw.githubusercontent.com/1ampr1me/libraries/056da49f13d19b48444b67e409c08b39ae9985be/main-uilib"
+local UI: any = loadstring(game:HttpGet(UI_URL))()
+
 local STUD_PER_M: number = 2.7777778
 local STUDS_TO_M: number = 1 / STUD_PER_M
 local FONT: number = 13
@@ -83,7 +86,6 @@ local AIM_R2: number = AIM_R * AIM_R
 local REQ_TRIES: number = 5
 local CAM_RATE: number = 1
 local SCREEN_RATE: number = 0.25
-local MENU_KEY: number = 0xA1
 local EPS: number = 0.0001
 local JOIN_EPS: number = 0.75
 
@@ -267,17 +269,6 @@ local lastMslT: number = 0
 local lastMslResolveT: number = -100
 local InboundUntil: number = 0
 local lastInboundNote: number = -100
-
-local UIState = {
-	X = 40,
-	Y = 60,
-	Visible = true,
-	Dragging = false,
-	DragOffset = { x = 0, y = 0 },
-}
-local MouseWasPressed: boolean = false
-local ActiveSlider: string? = nil
-local prevMenuKey: boolean = false
 
 local ptX: { number } = table.create(8, 0)
 local ptY: { number } = table.create(8, 0)
@@ -1785,53 +1776,10 @@ local function buildFrame(now: number): ()
 	writeBuf = if writeBuf == bufA then bufB else bufA
 end
 
-local T = table.freeze({
-	W = 290,
-	Bg = Color3.fromRGB(15, 15, 17),
-	Divider = Color3.fromRGB(26, 26, 30),
-	TextMain = Color3.fromRGB(255, 255, 255),
-	TextRow = Color3.fromRGB(166, 166, 172),
-	TextOff = Color3.fromRGB(94, 94, 101),
-	TextDim = Color3.fromRGB(72, 72, 78),
-	Chip = Color3.fromRGB(23, 23, 26),
-	Track = Color3.fromRGB(26, 26, 30),
-	PillBg = Color3.fromRGB(28, 28, 32),
-	PillLine = Color3.fromRGB(60, 60, 66),
-	PillBgOff = Color3.fromRGB(20, 20, 23),
-	PillLineOff = Color3.fromRGB(38, 38, 43),
-	Knob = Color3.fromRGB(245, 245, 247),
-	KnobOff = Color3.fromRGB(96, 96, 104),
-	White = Color3.new(1, 1, 1),
-})
-
-local HEADER_H: number = 38
-local MAIN_ROW_H: number = 28
-local PART_ROW_H: number = 24
-local PART_GAP: number = 1
-local SLIDER_ROW_H: number = 56
-local MENU_GAP: number = 10
-local T2W: number = 230
-local PANEL2_H: number = HEADER_H + 1 + #MISC_ROWS * MAIN_ROW_H + 10
-local PANEL_H: number = HEADER_H + 1 + MAIN_ROW_H * #MAIN_ROWS + 3 + SLIDER_ROW_H + 9
-	+ 30 + #MOD_ROWS * (PART_ROW_H + PART_GAP) + 3 + SLIDER_ROW_H + 6 + 32
-
 local function cycleColor(key: string): ()
 	local idx = (ColorIdx[key] or 0) % #PALETTE + 1
 	ColorIdx[key] = idx
 	Config[key] = PALETTE[idx]
-end
-
--- Keys arrive as virtual-key numbers or names depending on the game, accept both.
-local function processKeys(): ()
-	local keyDown: boolean = false
-	if isrbxactive() then
-		local keys: any = getpressedkeys()
-		keyDown = table.find(keys, MENU_KEY) ~= nil or table.find(keys, "RightShift") ~= nil
-	end
-	if keyDown and not prevMenuKey then
-		UIState.Visible = not UIState.Visible
-	end
-	prevMenuKey = keyDown
 end
 
 local function drawBuffer(buf: Buffer): ()
@@ -1849,192 +1797,59 @@ local function drawBuffer(buf: Buffer): ()
 	end
 end
 
--- Immediate mode has no rounding, so corners are built from rectangles and circles.
-local function RoundRect(x: number, y: number, w: number, h: number, r: number, color: Color3): ()
-	if r <= 3 then
-		DrawingImmediate.FilledRectangle(v2(x + 1, y), v2(w - 2, h), color, 1)
-		DrawingImmediate.FilledRectangle(v2(x, y + 1), v2(w, h - 2), color, 1)
-		return
-	end
-	DrawingImmediate.FilledRectangle(v2(x + r, y), v2(w - 2 * r, h), color, 1)
-	DrawingImmediate.FilledRectangle(v2(x, y + r), v2(r, h - 2 * r), color, 1)
-	DrawingImmediate.FilledRectangle(v2(x + w - r, y + r), v2(r, h - 2 * r), color, 1)
-	DrawingImmediate.FilledCircle(v2(x + r, y + r), r, color, 1)
-	DrawingImmediate.FilledCircle(v2(x + w - r, y + r), r, color, 1)
-	DrawingImmediate.FilledCircle(v2(x + r, y + h - r), r, color, 1)
-	DrawingImmediate.FilledCircle(v2(x + w - r, y + h - r), r, color, 1)
+local ui: any = UI.new({
+	Title = "SEVERE | MTC",
+	Key = "RightShift",
+	KeyLabel = "RShift",
+	Flags = Config,
+	X = 40,
+	Y = 60,
+	Width = 290,
+	Stats = {
+		{
+			Label = "Targets:",
+			Value = function(): string
+				return tostring(TargetCount)
+			end,
+		},
+		{
+			Label = "Team check:",
+			Value = function(): string
+				return if Config.TeamCheck then "ON" else "OFF"
+			end,
+		},
+	},
+})
+
+local tabMain: any = ui:tab("Main")
+for _, row in MAIN_ROWS do
+	tabMain:toggle({ Name = row.label, Flag = row.key })
 end
+tabMain:slider({ Name = "MAX DISTANCE", Flag = "MaxDist", Min = 0, Max = 4000, Step = 10, Suffix = " m" })
 
-local function DrawPill(x: number, y: number, w: number, h: number, on: boolean): ()
-	RoundRect(x, y, w, h, 5, if on then T.PillLine else T.PillLineOff)
-	RoundRect(x + 1, y + 1, w - 2, h - 2, 4, if on then T.PillBg else T.PillBgOff)
-	local knob: number = 10
-	local kx: number = if on then (x + w - knob - 4) else (x + 4)
-	RoundRect(kx, y + (h - knob) / 2, knob, knob, 3, if on then T.Knob else T.KnobOff)
-end
-
-local function DrawToggleRow(
-	x: number, y: number, w: number, h: number,
-	label: string, enabled: boolean,
-	clicked: boolean, mp: vector, swatch: Color3?
-): (boolean, boolean)
-	local labelX: number = x + 10
-	if swatch then
-		DrawingImmediate.FilledRectangle(v2(x + 10, y + h / 2 - 3), v2(6, 6), swatch, 1)
-		labelX = x + 22
-	end
-	DrawingImmediate.Text(v2(labelX, y + h / 2 - 6), 13, if enabled then T.TextRow else T.TextOff, 1, label, false)
-
-	local pillW: number = 32
-	local pillH: number = 18
-	DrawPill(x + w - pillW - 10, y + (h - pillH) / 2, pillW, pillH, enabled)
-
-	local inRow: boolean = clicked and mp.x >= x and mp.x <= x + w and mp.y >= y and mp.y <= y + h
-	local onSwatch: boolean = swatch ~= nil and inRow and mp.x <= x + 22
-	return inRow and not onSwatch, onSwatch
-end
-
-local function DrawSliderRow(
-	x: number, y: number, w: number, id: string,
-	label: string, value: number, minV: number, maxV: number, suffix: string,
-	clicked: boolean, ldown: boolean, mp: vector
-): number
-	DrawingImmediate.Text(v2(x + 10, y + 9), 11, T.TextDim, 1, label, false)
-
-	local valStr = tostring(math.floor(value)) .. suffix
-	RoundRect(x + w - 55, y + 9, 45, 14, 4, T.Chip)
-	DrawingImmediate.Text(v2(x + w - 32.5, y + 10), 11, T.TextMain, 1, valStr, true)
-
-	local tX: number = x + 10
-	local tW: number = w - 20
-	local tC: number = y + 43
-
-	if clicked and mp.x >= tX - 6 and mp.x <= tX + tW + 6 and mp.y >= tC - 10 and mp.y <= tC + 10 then
-		ActiveSlider = id
-	end
-	if not ldown then
-		ActiveSlider = nil
-	end
-
-	if ActiveSlider == id then
-		local rel = math.clamp((mp.x - tX) / tW, 0, 1)
-		value = math.floor((minV + rel * (maxV - minV)) / 10 + 0.5) * 10
-		value = math.clamp(value, minV, maxV)
-	end
-
-	RoundRect(tX, tC - 2, tW, 4, 2, T.Track)
-
-	local frac: number = math.clamp((value - minV) / (maxV - minV), 0, 1)
-	local thumbX: number = tX + math.floor(tW * frac) - 5
-	RoundRect(thumbX, tC - 5, 10, 10, 3, T.Knob)
-
-	return value
-end
-
-local function drawUI(): ()
-	local active: boolean = isrbxactive()
-	local ldown: boolean = active and isleftpressed()
-	local clicked: boolean = ldown and not MouseWasPressed
-	MouseWasPressed = ldown
-	local mp: vector = getmouseposition()
-
-	if ldown then
-		if not UIState.Dragging then
-			if clicked and UIState.Visible and ActiveSlider == nil
-			and mp.x >= UIState.X and mp.x <= UIState.X + T.W + MENU_GAP + T2W
-			and mp.y >= UIState.Y and mp.y <= UIState.Y + HEADER_H then
-				UIState.Dragging = true
-				UIState.DragOffset.x = mp.x - UIState.X
-				UIState.DragOffset.y = mp.y - UIState.Y
-			end
-		else
-			UIState.X = mp.x - UIState.DragOffset.x
-			UIState.Y = mp.y - UIState.DragOffset.y
-		end
+local tabMods: any = ui:tab("Modules")
+for _, row in MOD_ROWS do
+	local colorKey = row.color
+	if colorKey then
+		tabMods:toggle({
+			Name = row.label,
+			Flag = row.key,
+			Swatch = function(): Color3
+				return Config[colorKey]
+			end,
+			OnSwatch = function(): ()
+				cycleColor(colorKey)
+			end,
+		})
 	else
-		UIState.Dragging = false
+		tabMods:toggle({ Name = row.label, Flag = row.key })
 	end
-	-- The menu cannot leave the screen.
-	UIState.X = math.clamp(UIState.X, 0, math.max(0, vpW - (T.W + MENU_GAP + T2W)))
-	UIState.Y = math.clamp(UIState.Y, 0, math.max(0, vpH - PANEL_H))
+end
+tabMods:slider({ Name = "MODULE DISTANCE", Flag = "ModMaxDist", Min = 0, Max = 4000, Step = 10, Suffix = " m" })
 
-	if not UIState.Visible then
-		return
-	end
-
-	local ux: number = UIState.X
-	local uy: number = UIState.Y
-	local uw: number = T.W
-
-	RoundRect(ux, uy, uw, PANEL_H, 10, T.Bg)
-
-	DrawingImmediate.FilledRectangle(v2(ux + 18, uy + 18), v2(6, 6), T.White, 1)
-	DrawingImmediate.Text(v2(ux + 30, uy + 14), 13, T.TextMain, 1, "SEVERE | MTC", false)
-	DrawingImmediate.Text(v2(ux + 31, uy + 14), 13, T.TextMain, 1, "SEVERE | MTC", false)
-	DrawingImmediate.Text(v2(ux + uw - 26, uy + 13), 14, T.TextDim, 1, "x", false)
-	if clicked and mp.x >= ux + uw - 28 and mp.x <= ux + uw and mp.y >= uy and mp.y <= uy + HEADER_H then
-		UIState.Visible = false
-		UIState.Dragging = false
-		return
-	end
-
-	local x2: number = ux + uw + MENU_GAP
-	RoundRect(x2, uy, T2W, PANEL2_H, 10, T.Bg)
-	DrawingImmediate.Text(v2(x2 + 18, uy + 14), 11, T.TextDim, 1, "MISC", false)
-	local yo2: number = uy + HEADER_H + 1
-	for _, row in MISC_ROWS do
-		local hit = DrawToggleRow(x2 + 8, yo2, T2W - 16, MAIN_ROW_H, row.label, Config[row.key] == true, clicked, mp, nil)
-		if hit then
-			Config[row.key] = not Config[row.key]
-		end
-		yo2 += MAIN_ROW_H
-	end
-
-	local yo: number = uy + HEADER_H + 1
-
-	for _, row in MAIN_ROWS do
-		local hit = DrawToggleRow(ux + 8, yo, uw - 16, MAIN_ROW_H, row.label, Config[row.key] == true, clicked, mp, nil)
-		if hit then
-			Config[row.key] = not Config[row.key]
-		end
-		yo += MAIN_ROW_H
-	end
-	yo += 3
-
-	Config.MaxDist = DrawSliderRow(
-		ux + 8, yo, uw - 16, "maxdist", "MAX DISTANCE", Config.MaxDist, 0, 4000, " m", clicked, ldown, mp
-	)
-	yo += SLIDER_ROW_H + 9
-
-	DrawingImmediate.FilledRectangle(v2(ux + 12, yo), v2(uw - 24, 1), T.Divider, 1)
-	DrawingImmediate.Text(v2(ux + 18, yo + 12), 11, T.TextDim, 1, "MODULES", false)
-	yo += 30
-
-	for _, row in MOD_ROWS do
-		local colorKey = row.color
-		local swatch: Color3? = if colorKey then Config[colorKey] else nil
-		local hit, swatchHit = DrawToggleRow(
-			ux + 8, yo, uw - 16, PART_ROW_H, row.label, Config[row.key] == true, clicked, mp, swatch
-		)
-		if swatchHit and colorKey then
-			cycleColor(colorKey)
-		elseif hit then
-			Config[row.key] = not Config[row.key]
-		end
-		yo += PART_ROW_H + PART_GAP
-	end
-	yo += 3
-
-	Config.ModMaxDist = DrawSliderRow(
-		ux + 8, yo, uw - 16, "moddist", "MODULE DISTANCE", Config.ModMaxDist, 0, 4000, " m", clicked, ldown, mp
-	)
-	yo += SLIDER_ROW_H + 6
-
-	DrawingImmediate.FilledRectangle(v2(ux + 12, yo), v2(uw - 24, 1), T.Divider, 1)
-	DrawingImmediate.Text(v2(ux + 18, yo + 11), 11, T.TextDim, 1, "Targets:", false)
-	DrawingImmediate.Text(v2(ux + 74, yo + 11), 11, T.TextRow, 1, tostring(TargetCount), false)
-	DrawingImmediate.Text(v2(ux + 114, yo + 11), 11, T.TextDim, 1, "Team check:", false)
-	DrawingImmediate.Text(v2(ux + 194, yo + 11), 11, T.TextMain, 1, if Config.TeamCheck then "ON" else "OFF", false)
+local tabMisc: any = ui:tab("Misc")
+for _, row in MISC_ROWS do
+	tabMisc:toggle({ Name = row.label, Flag = row.key })
 end
 
 local lastCamT: number = 0
@@ -2055,7 +1870,7 @@ local function onPostLocal(): ()
 		lastScreenT = now
 		updateScreenSize()
 	end
-	processKeys()
+	ui:update()
 
 	local espOn: boolean = Config.Enabled
 	if not espOn and not Config.Missile and not Config.TeamCount then
@@ -2081,7 +1896,7 @@ local function onRender(): ()
 		return
 	end
 	drawBuffer(Front)
-	drawUI()
+	ui:render()
 end
 
 local connRender: any = RunService.Render:Connect(onRender)
@@ -2102,6 +1917,7 @@ local function stop(): ()
 	running = false
 	disconnect(connRender)
 	disconnect(connLogic)
+	ui:destroy()
 	for _, pool in { HeliPool, MslPool } do
 		for _, ring in pool.list do
 			ring:Remove()
